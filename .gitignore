@@ -1,0 +1,11 @@
+.DS_Store
+
+# SwiftPM build artifacts
+TalkText/.build/
+TalkText/.swiftpm/
+
+# Local app bundle output
+TalkText.app/
+
+# Downloaded Whisper model
+models/
