@@ -6,6 +6,7 @@ TalkText/.swiftpm/
 
 # Local app bundle output
 TalkText.app/
+dist/
 
 # Downloaded Whisper model
 models/

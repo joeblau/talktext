@@ -1,10 +1,13 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 APP_NAME="TalkText"
 BUNDLE_DIR="$APP_NAME.app"
 CONTENTS="$BUNDLE_DIR/Contents"
 MACOS="$CONTENTS/MacOS"
+RESOURCES="$CONTENTS/Resources"
+VERSION="$(tr -d '\n' < VERSION)"
+MODEL_NAME="ggml-base.en.bin"
 
 cd "$(dirname "$0")"
 
@@ -15,11 +18,12 @@ cd ..
 
 echo "==> Creating app bundle..."
 rm -rf "$BUNDLE_DIR"
-mkdir -p "$MACOS"
+mkdir -p "$MACOS" "$RESOURCES/models"
 
 cp "TalkText/.build/release/TalkText" "$MACOS/TalkText"
+cp "models/$MODEL_NAME" "$RESOURCES/models/$MODEL_NAME"
 
-cat > "$CONTENTS/Info.plist" <<'PLIST'
+cat > "$CONTENTS/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -29,9 +33,9 @@ cat > "$CONTENTS/Info.plist" <<'PLIST'
     <key>CFBundleIdentifier</key>
     <string>com.joeblau.talktext</string>
     <key>CFBundleVersion</key>
-    <string>1.0</string>
+    <string>${VERSION}</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>${VERSION}</string>
     <key>CFBundleExecutable</key>
     <string>TalkText</string>
     <key>CFBundlePackageType</key>

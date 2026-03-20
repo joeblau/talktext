@@ -85,11 +85,13 @@ final class TranscriptionEngine: ObservableObject {
         self.whisperBinaryPath = possibleBinaryPaths.first { FileManager.default.fileExists(atPath: $0) } ?? "/opt/homebrew/bin/whisper-cli"
 
         let possibleModelPaths = [
+            Bundle.main.resourceURL?.appendingPathComponent("models/ggml-base.en.bin").path,
             "\(NSHomeDirectory())/Developer/joeblau/src/whisper/models/ggml-base.en.bin",
             "\(NSHomeDirectory())/.local/share/whisper/ggml-base.en.bin",
             "/opt/homebrew/share/whisper/models/ggml-base.en.bin",
-        ]
-        self.modelPath = possibleModelPaths.first { FileManager.default.fileExists(atPath: $0) } ?? "\(NSHomeDirectory())/Developer/joeblau/src/whisper/models/ggml-base.en.bin"
+        ].compactMap { $0 }
+        self.modelPath = possibleModelPaths.first { FileManager.default.fileExists(atPath: $0) }
+            ?? "\(NSHomeDirectory())/Developer/joeblau/src/whisper/models/ggml-base.en.bin"
 
         activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification,
