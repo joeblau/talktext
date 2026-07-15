@@ -9,6 +9,11 @@ let package = Package(
         .executableTarget(
             name: "TalkText",
             path: "Sources/TalkText"
+        ),
+        .testTarget(
+            name: "TalkTextTests",
+            dependencies: ["TalkText"],
+            path: "Tests/TalkTextTests"
         )
     ]
 )

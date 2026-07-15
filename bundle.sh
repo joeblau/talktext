@@ -1,57 +1,141 @@
 #!/bin/bash
 set -euo pipefail
 
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+PACKAGE_DIR="$SCRIPT_DIR/TalkText"
 APP_NAME="TalkText"
-BUNDLE_DIR="$APP_NAME.app"
-CONTENTS="$BUNDLE_DIR/Contents"
+BUNDLE_PATH="$SCRIPT_DIR/$APP_NAME.app"
+INFO_TEMPLATE="$PACKAGE_DIR/Info.plist"
+ENTITLEMENTS="$PACKAGE_DIR/TalkText.entitlements"
+DEPENDENCY_MANIFEST="${TALKTEXT_DEPENDENCY_MANIFEST:-$SCRIPT_DIR/dependencies.env}"
+SIGNING_MODE="${TALKTEXT_SIGNING_MODE:-adhoc}"
+ARCHITECTURES=(arm64 x86_64)
+
+fail() {
+    echo "error: $*" >&2
+    exit 1
+}
+
+for command_name in swift lipo plutil codesign xattr; do
+    command -v "$command_name" >/dev/null 2>&1 || fail "required command is unavailable: $command_name"
+done
+[[ -x /usr/libexec/PlistBuddy ]] || fail "/usr/libexec/PlistBuddy is unavailable"
+[[ -r "$DEPENDENCY_MANIFEST" ]] || fail "dependency manifest is not readable: $DEPENDENCY_MANIFEST"
+
+# shellcheck source=/dev/null
+source "$DEPENDENCY_MANIFEST"
+[[ -n "${MODEL_FILE_NAME:-}" ]] || fail "dependency manifest does not define MODEL_FILE_NAME"
+
+VERSION="$("$SCRIPT_DIR/scripts/read-version.sh")"
+MODEL_PATH="${TALKTEXT_MODEL_PATH:-$SCRIPT_DIR/models/$MODEL_FILE_NAME}"
+
+case "$SIGNING_MODE" in
+    adhoc)
+        SIGNING_IDENTITY='-'
+        TIMESTAMP_ARGUMENT='--timestamp=none'
+        ;;
+    developer-id)
+        SIGNING_IDENTITY="${TALKTEXT_SIGNING_IDENTITY:-}"
+        [[ -n "$SIGNING_IDENTITY" ]] || fail "TALKTEXT_SIGNING_IDENTITY is required for Developer ID signing"
+        TIMESTAMP_ARGUMENT='--timestamp'
+        ;;
+    *)
+        fail "TALKTEXT_SIGNING_MODE must be 'adhoc' or 'developer-id'"
+        ;;
+esac
+
+build_product() {
+    local architecture="$1"
+    local scratch_path="$PACKAGE_DIR/.build/release-$architecture"
+    local triple="$architecture-apple-macosx14.0"
+    local bin_path
+
+    if ! swift build \
+        --package-path "$PACKAGE_DIR" \
+        --configuration release \
+        --triple "$triple" \
+        --scratch-path "$scratch_path" \
+        -Xswiftc -warnings-as-errors >&2; then
+        fail "release build failed for $architecture"
+    fi
+
+    if ! bin_path="$(swift build \
+        --package-path "$PACKAGE_DIR" \
+        --configuration release \
+        --triple "$triple" \
+        --scratch-path "$scratch_path" \
+        --show-bin-path)"; then
+        fail "could not resolve SwiftPM product path for $architecture"
+    fi
+    [[ -x "$bin_path/$APP_NAME" ]] || fail "SwiftPM did not produce $bin_path/$APP_NAME"
+    printf '%s\n' "$bin_path/$APP_NAME"
+}
+
+echo "==> Building warnings-as-errors Universal 2 release..."
+ARM64_PRODUCT="$(build_product arm64)"
+X86_64_PRODUCT="$(build_product x86_64)"
+
+# Verify the exact dependency immediately before bundle assembly. The CI path
+# supplies a tiny pinned fixture manifest; distributable releases use the
+# production manifest and therefore verify the complete model digest.
+TALKTEXT_DEPENDENCY_MANIFEST="$DEPENDENCY_MANIFEST" \
+    "$SCRIPT_DIR/scripts/dependency-tool.sh" verify-model "$MODEL_PATH"
+
+WORK_DIR="$(mktemp -d "$SCRIPT_DIR/.talktext-bundle.XXXXXX")"
+cleanup() {
+    rm -rf -- "$WORK_DIR"
+}
+trap cleanup EXIT HUP INT TERM
+
+WORK_BUNDLE="$WORK_DIR/$APP_NAME.app"
+CONTENTS="$WORK_BUNDLE/Contents"
 MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
-VERSION="$(tr -d '\n' < VERSION)"
-MODEL_NAME="ggml-base.en.bin"
-
-cd "$(dirname "$0")"
-
-echo "==> Building release..."
-cd TalkText
-swift build -c release 2>&1
-cd ..
-
-echo "==> Creating app bundle..."
-rm -rf "$BUNDLE_DIR"
 mkdir -p "$MACOS" "$RESOURCES/models"
 
-cp "TalkText/.build/release/TalkText" "$MACOS/TalkText"
-cp "models/$MODEL_NAME" "$RESOURCES/models/$MODEL_NAME"
+echo "==> Assembling canonical bundle metadata and resources..."
+lipo -create "$ARM64_PRODUCT" "$X86_64_PRODUCT" -output "$MACOS/$APP_NAME"
+chmod 755 "$MACOS/$APP_NAME"
+cp -- "$MODEL_PATH" "$RESOURCES/models/$MODEL_FILE_NAME"
+TALKTEXT_DEPENDENCY_MANIFEST="$DEPENDENCY_MANIFEST" \
+    "$SCRIPT_DIR/scripts/dependency-tool.sh" verify-model "$RESOURCES/models/$MODEL_FILE_NAME"
 
-cat > "$CONTENTS/Info.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleName</key>
-    <string>TalkText</string>
-    <key>CFBundleIdentifier</key>
-    <string>com.joeblau.talktext</string>
-    <key>CFBundleVersion</key>
-    <string>${VERSION}</string>
-    <key>CFBundleShortVersionString</key>
-    <string>${VERSION}</string>
-    <key>CFBundleExecutable</key>
-    <string>TalkText</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>LSUIElement</key>
-    <true/>
-    <key>NSMicrophoneUsageDescription</key>
-    <string>TalkText needs microphone access to record and transcribe your voice.</string>
-</dict>
-</plist>
-PLIST
+cp -- "$INFO_TEMPLATE" "$CONTENTS/Info.plist"
+if /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$CONTENTS/Info.plist" >/dev/null 2>&1 || \
+    /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$CONTENTS/Info.plist" >/dev/null 2>&1; then
+    fail "TalkText/Info.plist must not duplicate versions; VERSION is canonical"
+fi
+/usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $VERSION" "$CONTENTS/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $VERSION" "$CONTENTS/Info.plist"
+plutil -lint "$CONTENTS/Info.plist" >/dev/null
 
-echo "==> Done! App bundle created at: $(pwd)/$BUNDLE_DIR"
-echo ""
-echo "To run:  open $BUNDLE_DIR"
-echo ""
-echo "On first launch, macOS will prompt for:"
-echo "  1. Microphone access"
-echo "  2. Accessibility (System Settings > Privacy & Security > Accessibility)"
+# Signing is deliberately last: the executable, model, and final Info.plist are
+# all present before the code directory and resource seal are created.
+echo "==> Signing finalized bundle ($SIGNING_MODE, hardened runtime)..."
+xattr -cr "$WORK_BUNDLE"
+codesign \
+    --force \
+    --verbose \
+    --options runtime \
+    "$TIMESTAMP_ARGUMENT" \
+    --entitlements "$ENTITLEMENTS" \
+    --sign "$SIGNING_IDENTITY" \
+    "$WORK_BUNDLE"
+
+TALKTEXT_DEPENDENCY_MANIFEST="$DEPENDENCY_MANIFEST" \
+TALKTEXT_EXPECTED_SIGNATURE="$SIGNING_MODE" \
+    "$SCRIPT_DIR/scripts/verify-bundle.sh" "$WORK_BUNDLE"
+
+rm -rf -- "$BUNDLE_PATH"
+mv -- "$WORK_BUNDLE" "$BUNDLE_PATH"
+trap - EXIT HUP INT TERM
+rm -rf -- "$WORK_DIR"
+
+echo "==> App bundle created: $BUNDLE_PATH"
+echo "    Version: $VERSION"
+echo "    Architectures: ${ARCHITECTURES[*]}"
+if [[ "$SIGNING_MODE" == 'adhoc' ]]; then
+    echo "    Signature: ad hoc CI/development signature (not distributable)"
+else
+    echo "    Signature: $SIGNING_IDENTITY"
+fi

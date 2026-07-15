@@ -1,0 +1,40 @@
+strict: true
+
+included:
+  - TalkText/Sources
+  - TalkText/Tests
+
+excluded:
+  - TalkText/.build
+  - TalkText/.swiftpm
+
+# These thresholds capture regressions without forcing unrelated large-file
+# refactors as part of the release hardening work.
+line_length:
+  warning: 360
+  error: 500
+  ignores_comments: true
+  ignores_urls: true
+file_length:
+  warning: 700
+  error: 800
+type_body_length:
+  warning: 600
+  error: 700
+function_body_length:
+  warning: 150
+  error: 220
+cyclomatic_complexity:
+  warning: 35
+  error: 50
+large_tuple:
+  warning: 4
+  error: 5
+
+disabled_rules:
+  - trailing_comma
+
+opt_in_rules:
+  - empty_count
+  - empty_string
+  - first_where
