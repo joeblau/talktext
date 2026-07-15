@@ -141,12 +141,43 @@ jobs:
 
       - name: Verify pinned native runner and build tools
         run: |
-          CMAKE_BIN="${ANDROID_HOME:?}/cmake/$EXPECTED_CMAKE_VERSION/bin/cmake"
-          test "$(uname -m)" = "${{ matrix.architecture }}"
-          test "$(sw_vers -productVersion | cut -d. -f1)" = "15"
-          test "$(xcodebuild -version | sed -n '1p')" = "Xcode 16.4"
-          test -x "$CMAKE_BIN"
-          test "$($CMAKE_BIN --version | sed -nE 's/^cmake version ([0-9.]+)$/\1/p')" = "$EXPECTED_CMAKE_VERSION"
+          actual_architecture="$(uname -m)"
+          actual_macos_major="$(sw_vers -productVersion | cut -d. -f1)"
+          actual_xcode="$(xcodebuild -version | sed -n '1p')"
+          printf 'runner architecture=%s macOS-major=%s xcode=%s\n' \
+            "$actual_architecture" "$actual_macos_major" "$actual_xcode"
+          [[ "$actual_architecture" == "${{ matrix.architecture }}" ]] || {
+            echo "error: expected ${{ matrix.architecture }} runner, found $actual_architecture" >&2
+            exit 1
+          }
+          [[ "$actual_macos_major" == '15' ]] || {
+            echo "error: expected macOS 15 runner, found major $actual_macos_major" >&2
+            exit 1
+          }
+          [[ "$actual_xcode" == 'Xcode 16.4' ]] || {
+            echo "error: expected Xcode 16.4, found $actual_xcode" >&2
+            exit 1
+          }
+
+          cmake_candidates=("${ANDROID_HOME:?}"/cmake/*/bin/cmake)
+          if default_cmake="$(command -v cmake 2>/dev/null)"; then
+            cmake_candidates+=("$default_cmake")
+          fi
+          CMAKE_BIN=''
+          for candidate in "${cmake_candidates[@]}"; do
+            [[ -x "$candidate" ]] || continue
+            candidate_version="$("$candidate" --version | sed -nE 's/^cmake version ([0-9.]+)$/\1/p')"
+            printf 'cmake candidate=%s version=%s\n' "$candidate" "${candidate_version:-unreported}"
+            if [[ "$candidate_version" == "$EXPECTED_CMAKE_VERSION" ]]; then
+              CMAKE_BIN="$candidate"
+              break
+            fi
+          done
+          [[ -n "$CMAKE_BIN" ]] || {
+            echo "error: CMake $EXPECTED_CMAKE_VERSION is not installed" >&2
+            exit 1
+          }
+          echo "CMAKE_BIN=$CMAKE_BIN" >> "$GITHUB_ENV"
 
       - name: Restore exact backend build cache
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
@@ -166,7 +197,7 @@ jobs:
       - name: Build every exact supported backend revision
         run: |
           source dependencies.env
-          CMAKE_BIN="${ANDROID_HOME:?}/cmake/$EXPECTED_CMAKE_VERSION/bin/cmake"
+          : "${CMAKE_BIN:?verified CMake path was not exported}"
           backend_repository="$BACKEND_REPOSITORY_URL"
           backend_cache="$HOME/.cache/talktext-backends/${{ matrix.architecture }}"
           mkdir -p "$backend_cache"
