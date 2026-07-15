@@ -3,8 +3,14 @@ set -euo pipefail
 
 REPOSITORY_ROOT="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 DEPENDENCY_TOOL="$REPOSITORY_ROOT/scripts/dependency-tool.sh"
+DEPENDENCY_MANIFEST="$REPOSITORY_ROOT/dependencies.env"
+if [[ -n "${TALKTEXT_DEPENDENCY_MANIFEST:-}" && "$TALKTEXT_DEPENDENCY_MANIFEST" != "$DEPENDENCY_MANIFEST" ]]; then
+    echo "error: setup does not accept a dependency manifest override" >&2
+    exit 1
+fi
+export TALKTEXT_DEPENDENCY_MANIFEST="$DEPENDENCY_MANIFEST"
 # shellcheck source=dependencies.env
-source "$REPOSITORY_ROOT/dependencies.env"
+source "$DEPENDENCY_MANIFEST"
 
 echo "==> Resolving the supported whisper.cpp backend..."
 if ! BACKEND_PATH="$("$DEPENDENCY_TOOL" resolve-backend)"; then

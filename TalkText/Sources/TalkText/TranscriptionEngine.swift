@@ -187,11 +187,12 @@ final class TranscriptionEngine: ObservableObject {
         logger.notice("Engine operation cancelled")
     }
 
-    /// Synchronous lifecycle hook for normal application termination. Cancelling
-    /// the task triggers subprocess termination; audio files are removed before
-    /// this method returns.
+    /// Synchronous lifecycle hook for normal application termination. Active
+    /// subprocesses are force-killed and confirmed terminated, and audio files
+    /// are removed before this method returns.
     func cleanup() {
         invalidateCurrentSession()
+        transcriber.terminateActiveTranscriptions()
         dependencyPresentationTask?.cancel()
         dependencyPresentationTask = nil
         dependencyPreparationTask?.cancel()

@@ -2,6 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+DEPENDENCY_MANIFEST="$SCRIPT_DIR/dependencies.env"
 VERSION="$("$SCRIPT_DIR/scripts/read-version.sh")"
 RELEASE_TAG="${TALKTEXT_RELEASE_TAG:-${GITHUB_REF_NAME:-}}"
 EXPECTED_TAG="v$VERSION"
@@ -16,6 +17,11 @@ fail() {
     echo "error: $*" >&2
     exit 1
 }
+
+if [[ -n "${TALKTEXT_DEPENDENCY_MANIFEST:-}" && "$TALKTEXT_DEPENDENCY_MANIFEST" != "$DEPENDENCY_MANIFEST" ]]; then
+    fail "release does not accept a dependency manifest override"
+fi
+export TALKTEXT_DEPENDENCY_MANIFEST="$DEPENDENCY_MANIFEST"
 
 for command_name in git ditto codesign spctl xcrun plutil shasum; do
     command -v "$command_name" >/dev/null 2>&1 || fail "required release command is unavailable: $command_name"

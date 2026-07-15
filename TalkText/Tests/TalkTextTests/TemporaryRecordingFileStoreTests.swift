@@ -90,6 +90,40 @@ final class TemporaryRecordingFileStoreTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: oldUnowned.path))
     }
 
+    func testStaleMetadataLookupFailureIsReportedAfterOtherCleanupContinues() throws {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let root = try makeTemporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let recordingsRoot = root
+            .appendingPathComponent("TalkText", isDirectory: true)
+            .appendingPathComponent("recordings", isDirectory: true)
+        let oldOwned = recordingsRoot.appendingPathComponent("instance-old", isDirectory: true)
+        try FileManager.default.createDirectory(at: oldOwned, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes(
+            [.modificationDate: now.addingTimeInterval(-48 * 60 * 60)],
+            ofItemAtPath: oldOwned.path
+        )
+        let inaccessibleEntry = recordingsRoot.appendingPathComponent(
+            "instance-user-content-must-not-be-logged",
+            isDirectory: true
+        )
+        let fileManager = DirectoryContentsFileManager(
+            contents: [inaccessibleEntry, oldOwned]
+        )
+        let store = try TemporaryRecordingFileStore(
+            fileManager: fileManager,
+            temporaryDirectory: root,
+            now: { now }
+        )
+
+        XCTAssertThrowsError(
+            try store.removeStaleOwnedFiles(olderThan: 24 * 60 * 60)
+        ) { error in
+            XCTAssertEqual(error as? RecordingFileStoreError, .cleanupFailed)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: oldOwned.path))
+    }
+
     func testCleanupIsIdempotentForMissingRecordingAndInstance() throws {
         let root = try makeTemporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -106,5 +140,22 @@ final class TemporaryRecordingFileStoreTests: XCTestCase {
             .appendingPathComponent("TalkText-FileStoreTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         return root
+    }
+}
+
+private final class DirectoryContentsFileManager: FileManager, @unchecked Sendable {
+    private let contents: [URL]
+
+    init(contents: [URL]) {
+        self.contents = contents
+        super.init()
+    }
+
+    override func contentsOfDirectory(
+        at url: URL,
+        includingPropertiesForKeys keys: [URLResourceKey]?,
+        options mask: DirectoryEnumerationOptions
+    ) throws -> [URL] {
+        contents
     }
 }

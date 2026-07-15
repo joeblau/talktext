@@ -56,19 +56,23 @@ Backend resolution uses the same policy in setup and the app, in this order:
 2. `Contents/Resources/bin/whisper-cli` in a packaged app
 3. `PATH`
 4. `HOMEBREW_PREFIX`, `/opt/homebrew`, then `/usr/local`
-5. `.dependencies/bin` or `bin` under `TALKTEXT_DEVELOPMENT_ROOT` or an inferred checkout
+5. `.dependencies/bin` then `bin` under each development root:
+   `TALKTEXT_DEVELOPMENT_ROOT` (when set), the inferred checkout, the current
+   directory, then its parent
 6. `~/.local/bin`
 
-Model resolution uses `TALKTEXT_MODEL_PATH`, bundled `Resources/models`, the
-inferred checkout's `models/`, per-user application data, then Homebrew model
-locations. An explicit but invalid override fails closed instead of silently
-selecting another file.
+Model resolution uses `TALKTEXT_MODEL_PATH`, bundled `Resources/models`, a
+`models/` directory under the same development roots, per-user application
+data, then Homebrew model locations. An explicit but invalid override fails
+closed instead of silently selecting another file.
 
 Homebrew 1.8.4 does not implement `--version`, so the resolver can derive its
 version from the resolved Cellar path. A custom or bundled executable must
 report its version, have a neighboring `<executable>.version` file, or be paired
 with a reviewed `TALKTEXT_WHISPER_CLI_VERSION` override. An unreported or
 unsupported version is rejected even when its flags happen to look compatible.
+Version metadata trims only surrounding whitespace, accepts one optional
+lowercase `v`, and must otherwise be an exact three-component numeric version.
 
 ## Pinned model supply chain
 
@@ -80,6 +84,10 @@ retries. It validates format, size, and digest before an atomic rename. A valid
 cache avoids the network; an invalid cache is reported, replaced only after a
 verified download succeeds, and retained under an `.invalid.<timestamp>`
 quarantine name for diagnosis.
+
+Production setup and release reject `TALKTEXT_DEPENDENCY_MANIFEST` values that
+do not name the repository's reviewed manifest. Tests exercise alternate
+manifests by invoking `scripts/dependency-tool.sh` directly.
 
 Setup, bundling, and release all use the same verifier. To audit a local cache:
 

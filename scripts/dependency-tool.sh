@@ -136,7 +136,10 @@ install_model() {
     if (( had_invalid_cache )); then
         timestamp="$(date -u '+%Y%m%dT%H%M%SZ')"
         quarantine_path="${destination}.invalid.${timestamp}.$$"
-        mv -- "$destination" "$quarantine_path"
+        # Preserve the rejected inode under a diagnostic name without moving
+        # the live path away. The verified temporary file can then replace the
+        # destination with one same-filesystem rename and no missing-path gap.
+        ln -- "$destination" "$quarantine_path"
         echo "    Quarantined invalid model as: $quarantine_path" >&2
     fi
 
@@ -172,11 +175,38 @@ is_executable_file() {
     [[ -f "$1" && -r "$1" && -x "$1" ]]
 }
 
-resolve_backend() {
-    local candidate path_entry prefix development_root
+trim_surrounding_whitespace() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
 
-    if [[ -n "${TALKTEXT_WHISPER_CLI:-}" ]]; then
-        candidate="$(canonical_path "$TALKTEXT_WHISPER_CLI")"
+configured_path() {
+    local path="$1"
+
+    case "$path" in
+        '~')
+            path="${HOME:-$path}"
+            ;;
+        '~/'*)
+            path="${HOME:-~}/${path#\~/}"
+            ;;
+    esac
+
+    if [[ "$path" == /* ]]; then
+        printf '%s\n' "$path"
+    else
+        printf '%s/%s\n' "$(pwd -P)" "$path"
+    fi
+}
+
+resolve_backend() {
+    local candidate path_entry prefix development_root current_directory
+    local -a development_roots path_entries
+
+    if [[ -n "$(trim_surrounding_whitespace "${TALKTEXT_WHISPER_CLI:-}")" ]]; then
+        candidate="$(canonical_path "$(configured_path "$TALKTEXT_WHISPER_CLI")")"
         is_executable_file "$candidate" || fail "TALKTEXT_WHISPER_CLI is not a readable executable: $candidate"
         printf '%s\n' "$candidate"
         return
@@ -195,7 +225,8 @@ resolve_backend() {
 
     IFS=':' read -r -a path_entries <<< "${PATH:-}"
     for path_entry in "${path_entries[@]}"; do
-        [[ -n "$path_entry" ]] || path_entry='.'
+        [[ -n "$path_entry" ]] || path_entry="$(pwd -P)"
+        path_entry="$(configured_path "$path_entry")"
         candidate="$path_entry/$BACKEND_EXECUTABLE"
         if is_executable_file "$candidate"; then
             canonical_path "$candidate"
@@ -204,7 +235,8 @@ resolve_backend() {
     done
 
     for prefix in "${HOMEBREW_PREFIX:-}" /opt/homebrew /usr/local; do
-        [[ -n "$prefix" ]] || continue
+        [[ -n "$(trim_surrounding_whitespace "$prefix")" ]] || continue
+        prefix="$(configured_path "$prefix")"
         candidate="$prefix/bin/$BACKEND_EXECUTABLE"
         if is_executable_file "$candidate"; then
             canonical_path "$candidate"
@@ -212,33 +244,60 @@ resolve_backend() {
         fi
     done
 
-    development_root="${TALKTEXT_DEVELOPMENT_ROOT:-$REPOSITORY_ROOT}"
-    for candidate in \
-        "$development_root/.dependencies/bin/$BACKEND_EXECUTABLE" \
-        "$development_root/bin/$BACKEND_EXECUTABLE" \
-        "${HOME:-}/.local/bin/$BACKEND_EXECUTABLE"; do
-        [[ -n "$candidate" ]] || continue
-        if is_executable_file "$candidate"; then
-            canonical_path "$candidate"
-            return
-        fi
+    current_directory="$(pwd -P)"
+    development_roots=()
+    if [[ -n "$(trim_surrounding_whitespace "${TALKTEXT_DEVELOPMENT_ROOT:-}")" ]]; then
+        development_roots+=("$(configured_path "$TALKTEXT_DEVELOPMENT_ROOT")")
+    fi
+    development_roots+=(
+        "$REPOSITORY_ROOT"
+        "$current_directory"
+        "$(dirname -- "$current_directory")"
+    )
+
+    for development_root in "${development_roots[@]}"; do
+        for candidate in \
+            "$development_root/.dependencies/bin/$BACKEND_EXECUTABLE" \
+            "$development_root/bin/$BACKEND_EXECUTABLE"; do
+            if is_executable_file "$candidate"; then
+                canonical_path "$candidate"
+                return
+            fi
+        done
     done
+
+    candidate="${HOME:-}/.local/bin/$BACKEND_EXECUTABLE"
+    if is_executable_file "$candidate"; then
+        canonical_path "$candidate"
+        return
+    fi
 
     fail "$BACKEND_EXECUTABLE was not found (checked TALKTEXT_WHISPER_CLI, bundled resources, PATH, Homebrew, and development locations)"
 }
 
-extract_backend_version() {
-    local executable="$1" resolved output version
+normalized_backend_version() {
+    local version
+    version="$(trim_surrounding_whitespace "$1")"
+    [[ "$version" == v* ]] && version="${version#v}"
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    printf '%s\n' "$version"
+}
 
-    if [[ -n "${TALKTEXT_WHISPER_CLI_VERSION:-}" ]]; then
-        printf '%s\n' "$TALKTEXT_WHISPER_CLI_VERSION"
+extract_backend_version() {
+    local executable="$1" configured resolved output sidecar version
+
+    configured="${TALKTEXT_WHISPER_CLI_VERSION:-}"
+    if [[ -n "$(trim_surrounding_whitespace "$configured")" ]]; then
+        normalized_backend_version "$configured" || true
         return
     fi
 
     if [[ -r "${executable}.version" ]]; then
-        tr -d '[:space:]' < "${executable}.version"
-        printf '\n'
-        return
+        sidecar="$(<"${executable}.version")"
+        if version="$(normalized_backend_version "$sidecar")"; then
+            printf '%s\n' "$version"
+            return
+        fi
     fi
 
     resolved="$(canonical_path "$executable")"
@@ -247,13 +306,16 @@ extract_backend_version() {
     # resolved Cellar path still records the formula version without invoking a
     # transcription or inspecting dictated content.
     if [[ "$resolved" =~ /Cellar/${BACKEND_FORMULA}/([^/]+)/ ]]; then
-        printf '%s\n' "${BASH_REMATCH[1]}"
-        return
+        if version="$(normalized_backend_version "${BASH_REMATCH[1]}")"; then
+            printf '%s\n' "$version"
+            return
+        fi
     fi
 
     output="$({ "$executable" --version; } 2>&1 || true)"
-    version="$(printf '%s\n' "$output" | sed -nE 's/.*[Vv]ersion[^0-9]*([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -n 1)"
-    printf '%s\n' "$version"
+    if [[ "$output" =~ [Vv][Ee][Rr][Ss][Ii][Oo][Nn][^0-9]*([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+        normalized_backend_version "${BASH_REMATCH[1]}"
+    fi
 }
 
 probe_backend() {

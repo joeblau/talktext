@@ -84,6 +84,13 @@ enum ProcessRunResult: Equatable, Sendable {
 
 protocol AsyncProcessRunning: Sendable {
     func run(_ command: ProcessCommand, timeout: TimeInterval) async -> ProcessRunResult
+    func terminateActiveProcesses()
+}
+
+extension AsyncProcessRunning {
+    /// Synchronously terminates subprocesses owned by this runner. Implementations
+    /// without persistent subprocess state have nothing to terminate.
+    func terminateActiveProcesses() {}
 }
 
 /// Runs one subprocess while continuously consuming both output pipes.
@@ -93,9 +100,17 @@ protocol AsyncProcessRunning: Sendable {
 /// on a child that ignores polite termination.
 final class FoundationProcessRunner: AsyncProcessRunning, @unchecked Sendable {
     private let terminationGracePeriod: TimeInterval
+    private let activeProcesses = ManagedProcessRegistry()
 
     init(terminationGracePeriod: TimeInterval = 0.5) {
         self.terminationGracePeriod = max(0, terminationGracePeriod)
+    }
+
+    /// Permanently closes this runner to new launches, force-kills every process
+    /// already being launched or running, and waits for confirmed termination.
+    /// This is reserved for synchronous application shutdown.
+    func terminateActiveProcesses() {
+        activeProcesses.terminateAllSynchronously()
     }
 
     func run(_ command: ProcessCommand, timeout: TimeInterval) async -> ProcessRunResult {
@@ -124,9 +139,17 @@ final class FoundationProcessRunner: AsyncProcessRunning, @unchecked Sendable {
             controller.processDidTerminate(terminatedProcess)
         }
 
+        guard activeProcesses.register(controller) else {
+            return .cancelled(emptyDiagnostic)
+        }
+        defer {
+            activeProcesses.unregister(controller)
+        }
+
         return await withTaskCancellationHandler {
             guard !Task.isCancelled else {
                 controller.requestStop(.cancelled)
+                controller.processWillNotLaunch()
                 return .cancelled(emptyDiagnostic)
             }
 
@@ -134,6 +157,7 @@ final class FoundationProcessRunner: AsyncProcessRunning, @unchecked Sendable {
                 try process.run()
                 controller.processDidLaunch()
             } catch {
+                controller.processWillNotLaunch()
                 let nsError = error as NSError
                 let diagnostic = ProcessDiagnostic(
                     launchErrorDomain: nsError.domain,
@@ -143,11 +167,17 @@ final class FoundationProcessRunner: AsyncProcessRunning, @unchecked Sendable {
                 return .launchFailed(diagnostic)
             }
 
+            let outputDrain = ProcessPipeDrain(
+                fileHandle: standardOutputPipe.fileHandleForReading
+            )
+            let errorDrain = ProcessPipeDrain(
+                fileHandle: standardErrorPipe.fileHandleForReading
+            )
             let outputTask = Task.detached(priority: .utility) {
-                standardOutputPipe.fileHandleForReading.readDataToEndOfFile()
+                outputDrain.drain()
             }
             let errorTask = Task.detached(priority: .utility) {
-                standardErrorPipe.fileHandleForReading.readDataToEndOfFile()
+                errorDrain.drain()
             }
 
             let boundedTimeout = max(0.001, timeout)
@@ -166,6 +196,8 @@ final class FoundationProcessRunner: AsyncProcessRunning, @unchecked Sendable {
 
             let termination = await controller.waitForTermination()
             timeoutTask.cancel()
+            outputDrain.stopAfterProcessTermination()
+            errorDrain.stopAfterProcessTermination()
             let standardOutput = await outputTask.value
             let standardError = await errorTask.value
 
@@ -190,6 +222,40 @@ final class FoundationProcessRunner: AsyncProcessRunning, @unchecked Sendable {
     }
 }
 
+private final class ManagedProcessRegistry: @unchecked Sendable {
+    private let lock = NSLock()
+    private var acceptsLaunches = true
+    private var processes: [ObjectIdentifier: ManagedProcess] = [:]
+
+    func register(_ process: ManagedProcess) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard acceptsLaunches else {
+            return false
+        }
+        processes[ObjectIdentifier(process)] = process
+        return true
+    }
+
+    func unregister(_ process: ManagedProcess) {
+        lock.lock()
+        processes.removeValue(forKey: ObjectIdentifier(process))
+        lock.unlock()
+    }
+
+    func terminateAllSynchronously() {
+        let activeProcesses: [ManagedProcess]
+        lock.lock()
+        acceptsLaunches = false
+        activeProcesses = Array(processes.values)
+        lock.unlock()
+
+        for process in activeProcesses {
+            process.terminateSynchronously()
+        }
+    }
+}
+
 private final class ManagedProcess: @unchecked Sendable {
     enum StopCause: Sendable {
         case timedOut
@@ -204,9 +270,13 @@ private final class ManagedProcess: @unchecked Sendable {
 
     private let process: Process
     private let terminationGracePeriod: TimeInterval
-    private let lock = NSLock()
+    private let condition = NSCondition()
     private var launched = false
+    private var launchFinishedWithoutProcess = false
     private var stopCause: StopCause?
+    private var terminationSignalSent = false
+    private var forceKillRequested = false
+    private var forceKillSignalSent = false
     private var termination: Termination?
     private var terminationWaiters: [CheckedContinuation<Termination, Never>] = []
 
@@ -216,29 +286,80 @@ private final class ManagedProcess: @unchecked Sendable {
     }
 
     func processDidLaunch() {
-        let pendingStop: StopCause?
-        lock.lock()
+        let signal: Int32?
+        let processIdentifier: pid_t
+        condition.lock()
         launched = true
-        pendingStop = stopCause
-        lock.unlock()
+        processIdentifier = process.processIdentifier
+        if forceKillRequested, termination == nil, !forceKillSignalSent {
+            forceKillSignalSent = true
+            signal = SIGKILL
+        } else if stopCause != nil, termination == nil, !terminationSignalSent {
+            terminationSignalSent = true
+            signal = SIGTERM
+        } else {
+            signal = nil
+        }
+        condition.broadcast()
+        condition.unlock()
 
-        if pendingStop != nil {
-            signalTermination()
+        if let signal {
+            send(signal, to: processIdentifier)
         }
     }
 
+    func processWillNotLaunch() {
+        condition.lock()
+        launchFinishedWithoutProcess = true
+        condition.broadcast()
+        condition.unlock()
+    }
+
     func requestStop(_ cause: StopCause) {
-        let shouldSignal: Bool
-        lock.lock()
+        let processIdentifier: pid_t?
+        condition.lock()
         if termination == nil, stopCause == nil {
             stopCause = cause
         }
-        shouldSignal = launched && termination == nil
-        lock.unlock()
-
-        if shouldSignal {
-            signalTermination()
+        if launched, termination == nil, !terminationSignalSent, !forceKillRequested {
+            terminationSignalSent = true
+            processIdentifier = process.processIdentifier
+        } else {
+            processIdentifier = nil
         }
+        condition.unlock()
+
+        if let processIdentifier {
+            send(SIGTERM, to: processIdentifier)
+        }
+    }
+
+    /// Force-kills a process even when launch is concurrently in progress, then
+    /// blocks until Foundation has reaped it and delivered termination metadata.
+    func terminateSynchronously() {
+        let processIdentifier: pid_t?
+        condition.lock()
+        if termination == nil, stopCause == nil {
+            stopCause = .cancelled
+        }
+        forceKillRequested = true
+        if launched, termination == nil {
+            forceKillSignalSent = true
+            processIdentifier = process.processIdentifier
+        } else {
+            processIdentifier = nil
+        }
+        condition.unlock()
+
+        if let processIdentifier {
+            _ = Darwin.kill(processIdentifier, SIGKILL)
+        }
+
+        condition.lock()
+        while termination == nil, !launchFinishedWithoutProcess {
+            condition.wait()
+        }
+        condition.unlock()
     }
 
     func processDidTerminate(_ process: Process) {
@@ -250,9 +371,9 @@ private final class ManagedProcess: @unchecked Sendable {
 
         let waiters: [CheckedContinuation<Termination, Never>]
         let result: Termination
-        lock.lock()
+        condition.lock()
         if termination != nil {
-            lock.unlock()
+            condition.unlock()
             return
         }
         result = Termination(
@@ -263,7 +384,8 @@ private final class ManagedProcess: @unchecked Sendable {
         termination = result
         waiters = terminationWaiters
         terminationWaiters.removeAll()
-        lock.unlock()
+        condition.broadcast()
+        condition.unlock()
 
         for waiter in waiters {
             waiter.resume(returning: result)
@@ -272,38 +394,154 @@ private final class ManagedProcess: @unchecked Sendable {
 
     func waitForTermination() async -> Termination {
         await withCheckedContinuation { continuation in
-            lock.lock()
+            condition.lock()
             if let termination {
-                lock.unlock()
+                condition.unlock()
                 continuation.resume(returning: termination)
             } else {
                 terminationWaiters.append(continuation)
-                lock.unlock()
+                condition.unlock()
             }
         }
     }
 
-    private func signalTermination() {
-        let processIdentifier = process.processIdentifier
+    private func send(_ signal: Int32, to processIdentifier: pid_t) {
         guard processIdentifier > 0 else {
             return
         }
 
-        _ = Darwin.kill(processIdentifier, SIGTERM)
+        _ = Darwin.kill(processIdentifier, signal)
 
-        let deadline = DispatchTime.now() + terminationGracePeriod
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: deadline) { [weak self] in
-            self?.forceKillIfNeeded(processIdentifier: processIdentifier)
+        if signal == SIGTERM {
+            let deadline = DispatchTime.now() + terminationGracePeriod
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: deadline) { [weak self] in
+                self?.forceKillIfNeeded(processIdentifier: processIdentifier)
+            }
         }
     }
 
     private func forceKillIfNeeded(processIdentifier: pid_t) {
-        lock.lock()
-        let stillRunning = termination == nil
-        lock.unlock()
+        let shouldForceKill: Bool
+        condition.lock()
+        if termination == nil, launched, !forceKillSignalSent {
+            forceKillSignalSent = true
+            shouldForceKill = true
+        } else {
+            shouldForceKill = false
+        }
+        condition.unlock()
 
-        if stillRunning {
+        if shouldForceKill {
             _ = Darwin.kill(processIdentifier, SIGKILL)
         }
+    }
+}
+
+/// Drains a subprocess pipe without requiring EOF after the direct child exits.
+/// A descendant may inherit the write descriptor, so the final drain is bounded
+/// to data already available when termination is confirmed.
+private final class ProcessPipeDrain: @unchecked Sendable {
+    private enum ReadResult {
+        case unavailable
+        case ended
+        case bounded
+    }
+
+    private static let bufferSize = 64 * 1024
+    private static let maximumFinalReadCount = 256
+
+    private let fileHandle: FileHandle
+    private let lock = NSLock()
+    private var shouldStop = false
+
+    init(fileHandle: FileHandle) {
+        self.fileHandle = fileHandle
+        let descriptor = fileHandle.fileDescriptor
+        let flags = Darwin.fcntl(descriptor, F_GETFL)
+        if flags >= 0 {
+            _ = Darwin.fcntl(descriptor, F_SETFL, flags | O_NONBLOCK)
+        }
+    }
+
+    func stopAfterProcessTermination() {
+        lock.lock()
+        shouldStop = true
+        lock.unlock()
+    }
+
+    func drain() -> Data {
+        var data = Data()
+        let descriptor = fileHandle.fileDescriptor
+        defer {
+            try? fileHandle.close()
+        }
+
+        while true {
+            if stopRequested {
+                _ = readAvailable(
+                    from: descriptor,
+                    into: &data,
+                    maximumReadCount: Self.maximumFinalReadCount
+                )
+                return data
+            }
+
+            var pollDescriptor = pollfd(
+                fd: descriptor,
+                events: Int16(POLLIN | POLLHUP | POLLERR),
+                revents: 0
+            )
+            let pollResult = Darwin.poll(&pollDescriptor, 1, 50)
+            if pollResult > 0 {
+                let result = readAvailable(
+                    from: descriptor,
+                    into: &data,
+                    maximumReadCount: Self.maximumFinalReadCount
+                )
+                if case .ended = result {
+                    return data
+                }
+            } else if pollResult < 0, errno != EINTR {
+                return data
+            }
+        }
+    }
+
+    private var stopRequested: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return shouldStop
+    }
+
+    private func readAvailable(
+        from descriptor: Int32,
+        into data: inout Data,
+        maximumReadCount: Int
+    ) -> ReadResult {
+        var buffer = [UInt8](repeating: 0, count: Self.bufferSize)
+        var readCount = 0
+
+        while readCount < maximumReadCount {
+            let byteCount = buffer.withUnsafeMutableBytes { bytes in
+                Darwin.read(descriptor, bytes.baseAddress, bytes.count)
+            }
+            if byteCount > 0 {
+                data.append(contentsOf: buffer.prefix(Int(byteCount)))
+                readCount += 1
+                continue
+            }
+            if byteCount == 0 {
+                return .ended
+            }
+            if errno == EINTR {
+                continue
+            }
+            if errno == EAGAIN || errno == EWOULDBLOCK {
+                return .unavailable
+            }
+            return .ended
+        }
+
+        return .bounded
     }
 }

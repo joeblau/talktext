@@ -1,6 +1,12 @@
 @preconcurrency import AVFoundation
 import AppKit
 import Foundation
+import os
+
+private let recordingFileStoreLog = OSLog(
+    subsystem: "com.joeblau.talktext",
+    category: "recording-file-store"
+)
 
 enum MicrophoneAuthorization: Equatable, Sendable {
     case authorized
@@ -395,12 +401,28 @@ final class TemporaryRecordingFileStore: RecordingFileStoring {
         }
 
         let cutoff = now().addingTimeInterval(-max(0, age))
+        var metadataLookupFailed = false
         for url in contents where url.lastPathComponent.hasPrefix("instance-") {
             guard url.standardizedFileURL != instanceDirectoryURL.standardizedFileURL else {
                 continue
             }
-            guard let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .contentModificationDateKey]),
-                  values.isDirectory == true,
+            let values: URLResourceValues
+            do {
+                values = try url.resourceValues(
+                    forKeys: [.isDirectoryKey, .contentModificationDateKey]
+                )
+            } catch {
+                let errorType = String(describing: type(of: error))
+                os_log(
+                    "Stale recording metadata lookup failed; error type: %{public}@",
+                    log: recordingFileStoreLog,
+                    type: .error,
+                    errorType
+                )
+                metadataLookupFailed = true
+                continue
+            }
+            guard values.isDirectory == true,
                   let modificationDate = values.contentModificationDate,
                   modificationDate < cutoff else {
                 continue
@@ -410,6 +432,9 @@ final class TemporaryRecordingFileStore: RecordingFileStoring {
             } catch {
                 throw RecordingFileStoreError.cleanupFailed
             }
+        }
+        if metadataLookupFailed {
+            throw RecordingFileStoreError.cleanupFailed
         }
     }
 
@@ -534,6 +559,12 @@ enum TranscriptionOutcome: Equatable, Sendable {
 
 protocol WhisperTranscribing: Sendable {
     func transcribe(audioURL: URL) async -> TranscriptionOutcome
+    func terminateActiveTranscriptions()
+}
+
+extension WhisperTranscribing {
+    /// Transcribers that own no external process have nothing to terminate.
+    func terminateActiveTranscriptions() {}
 }
 
 struct WhisperTranscriber: WhisperTranscribing {
@@ -606,6 +637,10 @@ struct WhisperTranscriber: WhisperTranscribing {
             let cleaned = TranscriptOutputClassifier.clean(output)
             return cleaned.isEmpty ? .noSpeech : .success(cleaned)
         }
+    }
+
+    func terminateActiveTranscriptions() {
+        processRunner.terminateActiveProcesses()
     }
 }
 

@@ -190,6 +190,7 @@ final class EngineTranscriberFake: WhisperTranscribing, @unchecked Sendable {
     private var continuation: CheckedContinuation<TranscriptionOutcome, Never>?
     private var cancelled = false
     private(set) var invocationCount = 0
+    private(set) var synchronousTerminationCount = 0
 
     init(outcome: TranscriptionOutcome? = .noSpeech) {
         self.outcome = outcome
@@ -231,6 +232,13 @@ final class EngineTranscriberFake: WhisperTranscribing, @unchecked Sendable {
         self.continuation = nil
         lock.unlock()
         continuation?.resume(returning: outcome)
+    }
+
+    func terminateActiveTranscriptions() {
+        lock.lock()
+        synchronousTerminationCount += 1
+        lock.unlock()
+        resolveCancellation()
     }
 
     private func resolveCancellation() {

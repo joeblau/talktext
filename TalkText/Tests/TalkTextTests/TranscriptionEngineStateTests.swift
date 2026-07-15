@@ -1,3 +1,5 @@
+import AppKit
+import Darwin
 import Foundation
 import XCTest
 @testable import TalkText
@@ -141,6 +143,20 @@ final class TranscriptionEngineStateTests: XCTestCase {
         XCTAssertTrue(engine.statusText.contains("could not start"))
     }
 
+    func testRecorderConstructionFailureCleansAllocatedSessionFile() async {
+        let factory = EngineRecorderFactoryFake()
+        factory.creationError = CocoaError(.fileWriteUnknown)
+        let store = EngineFileStoreFake()
+        let engine = makeEngine(factory: factory, store: store)
+
+        engine.toggleRecording()
+        await waitUntil { engine.state == .failed }
+
+        XCTAssertEqual(factory.creationCount, 1)
+        XCTAssertEqual(store.removedURLs, store.allocatedURLs)
+        XCTAssertTrue(engine.statusText.contains("could not be created"))
+    }
+
     func testSynchronousRecorderCompletionDuringStartCannotReportRecording() async {
         let recorder = EngineRecorderFake()
         let factory = EngineRecorderFactoryFake(recorders: [recorder])
@@ -175,6 +191,34 @@ final class TranscriptionEngineStateTests: XCTestCase {
 
             XCTAssertEqual(engine.state, .failed)
             XCTAssertEqual(store.removedURLs.count, 1)
+        }
+    }
+
+    func testEveryRecorderStopFailureCleansAllocatedSessionFile() async {
+        let failures: [RecorderStopOutcome] = [
+            .notRecording,
+            .encodeError(RecorderErrorDiagnostic(domain: "fixture", code: 17)),
+            .unsuccessfulCompletion,
+            .finalizationTimedOut,
+            .cancelled,
+        ]
+
+        for failure in failures {
+            let recorder = EngineRecorderFake()
+            recorder.immediateStopOutcome = failure
+            let store = EngineFileStoreFake()
+            let engine = makeEngine(
+                factory: EngineRecorderFactoryFake(recorders: [recorder]),
+                store: store
+            )
+            engine.toggleRecording()
+            await waitUntil { engine.state == .recording }
+
+            engine.toggleRecording()
+            await waitUntil { engine.state == .failed }
+
+            XCTAssertEqual(store.allocatedURLs.count, 1)
+            XCTAssertEqual(store.removedURLs, store.allocatedURLs)
         }
     }
 
@@ -309,12 +353,71 @@ final class TranscriptionEngineStateTests: XCTestCase {
         XCTAssertEqual(terminationRecorder.cancelCount, 1)
     }
 
+    func testCancellationCleansAudioFromEveryFileOwningActiveState() async {
+        for activeState in FileOwningActiveState.allCases {
+            await assertSessionCleanup(from: activeState, action: .cancel)
+        }
+    }
+
+    func testApplicationTerminationCleansAudioFromEveryFileOwningActiveState() async {
+        for activeState in FileOwningActiveState.allCases {
+            await assertSessionCleanup(from: activeState, action: .terminateApplication)
+        }
+    }
+
+    func testApplicationTerminationDuringTranscriptionSynchronouslyKillsSIGTERMIgnoringChild() async throws {
+        let fixtureDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TalkText-EngineTermination-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: fixtureDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: fixtureDirectory) }
+        let processPIDFile = fixtureDirectory.appendingPathComponent("whisper.pid")
+        let executable = try makeSIGTERMIgnoringExecutable(
+            in: fixtureDirectory,
+            processPIDFile: processPIDFile
+        )
+        let dependencies = ResolvedWhisperDependencies(
+            binaryURL: executable,
+            modelURL: fixtureDirectory.appendingPathComponent("model.bin")
+        )
+        let processRunner = FoundationProcessRunner(terminationGracePeriod: 30)
+        let transcriber = WhisperTranscriber(
+            dependencyResolver: EngineDependencyResolverFake(result: .resolved(dependencies)),
+            audioValidator: EngineAudioValidatorFake(result: .valid(duration: 1)),
+            processRunner: processRunner,
+            timeout: 30
+        )
+        let store = EngineFileStoreFake()
+        let engine = makeEngine(store: store, transcriber: transcriber)
+        let hotKeyController = HotKeyController(service: EngineHotKeyServiceFake())
+        let appDelegate = AppDelegate(
+            transcriptionEngine: engine,
+            hotKeyController: hotKeyController
+        )
+        engine.toggleRecording()
+        await waitUntil { engine.state == .recording }
+        engine.toggleRecording()
+        await waitUntil { engine.state == .transcribing }
+        let processIdentifier = try await waitForProcessIdentifier(from: processPIDFile)
+
+        appDelegate.applicationWillTerminate(
+            Notification(name: NSApplication.willTerminateNotification)
+        )
+
+        XCTAssertEqual(Darwin.kill(processIdentifier, 0), -1)
+        XCTAssertEqual(errno, ESRCH)
+        XCTAssertEqual(store.removedURLs, store.allocatedURLs)
+        XCTAssertEqual(store.instanceCleanupCount, 1)
+    }
+
     private func makeEngine(
         preflight: EnginePreflightFake = EnginePreflightFake(),
         permission: EnginePermissionFake = EnginePermissionFake(),
         factory: EngineRecorderFactoryFake = EngineRecorderFactoryFake(),
         store: EngineFileStoreFake = EngineFileStoreFake(),
-        transcriber: EngineTranscriberFake = EngineTranscriberFake(),
+        transcriber: any WhisperTranscribing = EngineTranscriberFake(),
         delivery: EngineDeliveryFake = EngineDeliveryFake()
     ) -> TranscriptionEngine {
         TranscriptionEngine(
@@ -326,6 +429,130 @@ final class TranscriptionEngineStateTests: XCTestCase {
             textDelivery: delivery,
             performStartupCleanup: false
         )
+    }
+
+    private enum FileOwningActiveState: CaseIterable, Equatable {
+        case stopping
+        case transcribing
+        case delivering
+    }
+
+    private enum SessionCleanupAction: Equatable {
+        case cancel
+        case terminateApplication
+    }
+
+    private func assertSessionCleanup(
+        from activeState: FileOwningActiveState,
+        action: SessionCleanupAction,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        let recorder = EngineRecorderFake()
+        let transcriber: EngineTranscriberFake
+        let delivery: EngineDeliveryFake
+        switch activeState {
+        case .stopping:
+            recorder.immediateStopOutcome = nil
+            transcriber = EngineTranscriberFake()
+            delivery = EngineDeliveryFake()
+        case .transcribing:
+            transcriber = EngineTranscriberFake(outcome: nil)
+            delivery = EngineDeliveryFake()
+        case .delivering:
+            transcriber = EngineTranscriberFake(outcome: .success("fixture transcript"))
+            delivery = EngineDeliveryFake(outcome: nil)
+        }
+
+        let store = EngineFileStoreFake()
+        let engine = makeEngine(
+            factory: EngineRecorderFactoryFake(recorders: [recorder]),
+            store: store,
+            transcriber: transcriber,
+            delivery: delivery
+        )
+        engine.toggleRecording()
+        await waitUntil { engine.state == .recording }
+        engine.toggleRecording()
+
+        switch activeState {
+        case .stopping:
+            await waitUntil { engine.state == .stopping && recorder.stopCount == 1 }
+        case .transcribing:
+            await waitUntil {
+                engine.state == .transcribing && transcriber.invocationCount == 1
+            }
+        case .delivering:
+            await waitUntil {
+                engine.state == .delivering && delivery.deliveredTexts.count == 1
+            }
+        }
+
+        switch action {
+        case .cancel:
+            engine.cancelCurrentOperation()
+        case .terminateApplication:
+            engine.cleanup()
+        }
+
+        XCTAssertEqual(store.allocatedURLs.count, 1, file: file, line: line)
+        XCTAssertEqual(store.removedURLs, store.allocatedURLs, file: file, line: line)
+        XCTAssertEqual(
+            store.instanceCleanupCount,
+            action == .terminateApplication ? 1 : 0,
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            transcriber.synchronousTerminationCount,
+            action == .terminateApplication ? 1 : 0,
+            file: file,
+            line: line
+        )
+
+        if activeState == .delivering {
+            delivery.resolve(.inserted)
+            await spinMainActor()
+        }
+    }
+
+    private func makeSIGTERMIgnoringExecutable(
+        in directory: URL,
+        processPIDFile: URL
+    ) throws -> URL {
+        let executable = directory.appendingPathComponent("whisper-cli")
+        let script = """
+        #!/bin/sh
+        set -eu
+        trap '' TERM
+        printf '%s' "$$" > '\(processPIDFile.path)'
+        while :; do :; done
+        """
+        try script.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: Int16(0o700))],
+            ofItemAtPath: executable.path
+        )
+        return executable
+    }
+
+    private func readProcessIdentifier(from url: URL) throws -> pid_t {
+        let value = try String(contentsOf: url, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let processIdentifier = pid_t(value) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        return processIdentifier
+    }
+
+    private func waitForProcessIdentifier(from url: URL) async throws -> pid_t {
+        for _ in 0..<200 {
+            if let processIdentifier = try? readProcessIdentifier(from: url) {
+                return processIdentifier
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        throw CocoaError(.fileReadNoSuchFile)
     }
 
     private func waitUntil(
@@ -346,5 +573,34 @@ final class TranscriptionEngineStateTests: XCTestCase {
         for _ in 0..<20 {
             await Task.yield()
         }
+    }
+}
+
+private struct EngineDependencyResolverFake: WhisperDependencyResolving {
+    let result: WhisperDependencyResolution
+
+    func resolveDependencies() -> WhisperDependencyResolution {
+        result
+    }
+}
+
+private struct EngineAudioValidatorFake: AudioValidating {
+    let result: AudioValidationResult
+
+    func validateAudio(at url: URL) -> AudioValidationResult {
+        result
+    }
+}
+
+@MainActor
+private final class EngineHotKeyServiceFake: GlobalHotKeyService {
+    func install(
+        action: @escaping @MainActor @Sendable () -> Void
+    ) -> Result<Void, HotKeyInstallationError> {
+        .success(())
+    }
+
+    func uninstall() -> Result<Void, HotKeyCleanupError> {
+        .success(())
     }
 }

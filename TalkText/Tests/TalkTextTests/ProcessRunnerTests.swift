@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import XCTest
 @testable import TalkText
@@ -132,6 +133,70 @@ final class ProcessRunnerTests: XCTestCase {
         XCTAssertLessThan(Date().timeIntervalSince(start), 2)
     }
 
+    func testTimeoutIsNotDefeatedByPipeInheritingDescendant() async throws {
+        let descendantPIDFile = fixtureDirectory.appendingPathComponent("descendant.pid")
+        let executable = try makeExecutable(
+            named: "inherited-pipe-timeout",
+            body: """
+            sleep 30 &
+            descendant_pid=$!
+            printf '%s' "$descendant_pid" > "$1"
+            trap '' TERM
+            while :; do :; done
+            """
+        )
+        let start = Date()
+
+        let result = await FoundationProcessRunner(terminationGracePeriod: 0.05).run(
+            ProcessCommand(
+                executableURL: executable,
+                arguments: [descendantPIDFile.path]
+            ),
+            timeout: 1
+        )
+
+        let descendantPID = try readProcessIdentifier(from: descendantPIDFile)
+        defer { _ = Darwin.kill(descendantPID, SIGKILL) }
+        guard case .timedOut = result else {
+            return XCTFail("Expected timeout, received \(result)")
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(start), 5)
+        XCTAssertEqual(Darwin.kill(descendantPID, 0), 0)
+    }
+
+    func testSynchronousTerminationWaitsForSIGTERMIgnoringProcessToExit() async throws {
+        let processPIDFile = fixtureDirectory.appendingPathComponent("active.pid")
+        let executable = try makeExecutable(
+            named: "synchronous-termination",
+            body: """
+            trap '' TERM
+            printf '%s' "$$" > "$1"
+            while :; do :; done
+            """
+        )
+        let runner = FoundationProcessRunner(terminationGracePeriod: 30)
+        let task = Task {
+            await runner.run(
+                ProcessCommand(
+                    executableURL: executable,
+                    arguments: [processPIDFile.path]
+                ),
+                timeout: 30
+            )
+        }
+        let processIdentifier = try await waitForProcessIdentifier(from: processPIDFile)
+
+        runner.terminateActiveProcesses()
+
+        XCTAssertEqual(Darwin.kill(processIdentifier, 0), -1)
+        XCTAssertEqual(errno, ESRCH)
+        guard case let .cancelled(diagnostic) = await task.value else {
+            return XCTFail("Expected cancellation after synchronous termination")
+        }
+        XCTAssertEqual(diagnostic.terminationReason, .uncaughtSignal)
+        XCTAssertEqual(diagnostic.terminationStatus, SIGKILL)
+    }
+
     func testLaunchFailurePreservesTypedNSErrorMetadata() async {
         let missingURL = fixtureDirectory.appendingPathComponent("does-not-exist")
 
@@ -158,5 +223,24 @@ final class ProcessRunnerTests: XCTestCase {
             ofItemAtPath: url.path
         )
         return url
+    }
+
+    private func waitForProcessIdentifier(from url: URL) async throws -> pid_t {
+        for _ in 0..<200 {
+            if let processIdentifier = try? readProcessIdentifier(from: url) {
+                return processIdentifier
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        throw CocoaError(.fileReadNoSuchFile)
+    }
+
+    private func readProcessIdentifier(from url: URL) throws -> pid_t {
+        let value = try String(contentsOf: url, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let processIdentifier = pid_t(value) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        return processIdentifier
     }
 }
