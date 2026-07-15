@@ -37,6 +37,33 @@ instead, run:
 open TalkText.app
 ```
 
+### Debugging in Xcode
+
+TalkText needs a real app bundle to exercise: microphone access, accessibility,
+and the menu-bar-only presentation all depend on it, so `swift run` cannot run
+the app. To debug it with breakpoints, generate a development Xcode project:
+
+```sh
+brew install xcodegen   # once
+./scripts/generate-xcodeproj.sh
+open TalkText.xcodeproj
+```
+
+The project is generated from [project.yml](project.yml) and is not tracked;
+regenerate it after adding or removing sources. It reads the same canonical
+`TalkText/Info.plist` and entitlements the release path uses, and a build phase
+injects `CFBundleVersion` and `CFBundleShortVersionString` from `VERSION`, so an
+Xcode build reports the same version as a released one. Its scheme sets
+`TALKTEXT_DEVELOPMENT_ROOT` to `$(SRCROOT)`, because a build running from
+DerivedData cannot infer the checkout the way the SwiftPM executable does.
+
+A bare `xcodegen generate` also works. Prefer the script: it additionally fails
+when the names in `project.yml` drift from the canonical `Info.plist`, which a
+plain `xcodegen` run cannot check.
+
+Xcode builds are ad-hoc signed and for development only. Release artifacts still
+come from `./bundle.sh`, which is what CI verifies.
+
 See [docs/RELEASING.md](docs/RELEASING.md) for the architecture, signing,
 notarization, and required-check policy.
 
