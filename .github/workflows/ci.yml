@@ -131,6 +131,7 @@ jobs:
     env:
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
       EXPECTED_CMAKE_VERSION: 4.1.2
+      EXPECTED_CMAKE_BUILD_VERSION: 4.1.2-gc33710e
     defaults:
       run:
         shell: bash
@@ -174,13 +175,13 @@ jobs:
               }
             ')"
             printf 'cmake candidate=%s version=%s\n' "$candidate" "${candidate_version:-unreported}"
-            if [[ "$candidate_version" == "$EXPECTED_CMAKE_VERSION" ]]; then
+            if [[ "$candidate_version" == "$EXPECTED_CMAKE_BUILD_VERSION" ]]; then
               CMAKE_BIN="$candidate"
               break
             fi
           done
           [[ -n "$CMAKE_BIN" ]] || {
-            echo "error: CMake $EXPECTED_CMAKE_VERSION is not installed" >&2
+            echo "error: CMake build $EXPECTED_CMAKE_BUILD_VERSION is not installed" >&2
             exit 1
           }
           echo "CMAKE_BIN=$CMAKE_BIN" >> "$GITHUB_ENV"

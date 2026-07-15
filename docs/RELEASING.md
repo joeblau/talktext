@@ -91,7 +91,7 @@ check. Tag releases call the same reusable workflow first, and publishing
 cannot start unless it succeeds.
 
 The check pins macOS to `macos-15-intel` and `macos-15`, Xcode to 16.4, CMake
-to an installed executable that reports exactly 4.1.2, third-party lint tool versions and
+to the runner's exact `4.1.2-gc33710e` build (package version 4.1.2), third-party lint tool versions and
 archive digests, and every GitHub Action to a full commit SHA. SwiftPM, model,
 backend, and tool caches use explicit, versioned keys. The gate covers:
 
