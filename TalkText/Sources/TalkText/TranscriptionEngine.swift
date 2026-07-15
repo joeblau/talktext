@@ -1,569 +1,582 @@
-@preconcurrency import AVFoundation
-import ApplicationServices
 import AppKit
+import Foundation
 import os
 
-private let logger = Logger(subsystem: "com.joeblau.talktext", category: "engine")
-
-private struct PasteTarget: Equatable {
-    let processIdentifier: pid_t
-    let bundleIdentifier: String?
-}
-
-// Audio recording happens off the main actor to avoid concurrency issues
-private final class AudioRecorderHelper: NSObject, AVAudioRecorderDelegate, @unchecked Sendable {
-    private var recorder: AVAudioRecorder?
-    let url: URL
-
-    init(url: URL) {
-        self.url = url
-    }
-
-    func start() -> Bool {
-        let settings: [String: Any] = [
-            AVFormatIDKey: Int(kAudioFormatLinearPCM),
-            AVSampleRateKey: 16000,
-            AVNumberOfChannelsKey: 1,
-            AVLinearPCMBitDepthKey: 16,
-            AVLinearPCMIsFloatKey: false,
-            AVLinearPCMIsBigEndianKey: false,
-        ]
-
-        try? FileManager.default.removeItem(at: url)
-
-        do {
-            recorder = try AVAudioRecorder(url: url, settings: settings)
-            recorder?.delegate = self
-            recorder?.isMeteringEnabled = true
-            let started = recorder?.record() ?? false
-            if started {
-                recorder?.updateMeters()
-                let avg = recorder?.averagePower(forChannel: 0) ?? -999
-                logger.notice("Recording started. Avg power: \(avg) dB")
-            }
-            return started
-        } catch {
-            logger.error("AVAudioRecorder init failed: \(error.localizedDescription)")
-            return false
-        }
-    }
-
-    func stop() {
-        recorder?.stop()
-        recorder = nil
-    }
-}
+private let logger = Logger(subsystem: AppIdentity.bundleIdentifier, category: "engine")
 
 @MainActor
 final class TranscriptionEngine: ObservableObject {
-    enum State: Equatable {
+    /// Five minutes bounds disk use and prevents an unattended recording from
+    /// continuing indefinitely. Reaching the limit finalizes and transcribes the
+    /// recording exactly as if the user had stopped it.
+    static let maximumRecordingDuration: TimeInterval = 5 * 60
+
+    enum State: Equatable, Sendable {
         case idle
+        case requestingPermission
+        case starting
         case recording
+        case stopping
         case transcribing
+        case delivering
+        case failed
     }
 
-    @Published var state: State = .idle
-    @Published var statusText: String = "Press Ctrl+Space to record"
+    struct Presentation: Equatable, Sendable {
+        let state: State
+        let statusText: String
+    }
 
-    private var recorderHelper: AudioRecorderHelper?
-    private let recordingURL: URL
-    private let whisperBinaryPath: String
-    private let modelPath: String
-    private var currentSessionPasteTarget: PasteTarget?
-    private var lastExternalPasteTarget: PasteTarget?
-    private var activationObserver: NSObjectProtocol?
+    @Published private(set) var state: State
+    @Published private(set) var statusText: String
 
-    init() {
-        let tempDir = FileManager.default.temporaryDirectory
-        self.recordingURL = tempDir.appendingPathComponent("whisper_recording.wav")
+    var isInteractive: Bool {
+        state == .idle || state == .failed
+    }
 
-        let possibleBinaryPaths = [
-            "/opt/homebrew/bin/whisper-cli",
-            "/usr/local/bin/whisper-cli",
-            "\(NSHomeDirectory())/.local/bin/whisper-cli",
-        ]
-        self.whisperBinaryPath = possibleBinaryPaths.first { FileManager.default.fileExists(atPath: $0) } ?? "/opt/homebrew/bin/whisper-cli"
+    private let permissionProvider: any MicrophonePermissionProviding
+    private let recorderFactory: any AudioRecorderCreating
+    private let recordingFileStore: any RecordingFileStoring
+    private let dependencyPreflight: any WhisperDependencyPreflighting
+    private let transcriber: any WhisperTranscribing
+    private let textDelivery: any TextDelivering
+    private let applicationBundleIdentifier: String?
+    private let maximumDuration: TimeInterval
 
-        let possibleModelPaths = [
-            Bundle.main.resourceURL?.appendingPathComponent("models/ggml-base.en.bin").path,
-            "\(NSHomeDirectory())/Developer/joeblau/src/whisper/models/ggml-base.en.bin",
-            "\(NSHomeDirectory())/.local/share/whisper/ggml-base.en.bin",
-            "/opt/homebrew/share/whisper/models/ggml-base.en.bin",
-        ].compactMap { $0 }
-        self.modelPath = possibleModelPaths.first { FileManager.default.fileExists(atPath: $0) }
-            ?? "\(NSHomeDirectory())/Developer/joeblau/src/whisper/models/ggml-base.en.bin"
+    private var currentSessionIdentifier: UUID?
+    private var currentSessionTarget: PasteTarget?
+    private var currentRecordingURL: URL?
+    private var currentRecorder: (any AudioRecording)?
+    private var activeTask: Task<Void, Never>?
+    private var dependencyPreparationTask: Task<TalkTextDependencyPreflightResult, Never>?
+    private var dependencyPresentationTask: Task<Void, Never>?
+    private var cachedDependencyPreflight: TalkTextDependencyPreflightResult?
 
-        activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didActivateApplicationNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] notification in
-            guard let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else {
-                return
-            }
-
-            Task { @MainActor [weak self] in
-                self?.rememberExternalApplication(application)
-            }
+    convenience init() {
+        let recordingFileStore: any RecordingFileStoring
+        let startupPresentation: Presentation?
+        do {
+            recordingFileStore = try TemporaryRecordingFileStore()
+            startupPresentation = nil
+        } catch {
+            recordingFileStore = UnavailableRecordingFileStore()
+            startupPresentation = Presentation(
+                state: .failed,
+                statusText: "Temporary recording storage is unavailable. Restart TalkText."
+            )
         }
 
-        if let application = currentExternalApplication() {
-            rememberExternalApplication(application)
+        let dependencyResolver = TalkTextDependencyResolver()
+        self.init(
+            permissionProvider: SystemMicrophonePermissionProvider(),
+            recorderFactory: SystemAudioRecorderFactory(),
+            recordingFileStore: recordingFileStore,
+            dependencyPreflight: dependencyResolver,
+            transcriber: WhisperTranscriber(dependencyResolver: dependencyResolver),
+            textDelivery: TextDeliveryService(),
+            applicationBundleIdentifier: Bundle.main.bundleIdentifier,
+            startupPresentation: startupPresentation
+        )
+    }
+
+    init(
+        permissionProvider: any MicrophonePermissionProviding,
+        recorderFactory: any AudioRecorderCreating,
+        recordingFileStore: any RecordingFileStoring,
+        dependencyPreflight: any WhisperDependencyPreflighting,
+        transcriber: any WhisperTranscribing,
+        textDelivery: any TextDelivering,
+        applicationBundleIdentifier: String? = AppIdentity.bundleIdentifier,
+        maximumDuration: TimeInterval = TranscriptionEngine.maximumRecordingDuration,
+        performStartupCleanup: Bool = true,
+        startupPresentation: Presentation? = nil
+    ) {
+        self.permissionProvider = permissionProvider
+        self.recorderFactory = recorderFactory
+        self.recordingFileStore = recordingFileStore
+        self.dependencyPreflight = dependencyPreflight
+        self.transcriber = transcriber
+        self.textDelivery = textDelivery
+        self.applicationBundleIdentifier = applicationBundleIdentifier
+        self.maximumDuration = maximumDuration
+        state = startupPresentation?.state ?? .idle
+        statusText = startupPresentation?.statusText ?? "Press Ctrl+Space to record"
+
+        if performStartupCleanup {
+            do {
+                try recordingFileStore.removeStaleOwnedFiles(
+                    olderThan: TemporaryRecordingFileStore.staleFileAge
+                )
+            } catch {
+                logTemporaryFileError(operation: "stale cleanup", error: error)
+            }
         }
     }
 
     func toggleRecording() {
-        logger.notice("toggleRecording, state: \(String(describing: self.state))")
         switch state {
-        case .idle:
-            capturePasteTargetForCurrentSession()
-            startRecording()
+        case .idle, .failed:
+            startRecordingFlow()
+        case .starting where currentSessionIdentifier == nil:
+            // A launch-time dependency check is in flight. Preserve the user's
+            // intent and await the same cached task instead of dropping input.
+            startRecordingFlow()
         case .recording:
-            stopRecordingAndTranscribe()
-        case .transcribing:
+            stopRecordingFlow()
+        case .requestingPermission, .starting, .stopping, .transcribing, .delivering:
+            logger.debug("Ignored recording toggle while engine is busy")
+        }
+    }
+
+    /// Runs the canonical dependency preflight at launch and caches its typed
+    /// result. Recording reuses this task/result and still re-resolves immediately
+    /// before invoking Whisper, so removed or replaced files fail closed.
+    func prepareDependencies(forceRefresh: Bool = false) {
+        guard currentSessionIdentifier == nil else {
+            return
+        }
+        if forceRefresh {
+            cachedDependencyPreflight = nil
+            dependencyPreparationTask?.cancel()
+            dependencyPreparationTask = nil
+        }
+
+        transition(
+            to: Presentation(
+                state: .starting,
+                statusText: "Checking Whisper setup…"
+            )
+        )
+        dependencyPresentationTask?.cancel()
+        dependencyPresentationTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let result = await self.dependencyPreflightResult()
+            guard !Task.isCancelled, self.currentSessionIdentifier == nil else {
+                return
+            }
+            switch result {
+            case .ready:
+                self.transition(
+                    to: Presentation(
+                        state: .idle,
+                        statusText: "Ready. Press Ctrl+Space to record"
+                    )
+                )
+            case let .failure(failure):
+                self.transition(
+                    to: Presentation(state: .failed, statusText: failure.userMessage)
+                )
+            }
+        }
+    }
+
+    /// Cancels recording/transcription/delivery, removes session audio, and leaves
+    /// an explicit error presentation. This is also useful for deterministic
+    /// lifecycle tests; application termination should call `cleanup()` instead.
+    func cancelCurrentOperation() {
+        guard currentSessionIdentifier != nil else {
+            return
+        }
+        invalidateCurrentSession()
+        transition(
+            to: Presentation(
+                state: .failed,
+                statusText: "Operation cancelled. Press Ctrl+Space to try again."
+            )
+        )
+        logger.notice("Engine operation cancelled")
+    }
+
+    /// Synchronous lifecycle hook for normal application termination. Active
+    /// subprocesses are force-killed and confirmed terminated, and audio files
+    /// are removed before this method returns.
+    func cleanup() {
+        invalidateCurrentSession()
+        transcriber.terminateActiveTranscriptions()
+        dependencyPresentationTask?.cancel()
+        dependencyPresentationTask = nil
+        dependencyPreparationTask?.cancel()
+        dependencyPreparationTask = nil
+        do {
+            try recordingFileStore.cleanupInstance()
+        } catch {
+            logTemporaryFileError(operation: "instance cleanup", error: error)
+        }
+    }
+
+    private func startRecordingFlow() {
+        activeTask?.cancel()
+        activeTask = nil
+        dependencyPresentationTask?.cancel()
+        dependencyPresentationTask = nil
+
+        if dependencyPreparationTask == nil {
+            // Dependencies can be removed, replaced, or made unreadable after
+            // launch. Re-check every recording intent before microphone access.
+            cachedDependencyPreflight = nil
+        }
+
+        let sessionIdentifier = UUID()
+        currentSessionIdentifier = sessionIdentifier
+        currentSessionTarget = textDelivery.captureCurrentTarget(
+            excludingBundleIdentifier: applicationBundleIdentifier
+        )
+
+        transition(
+            to: Presentation(
+                state: .starting,
+                statusText: "Checking Whisper setup…"
+            )
+        )
+        activeTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let result = await self.dependencyPreflightResult()
+            guard self.currentSessionIdentifier == sessionIdentifier,
+                  self.state == .starting else {
+                return
+            }
+            self.activeTask = nil
+            switch result {
+            case .ready:
+                self.continueRecordingAfterPreflight(sessionIdentifier: sessionIdentifier)
+            case let .failure(failure):
+                self.finishFailure(failure.userMessage)
+            }
+        }
+    }
+
+    private func continueRecordingAfterPreflight(sessionIdentifier: UUID) {
+        guard currentSessionIdentifier == sessionIdentifier else {
+            return
+        }
+        switch permissionProvider.authorizationStatus() {
+        case .authorized:
+            beginRecording(sessionIdentifier: sessionIdentifier)
+        case .notDetermined:
+            transition(
+                to: Presentation(
+                    state: .requestingPermission,
+                    statusText: "Waiting for microphone permission…"
+                )
+            )
+            activeTask = Task { @MainActor [weak self] in
+                guard let self else { return }
+                let granted = await self.permissionProvider.requestAccess()
+                guard self.currentSessionIdentifier == sessionIdentifier,
+                      self.state == .requestingPermission else {
+                    return
+                }
+                self.activeTask = nil
+                if granted {
+                    self.beginRecording(sessionIdentifier: sessionIdentifier)
+                } else {
+                    self.finishFailure(
+                        "Microphone access was denied. Enable it in System Settings > Privacy & Security > Microphone."
+                    )
+                }
+            }
+        case .denied:
+            finishFailure(
+                "Microphone access is denied. Enable it in System Settings > Privacy & Security > Microphone."
+            )
+        case .restricted:
+            finishFailure(
+                "Microphone access is restricted on this Mac. Check device or parental-control settings."
+            )
+        case .unknown:
+            finishFailure(
+                "Microphone permission could not be determined. Check System Settings and try again."
+            )
+        }
+    }
+
+    private func beginRecording(sessionIdentifier: UUID) {
+        guard currentSessionIdentifier == sessionIdentifier else {
+            return
+        }
+        transition(to: Presentation(state: .starting, statusText: "Starting recording…"))
+
+        let recordingURL: URL
+        do {
+            recordingURL = try recordingFileStore.allocateRecordingURL()
+        } catch {
+            logTemporaryFileError(operation: "allocation", error: error)
+            finishFailure("Couldn’t create a private temporary recording. Check disk space and try again.")
+            return
+        }
+        currentRecordingURL = recordingURL
+
+        do {
+            let recorder = try recorderFactory.makeRecorder(at: recordingURL) { [weak self] event in
+                self?.handleRecorderEvent(event, sessionIdentifier: sessionIdentifier)
+            }
+            currentRecorder = recorder
+            let started = recorder.start(maximumDuration: maximumDuration)
+            guard started, recorder.isRecording else {
+                currentRecorder = nil
+                if currentSessionIdentifier == sessionIdentifier {
+                    finishFailure("The microphone recorder could not start. Check the selected input device.")
+                }
+                return
+            }
+
+            guard currentSessionIdentifier == sessionIdentifier, state == .starting else {
+                recorder.cancel()
+                return
+            }
+            transition(
+                to: Presentation(
+                    state: .recording,
+                    statusText: "Recording… Press Ctrl+Space to stop"
+                )
+            )
+            logger.notice("Recording started")
+        } catch {
+            currentRecorder = nil
+            removeCurrentRecording()
+            finishFailure("The microphone recorder could not be created. Check the input device and try again.")
+            logger.error("Audio recorder creation failed")
+        }
+    }
+
+    private func stopRecordingFlow() {
+        guard let sessionIdentifier = currentSessionIdentifier,
+              let recorder = currentRecorder else {
+            finishFailure("No active recorder was available. Please try again.")
+            return
+        }
+
+        transition(to: Presentation(state: .stopping, statusText: "Finalizing recording…"))
+        activeTask = Task { @MainActor [weak self, recorder] in
+            let outcome = await recorder.stop()
+            guard let self,
+                  self.currentSessionIdentifier == sessionIdentifier,
+                  self.state == .stopping else {
+                return
+            }
+            self.activeTask = nil
+            self.currentRecorder = nil
+
+            switch outcome {
+            case .finished:
+                self.beginTranscription(sessionIdentifier: sessionIdentifier)
+            case .notRecording, .unsuccessfulCompletion:
+                self.finishFailure("Recording ended unexpectedly. Check the input device and try again.")
+            case .finalizationTimedOut:
+                self.finishFailure("Recording could not be finalized. Check the input device and try again.")
+            case .encodeError:
+                self.finishFailure("The recording could not be encoded. Check disk space and the input device.")
+            case .cancelled:
+                self.finishFailure("Recording was cancelled. Press Ctrl+Space to try again.")
+            }
+        }
+    }
+
+    private func handleRecorderEvent(_ event: RecorderEvent, sessionIdentifier: UUID) {
+        guard currentSessionIdentifier == sessionIdentifier else {
+            return
+        }
+
+        switch event {
+        case .maximumDurationReached where state == .recording:
+            currentRecorder = nil
+            transition(
+                to: Presentation(
+                    state: .stopping,
+                    statusText: "Maximum recording length reached. Finalizing…"
+                )
+            )
+            beginTranscription(sessionIdentifier: sessionIdentifier)
+        case .interrupted:
+            currentRecorder = nil
+            finishFailure("Recording was interrupted. Check the input device and try again.")
+        case .deviceUnavailable:
+            currentRecorder = nil
+            finishFailure("The microphone became unavailable. Reconnect it and try again.")
+        case .encodeError:
+            currentRecorder = nil
+            finishFailure("The recording could not be encoded. Check disk space and the input device.")
+        case .unexpectedCompletion:
+            currentRecorder = nil
+            finishFailure("Recording ended unexpectedly. Check the input device and try again.")
+        default:
+            // A stale or duplicate completion cannot advance another transition.
             break
         }
     }
 
-    private func startRecording() {
-        let authStatus = AVCaptureDevice.authorizationStatus(for: .audio)
-        logger.notice("Mic auth: \(authStatus.rawValue)")
-
-        switch authStatus {
-        case .authorized:
-            beginRecording()
-        case .notDetermined:
-            AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
-                DispatchQueue.main.async {
-                    if granted {
-                        self?.beginRecording()
-                    } else {
-                        logger.error("Mic permission denied")
-                        self?.statusText = "Microphone access denied"
-                        self?.state = .idle
-                    }
-                }
-            }
-        case .denied, .restricted:
-            logger.error("Mic denied/restricted")
-            statusText = "Microphone blocked. Check System Settings > Privacy > Microphone"
-            state = .idle
-        @unknown default:
-            beginRecording()
+    private func beginTranscription(sessionIdentifier: UUID) {
+        guard currentSessionIdentifier == sessionIdentifier,
+              let recordingURL = currentRecordingURL else {
+            return
         }
-    }
+        transition(to: Presentation(state: .transcribing, statusText: "Transcribing…"))
 
-    private func beginRecording() {
-        let helper = AudioRecorderHelper(url: recordingURL)
-        recorderHelper = helper
-
-        if helper.start() {
-            state = .recording
-            statusText = "Recording... Press Ctrl+Space to stop"
-        } else {
-            logger.error("Failed to start recording")
-            statusText = "Failed to start recording"
-            state = .idle
-        }
-    }
-
-    private func stopRecordingAndTranscribe() {
-        recorderHelper?.stop()
-        recorderHelper = nil
-        state = .transcribing
-        statusText = "Transcribing..."
-
-        let binaryPath = whisperBinaryPath
-        let model = modelPath
-        let audioPath = recordingURL.path
-
-        Task {
-            let text = await Self.runWhisper(binaryPath: binaryPath, modelPath: model, audioPath: audioPath)
-            let cleaned = text?
-                .replacingOccurrences(of: "[BLANK_AUDIO]", with: "")
-                .replacingOccurrences(of: "(blank audio)", with: "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-
-            logger.notice("Transcription: '\(cleaned ?? "nil")'")
-
-            if let cleaned = cleaned, !cleaned.isEmpty {
-                if pasteText(cleaned) {
-                    statusText = "Pasting... Press Ctrl+Space to record"
-                } else {
-                    statusText = "Copied. Enable Accessibility to auto-paste."
-                }
-            } else {
-                statusText = "No speech detected. Press Ctrl+Space to record"
+        activeTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let outcome = await self.transcriber.transcribe(audioURL: recordingURL)
+            guard self.currentSessionIdentifier == sessionIdentifier else {
+                return
             }
 
-            currentSessionPasteTarget = nil
-            state = .idle
+            self.removeCurrentRecording()
+            await self.handleTranscriptionOutcome(
+                outcome,
+                sessionIdentifier: sessionIdentifier
+            )
         }
     }
 
-    nonisolated private static func runWhisper(binaryPath: String, modelPath: String, audioPath: String) async -> String? {
-        guard FileManager.default.fileExists(atPath: binaryPath) else {
-            logger.error("whisper-cli not found at \(binaryPath)")
-            return nil
+    private func handleTranscriptionOutcome(
+        _ outcome: TranscriptionOutcome,
+        sessionIdentifier: UUID
+    ) async {
+        logTranscriptionOutcome(outcome)
+        let outcomePresentation = Self.presentation(for: outcome)
+        transition(to: outcomePresentation)
+
+        guard case let .success(text) = outcome else {
+            finishSessionKeepingPresentation()
+            return
         }
-        guard FileManager.default.fileExists(atPath: modelPath) else {
-            logger.error("Model not found at \(modelPath)")
-            return nil
+
+        let target = currentSessionTarget
+        let deliveryOutcome = await textDelivery.deliver(text, to: target)
+        guard currentSessionIdentifier == sessionIdentifier else {
+            return
         }
+        logger.notice("Delivery completed; characters: \(text.count, privacy: .public)")
+        transition(to: Self.presentation(for: deliveryOutcome))
+        finishSessionKeepingPresentation()
+    }
 
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: binaryPath)
-        process.arguments = [
-            "--model", modelPath,
-            "--file", audioPath,
-            "--no-timestamps",
-            "--threads", "4",
-        ]
+    private func invalidateCurrentSession() {
+        currentSessionIdentifier = nil
+        currentSessionTarget = nil
+        activeTask?.cancel()
+        activeTask = nil
+        currentRecorder?.cancel()
+        currentRecorder = nil
+        removeCurrentRecording()
+    }
 
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = Pipe()
+    private func finishFailure(_ message: String) {
+        activeTask?.cancel()
+        activeTask = nil
+        currentRecorder?.cancel()
+        currentRecorder = nil
+        removeCurrentRecording()
+        currentSessionIdentifier = nil
+        currentSessionTarget = nil
+        transition(to: Presentation(state: .failed, statusText: message))
+    }
 
+    private func finishSessionKeepingPresentation() {
+        activeTask = nil
+        currentRecorder = nil
+        currentRecordingURL = nil
+        currentSessionIdentifier = nil
+        currentSessionTarget = nil
+    }
+
+    private func removeCurrentRecording() {
+        guard let recordingURL = currentRecordingURL else {
+            return
+        }
+        currentRecordingURL = nil
         do {
-            try process.run()
-            process.waitUntilExit()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            try recordingFileStore.removeRecording(at: recordingURL)
         } catch {
-            return nil
+            logTemporaryFileError(operation: "session cleanup", error: error)
         }
     }
 
-    private func pasteText(_ text: String) -> Bool {
-        logger.notice("Attempting to insert transcription: \(text)")
+    private func transition(to presentation: Presentation) {
+        state = presentation.state
+        statusText = presentation.statusText
+    }
 
-        guard ensureAccessibilityPermission() else {
-            logger.error("Accessibility permission is required for auto-paste")
-            return false
-        }
-
-        if insertTextIntoFocusedElement(text) {
-            logger.notice("Inserted text into focused accessibility element")
-            statusText = "Pasted! Press Ctrl+Space to record"
-            return true
-        }
-
-        logger.notice("Direct accessibility insertion failed, falling back to synthetic paste")
-
-        guard ensurePostEventPermission() else {
-            logger.error("Event posting permission is required for synthetic paste fallback")
-            return false
-        }
-
-        let pasteboard = NSPasteboard.general
-        let originalItems = duplicatePasteboardItems(from: pasteboard)
-        pasteboard.clearContents()
-        pasteboard.setString(text, forType: .string)
-        let transientChangeCount = pasteboard.changeCount
-
-        guard let target = resolvedPasteTarget(),
-              let targetApplication = runningApplication(for: target) else {
-            logger.error("Unable to resolve a target app for paste")
-            return false
-        }
-
-        logger.notice("Target app for paste: \(targetApplication.localizedName ?? "none"), pid: \(targetApplication.processIdentifier)")
-        attemptPasteIntoFrontmostApplication(
-            targetApplication,
-            pasteboard: pasteboard,
-            originalItems: originalItems,
-            transientChangeCount: transientChangeCount,
-            remainingRetries: 6
+    private func logTemporaryFileError(operation: StaticString, error: any Error) {
+        let errorType = String(describing: type(of: error))
+        logger.error(
+            "Temporary recording \(operation, privacy: .public) failed; error type: \(errorType, privacy: .public)"
         )
-
-        return true
     }
 
-    private func attemptPasteIntoFrontmostApplication(
-        _ targetApplication: NSRunningApplication,
-        pasteboard: NSPasteboard,
-        originalItems: [NSPasteboardItem]?,
-        transientChangeCount: Int,
-        remainingRetries: Int
-    ) {
-        targetApplication.activate(options: [.activateAllWindows])
+    private func logTranscriptionOutcome(_ outcome: TranscriptionOutcome) {
+        switch outcome {
+        case let .success(text):
+            logger.notice("Transcription succeeded; characters: \(text.count, privacy: .public)")
+        case .noSpeech:
+            logger.notice("Transcription succeeded with no speech")
+        case let .missingDependency(dependency):
+            logger.error(
+                "Transcription dependency missing; kind: \(String(describing: dependency), privacy: .public)"
+            )
+        case let .invalidAudio(reason):
+            logger.error(
+                "Transcription rejected invalid audio; reason: \(String(describing: reason), privacy: .public)"
+            )
+        case let .launchFailed(diagnostic):
+            logger.error(
+                "Transcription process launch failed; domain: \(diagnostic.launchErrorDomain ?? "unknown", privacy: .private), code: \(diagnostic.launchErrorCode ?? -1, privacy: .public)"
+            )
+        case let .processFailed(diagnostic):
+            logProcessDiagnostic("failed", diagnostic: diagnostic)
+        case let .timedOut(diagnostic):
+            logProcessDiagnostic("timed out", diagnostic: diagnostic)
+        case let .cancelled(diagnostic):
+            logProcessDiagnostic("cancelled", diagnostic: diagnostic)
+        }
+    }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-            let frontmostPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+    private func logProcessDiagnostic(_ outcome: StaticString, diagnostic: ProcessDiagnostic) {
+        logger.error(
+            "Transcription process \(outcome, privacy: .public); reason: \(String(describing: diagnostic.terminationReason), privacy: .public), status: \(diagnostic.terminationStatus ?? -1, privacy: .public), stdout bytes: \(diagnostic.standardOutput.count, privacy: .public), stderr bytes: \(diagnostic.standardError.count, privacy: .public)"
+        )
+    }
 
-            if frontmostPID != targetApplication.processIdentifier, remainingRetries > 0 {
-                logger.notice("Paste target pid \(targetApplication.processIdentifier) is not frontmost yet. Retrying.")
-                self.attemptPasteIntoFrontmostApplication(
-                    targetApplication,
-                    pasteboard: pasteboard,
-                    originalItems: originalItems,
-                    transientChangeCount: transientChangeCount,
-                    remainingRetries: remainingRetries - 1
-                )
-                return
-            }
+    private func dependencyPreflightResult() async -> TalkTextDependencyPreflightResult {
+        if let cachedDependencyPreflight {
+            return cachedDependencyPreflight
+        }
+        if let dependencyPreparationTask {
+            return await dependencyPreparationTask.value
+        }
 
-            guard self.postPasteShortcut() else {
-                logger.error("Failed to post paste shortcut")
-                self.statusText = "Copied, but paste failed"
-                return
-            }
+        let preflight = dependencyPreflight
+        let task = Task {
+            await preflight.preflightDependencies()
+        }
+        dependencyPreparationTask = task
+        let result = await task.value
+        dependencyPreparationTask = nil
+        cachedDependencyPreflight = result
+        logDependencyPreflight(result)
+        return result
+    }
 
-            let deliveredPID = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1
-            logger.notice("Cmd+V sent to frontmost pid \(deliveredPID)")
-            self.statusText = "Pasted! Press Ctrl+Space to record"
-
-            self.restorePasteboardIfUnchanged(
-                pasteboard,
-                originalItems: originalItems,
-                transientChangeCount: transientChangeCount
+    private func logDependencyPreflight(_ result: TalkTextDependencyPreflightResult) {
+        switch result {
+        case let .ready(preflight):
+            logger.notice(
+                "Dependency preflight ready; \(preflight.diagnosticSummary, privacy: .public); binary: \(preflight.backend.executable.url.path, privacy: .private(mask: .hash)); model: \(preflight.model.url.path, privacy: .private(mask: .hash))"
+            )
+        case let .failure(failure):
+            logger.error(
+                "Dependency preflight failed; category: \(Self.preflightFailureCategory(failure), privacy: .public)"
             )
         }
     }
+}
 
-    private func postPasteShortcut() -> Bool {
-        let source = CGEventSource(stateID: .hidSystemState)
-
-        guard let commandDown = CGEvent(keyboardEventSource: source, virtualKey: 0x37, keyDown: true),
-              let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: true),
-              let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: false),
-              let commandUp = CGEvent(keyboardEventSource: source, virtualKey: 0x37, keyDown: false) else {
-            return false
-        }
-
-        keyDown.flags = .maskCommand
-        keyUp.flags = .maskCommand
-
-        commandDown.post(tap: .cghidEventTap)
-        keyDown.post(tap: .cghidEventTap)
-        keyUp.post(tap: .cghidEventTap)
-        commandUp.post(tap: .cghidEventTap)
-        return true
+@MainActor
+private final class UnavailableRecordingFileStore: RecordingFileStoring {
+    func allocateRecordingURL() throws -> URL {
+        throw RecordingFileStoreError.unableToAllocateRecording
     }
 
-    private func insertTextIntoFocusedElement(_ text: String) -> Bool {
-        let systemWideElement = AXUIElementCreateSystemWide()
-        var focusedElementValue: CFTypeRef?
-        let focusError = AXUIElementCopyAttributeValue(
-            systemWideElement,
-            kAXFocusedUIElementAttribute as CFString,
-            &focusedElementValue
-        )
-
-        guard focusError == .success, let focusedElementValue else {
-            logger.error("Unable to read focused accessibility element: \(focusError.rawValue)")
-            return false
-        }
-
-        let focusedElement = unsafeDowncast(focusedElementValue, to: AXUIElement.self)
-
-        var valueSettable = DarwinBoolean(false)
-        let valueSettableError = AXUIElementIsAttributeSettable(
-            focusedElement,
-            kAXValueAttribute as CFString,
-            &valueSettable
-        )
-
-        guard valueSettableError == .success, valueSettable.boolValue else {
-            logger.error("Focused element does not expose a writable AXValue")
-            return false
-        }
-
-        var currentValueRef: CFTypeRef?
-        let currentValueError = AXUIElementCopyAttributeValue(
-            focusedElement,
-            kAXValueAttribute as CFString,
-            &currentValueRef
-        )
-
-        guard currentValueError == .success else {
-            logger.error("Unable to read AXValue from focused element: \(currentValueError.rawValue)")
-            return false
-        }
-
-        let currentValue = (currentValueRef as? String) ?? ""
-        let currentNSString = currentValue as NSString
-        let insertedNSString = text as NSString
-
-        var selectedRange = CFRange(location: currentNSString.length, length: 0)
-        if let selectionAXValue = copySelectedTextRange(from: focusedElement) {
-            selectedRange = selectionAXValue
-        }
-
-        let safeLocation = max(0, min(selectedRange.location, currentNSString.length))
-        let safeLength = max(0, min(selectedRange.length, currentNSString.length - safeLocation))
-        let replacementRange = NSRange(location: safeLocation, length: safeLength)
-        let updatedValue = currentNSString.replacingCharacters(in: replacementRange, with: text)
-
-        let setValueError = AXUIElementSetAttributeValue(
-            focusedElement,
-            kAXValueAttribute as CFString,
-            updatedValue as CFTypeRef
-        )
-
-        guard setValueError == .success else {
-            logger.error("Unable to write AXValue to focused element: \(setValueError.rawValue)")
-            return false
-        }
-
-        var insertionRange = CFRange(location: safeLocation + insertedNSString.length, length: 0)
-        if let insertionAXValue = AXValueCreate(.cfRange, &insertionRange) {
-            let selectionError = AXUIElementSetAttributeValue(
-                focusedElement,
-                kAXSelectedTextRangeAttribute as CFString,
-                insertionAXValue
-            )
-
-            if selectionError != .success {
-                logger.notice("Updated text, but could not restore insertion point: \(selectionError.rawValue)")
-            }
-        }
-
-        return true
-    }
-
-    private func copySelectedTextRange(from element: AXUIElement) -> CFRange? {
-        var selectedRangeRef: CFTypeRef?
-        let selectionError = AXUIElementCopyAttributeValue(
-            element,
-            kAXSelectedTextRangeAttribute as CFString,
-            &selectedRangeRef
-        )
-
-        guard selectionError == .success,
-              let selectedRangeRef,
-              CFGetTypeID(selectedRangeRef) == AXValueGetTypeID() else {
-            return nil
-        }
-
-        let rangeValue = unsafeDowncast(selectedRangeRef, to: AXValue.self)
-        guard AXValueGetType(rangeValue) == .cfRange else {
-            return nil
-        }
-
-        var selectedRange = CFRange()
-        guard AXValueGetValue(rangeValue, .cfRange, &selectedRange) else {
-            return nil
-        }
-
-        return selectedRange
-    }
-
-    private func ensurePostEventPermission() -> Bool {
-        if CGPreflightPostEventAccess() {
-            return true
-        }
-
-        return CGRequestPostEventAccess()
-    }
-
-    private func restorePasteboardIfUnchanged(
-        _ pasteboard: NSPasteboard,
-        originalItems: [NSPasteboardItem]?,
-        transientChangeCount: Int
-    ) {
-        guard let originalItems, pasteboard.changeCount == transientChangeCount else {
-            return
-        }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) {
-            guard pasteboard.changeCount == transientChangeCount else {
-                return
-            }
-
-            pasteboard.clearContents()
-            pasteboard.writeObjects(originalItems)
-        }
-    }
-
-    private func duplicatePasteboardItems(from pasteboard: NSPasteboard) -> [NSPasteboardItem]? {
-        guard let items = pasteboard.pasteboardItems, !items.isEmpty else {
-            return nil
-        }
-
-        return items.map { item in
-            let duplicate = NSPasteboardItem()
-            for type in item.types {
-                if let data = item.data(forType: type) {
-                    duplicate.setData(data, forType: type)
-                } else if let string = item.string(forType: type) {
-                    duplicate.setString(string, forType: type)
-                }
-            }
-            return duplicate
-        }
-    }
-
-    private func capturePasteTargetForCurrentSession() {
-        if let application = currentExternalApplication() {
-            rememberExternalApplication(application)
-            currentSessionPasteTarget = PasteTarget(
-                processIdentifier: application.processIdentifier,
-                bundleIdentifier: application.bundleIdentifier
-            )
-        } else {
-            currentSessionPasteTarget = lastExternalPasteTarget
-        }
-
-        logger.notice("Captured paste target pid: \(self.currentSessionPasteTarget?.processIdentifier ?? -1)")
-    }
-
-    private func currentExternalApplication() -> NSRunningApplication? {
-        guard let application = NSWorkspace.shared.frontmostApplication else {
-            return nil
-        }
-
-        return isTalkTextApplication(application) ? nil : application
-    }
-
-    private func rememberExternalApplication(_ application: NSRunningApplication) {
-        guard !isTalkTextApplication(application) else {
-            return
-        }
-
-        lastExternalPasteTarget = PasteTarget(
-            processIdentifier: application.processIdentifier,
-            bundleIdentifier: application.bundleIdentifier
-        )
-    }
-
-    private func resolvedPasteTarget() -> PasteTarget? {
-        if let application = currentExternalApplication() {
-            rememberExternalApplication(application)
-        }
-
-        return currentExternalPasteTarget() ?? currentSessionPasteTarget ?? lastExternalPasteTarget
-    }
-
-    private func currentExternalPasteTarget() -> PasteTarget? {
-        guard let application = currentExternalApplication() else {
-            return nil
-        }
-
-        return PasteTarget(
-            processIdentifier: application.processIdentifier,
-            bundleIdentifier: application.bundleIdentifier
-        )
-    }
-
-    private func runningApplication(for target: PasteTarget) -> NSRunningApplication? {
-        if let application = NSRunningApplication(processIdentifier: target.processIdentifier) {
-            return application
-        }
-
-        guard let bundleIdentifier = target.bundleIdentifier else {
-            return nil
-        }
-
-        return NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier).first
-    }
-
-    private func ensureAccessibilityPermission() -> Bool {
-        let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
-        return AXIsProcessTrustedWithOptions(options)
-    }
-
-    private func isTalkTextApplication(_ application: NSRunningApplication) -> Bool {
-        application.bundleIdentifier == Bundle.main.bundleIdentifier
-    }
+    func removeRecording(at url: URL) throws {}
+    func removeStaleOwnedFiles(olderThan age: TimeInterval) throws {}
+    func cleanupInstance() throws {}
 }

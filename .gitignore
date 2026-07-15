@@ -4,9 +4,12 @@
 TalkText/.build/
 TalkText/.swiftpm/
 
-# Local app bundle output
-TalkText.app/
+# Release artifacts
 dist/
+
+# Generated app bundle. Matched by shape rather than by name so a
+# CFBundleName change cannot leave the bundle tracked.
+*.app/
 
 # Downloaded Whisper model
 models/

@@ -1,0 +1,169 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  quality:
+    name: Required quality gate
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Sign, notarize, verify, and publish
+    needs:
+      - quality
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out exact tag
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Export canonical bundle metadata
+        run: ./scripts/export-canonical-metadata.sh
+
+      - name: Verify pinned runner and toolchain
+        run: |
+          test "$(uname -m)" = "x86_64"
+          test "$(sw_vers -productVersion | cut -d. -f1)" = "15"
+          test "$(xcodebuild -version | sed -n '1p')" = "Xcode 16.4"
+
+      - name: Restore explicit SwiftPM cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: TalkText/.build
+          key: talktext-v1-${{ runner.os }}-${{ runner.arch }}-xcode-16.4-${{ hashFiles('TalkText/Package.swift', 'TalkText/Package.resolved') }}
+          restore-keys: |
+            talktext-v1-${{ runner.os }}-${{ runner.arch }}-xcode-16.4-
+
+      - name: Restore digest-keyed model cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: models
+          key: talktext-model-v1-${{ hashFiles('dependencies.env') }}
+
+      - name: Install or verify the pinned production model
+        run: ./scripts/dependency-tool.sh install-model
+
+      - name: Import Developer ID certificate into an ephemeral keychain
+        env:
+          MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          : "${MACOS_CERTIFICATE_BASE64:?missing MACOS_CERTIFICATE_BASE64}"
+          : "${MACOS_CERTIFICATE_PASSWORD:?missing MACOS_CERTIFICATE_PASSWORD}"
+          : "${MACOS_SIGNING_IDENTITY:?missing MACOS_SIGNING_IDENTITY}"
+
+          certificate_path="$RUNNER_TEMP/developer-id.p12"
+          keychain_path="$RUNNER_TEMP/talktext-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 32)"
+          if printf '%s' "$MACOS_CERTIFICATE_BASE64" | base64 -D > "$certificate_path" 2>/dev/null; then
+            :
+          else
+            printf '%s' "$MACOS_CERTIFICATE_BASE64" | base64 --decode > "$certificate_path"
+          fi
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$certificate_path" \
+            -k "$keychain_path" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain_path"
+          security list-keychains -d user -s "$keychain_path"
+          security default-keychain -d user -s "$keychain_path"
+          security find-identity -v -p codesigning "$keychain_path" | grep -F "\"$MACOS_SIGNING_IDENTITY\""
+          rm -f "$certificate_path"
+
+          echo "TALKTEXT_KEYCHAIN=$keychain_path" >> "$GITHUB_ENV"
+
+      - name: Build, sign, notarize, staple, and archive
+        env:
+          TALKTEXT_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          TALKTEXT_RELEASE_TAG: ${{ github.ref_name }}
+          TALKTEXT_RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          : "${APPLE_ID:?missing APPLE_ID}"
+          : "${APPLE_TEAM_ID:?missing APPLE_TEAM_ID}"
+          : "${APPLE_APP_SPECIFIC_PASSWORD:?missing APPLE_APP_SPECIFIC_PASSWORD}"
+          ./release.sh
+
+      - name: Create draft release and upload verified assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TALKTEXT_RELEASE_TAG: ${{ github.ref_name }}
+          TALKTEXT_RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          source dependencies.env
+          version="$(./scripts/read-version.sh)"
+          zip_name="$TALKTEXT_BUNDLE_NAME-$version.zip"
+          release_preamble="$(printf '%s\n\n%s\n\n%s' \
+            "This release is a notarized Universal 2 build for Apple Silicon and Intel Macs running macOS $TALKTEXT_MINIMUM_SYSTEM_VERSION or newer." \
+            "Pinned model: $MODEL_REPOSITORY@$MODEL_REVISION (sha256:$MODEL_SHA256)." \
+            "Supported whisper-cli versions and commits: $BACKEND_UPSTREAM_REVISIONS.")"
+          ./release.sh verify-source
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/$zip_name" \
+            "dist/$zip_name.sha256" \
+            --draft \
+            --verify-tag \
+            --title "$TALKTEXT_BUNDLE_NAME $version" \
+            --generate-notes \
+            --notes "$release_preamble"
+
+      - name: Download and verify the exact draft asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          version="$(./scripts/read-version.sh)"
+          zip_name="$TALKTEXT_BUNDLE_NAME-$version.zip"
+          download_dir="$RUNNER_TEMP/downloaded-release"
+          extracted_dir="$RUNNER_TEMP/downloaded-release-extracted"
+          mkdir -p "$download_dir" "$extracted_dir"
+          gh release download "$GITHUB_REF_NAME" --pattern "$zip_name" --dir "$download_dir"
+          (cd "$download_dir" && shasum -a 256 -c "$GITHUB_WORKSPACE/dist/$zip_name.sha256")
+          ditto -x -k "$download_dir/$zip_name" "$extracted_dir"
+          TALKTEXT_EXPECTED_SIGNATURE=developer-id \
+          TALKTEXT_EXPECTED_TEAM_ID="$APPLE_TEAM_ID" \
+          TALKTEXT_REQUIRE_NOTARIZATION=1 \
+          TALKTEXT_X86_64_SMOKE_TEST=1 \
+            ./scripts/verify-bundle.sh "$extracted_dir/$TALKTEXT_BUNDLE_NAME.app"
+
+      - name: Publish only after downloaded-asset verification
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TALKTEXT_RELEASE_TAG: ${{ github.ref_name }}
+          TALKTEXT_RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          ./release.sh verify-source
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+
+      - name: Delete ephemeral keychain
+        if: ${{ always() }}
+        run: |
+          if [[ -n "${TALKTEXT_KEYCHAIN:-}" && -f "$TALKTEXT_KEYCHAIN" ]]; then
+            security delete-keychain "$TALKTEXT_KEYCHAIN"
+          fi

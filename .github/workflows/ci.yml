@@ -1,0 +1,275 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: App, tests, and bundle (Intel)
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Export canonical bundle metadata
+        run: ./scripts/export-canonical-metadata.sh
+
+      - name: Verify pinned runner and toolchain
+        run: |
+          test "$(uname -m)" = "x86_64"
+          test "$(sw_vers -productVersion | cut -d. -f1)" = "15"
+          test "$(xcodebuild -version | sed -n '1p')" = "Xcode 16.4"
+          swift --version
+
+      - name: Restore explicit SwiftPM and tool caches
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            TalkText/.build
+            ~/.cache/talktext-tools
+          key: talktext-v1-${{ runner.os }}-${{ runner.arch }}-xcode-16.4-${{ hashFiles('TalkText/Package.swift', 'TalkText/Package.resolved') }}
+          restore-keys: |
+            talktext-v1-${{ runner.os }}-${{ runner.arch }}-xcode-16.4-
+
+      - name: Install digest-pinned lint tools
+        run: |
+          tool_bin="$(./scripts/install-ci-tools.sh)"
+          echo "$tool_bin" >> "$GITHUB_PATH"
+
+      - name: Validate shell, plist, version, lint, and format policy
+        run: |
+          while IFS= read -r -d '' script; do
+            bash -n "$script"
+          done < <(find . -type f -name '*.sh' -not -path './TalkText/.build/*' -print0)
+          plutil -lint TalkText/Info.plist TalkText/TalkText.entitlements
+          if /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' TalkText/Info.plist >/dev/null 2>&1; then
+            echo 'TalkText/Info.plist must not duplicate VERSION' >&2
+            exit 1
+          fi
+          ./scripts/read-version.sh
+          swiftlint lint --strict --config .swiftlint.yml
+          swiftformat --lint --config .swiftformat TalkText/Sources TalkText/Tests
+
+      - name: Build debug and release for every supported architecture
+        run: |
+          for configuration in debug release; do
+            for architecture in arm64 x86_64; do
+              swift build \
+                --package-path TalkText \
+                --configuration "$configuration" \
+                --triple "$architecture-apple-macosx$TALKTEXT_MINIMUM_SYSTEM_VERSION" \
+                --scratch-path "TalkText/.build/$configuration-$architecture" \
+                -Xswiftc -warnings-as-errors
+            done
+          done
+
+      - name: Run all tests
+        run: |
+          swift test \
+            --package-path TalkText \
+            --configuration debug \
+            --triple "x86_64-apple-macosx$TALKTEXT_MINIMUM_SYSTEM_VERSION" \
+            --scratch-path TalkText/.build/tests-x86_64 \
+            -Xswiftc -warnings-as-errors
+          bash tests/dependency-tool-fixtures.sh
+
+      - name: Assemble and verify extracted deterministic test bundle
+        run: |
+          source dependencies.env
+          fixture_dir="$RUNNER_TEMP/talktext-model-fixture"
+          mkdir -p "$fixture_dir"
+          printf 'lmggTalkText deterministic CI model fixture\n' > "$fixture_dir/$MODEL_FILE_NAME"
+          fixture_size="$(stat -f '%z' "$fixture_dir/$MODEL_FILE_NAME")"
+          fixture_sha="$(shasum -a 256 "$fixture_dir/$MODEL_FILE_NAME" | awk '{print $1}')"
+          sed \
+            -e "s/^MODEL_SIZE_BYTES=.*/MODEL_SIZE_BYTES='$fixture_size'/" \
+            -e "s/^MODEL_SHA256=.*/MODEL_SHA256='$fixture_sha'/" \
+            dependencies.env > "$fixture_dir/dependencies.env"
+
+          TALKTEXT_DEPENDENCY_MANIFEST="$fixture_dir/dependencies.env" \
+          TALKTEXT_MODEL_PATH="$fixture_dir/$MODEL_FILE_NAME" \
+          TALKTEXT_SIGNING_MODE=adhoc \
+            ./bundle.sh
+
+          archive="$RUNNER_TEMP/$TALKTEXT_BUNDLE_NAME-ci.zip"
+          extracted="$RUNNER_TEMP/extracted"
+          ditto -c -k --sequesterRsrc --keepParent "$TALKTEXT_BUNDLE_NAME.app" "$archive"
+          mkdir -p "$extracted"
+          ditto -x -k "$archive" "$extracted"
+          TALKTEXT_DEPENDENCY_MANIFEST="$fixture_dir/dependencies.env" \
+          TALKTEXT_EXPECTED_SIGNATURE=adhoc \
+          TALKTEXT_X86_64_SMOKE_TEST=1 \
+            ./scripts/verify-bundle.sh "$extracted/$TALKTEXT_BUNDLE_NAME.app"
+
+  backend-contract:
+    name: Backend contract (${{ matrix.architecture }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x86_64
+            runner: macos-15-intel
+          - architecture: arm64
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+      EXPECTED_CMAKE_VERSION: 4.1.2
+      EXPECTED_CMAKE_BUILD_VERSION: 4.1.2-gc33710e
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Export canonical bundle metadata
+        run: ./scripts/export-canonical-metadata.sh
+
+      - name: Verify pinned native runner and build tools
+        run: |
+          actual_architecture="$(uname -m)"
+          actual_macos_major="$(sw_vers -productVersion | cut -d. -f1)"
+          actual_xcode="$(xcodebuild -version | sed -n '1p')"
+          printf 'runner architecture=%s macOS-major=%s xcode=%s\n' \
+            "$actual_architecture" "$actual_macos_major" "$actual_xcode"
+          [[ "$actual_architecture" == "${{ matrix.architecture }}" ]] || {
+            echo "error: expected ${{ matrix.architecture }} runner, found $actual_architecture" >&2
+            exit 1
+          }
+          [[ "$actual_macos_major" == '15' ]] || {
+            echo "error: expected macOS 15 runner, found major $actual_macos_major" >&2
+            exit 1
+          }
+          [[ "$actual_xcode" == 'Xcode 16.4' ]] || {
+            echo "error: expected Xcode 16.4, found $actual_xcode" >&2
+            exit 1
+          }
+
+          cmake_candidates=("${ANDROID_HOME:?}"/cmake/*/bin/cmake)
+          if default_cmake="$(command -v cmake 2>/dev/null)"; then
+            cmake_candidates+=("$default_cmake")
+          fi
+          CMAKE_BIN=''
+          for candidate in "${cmake_candidates[@]}"; do
+            [[ -x "$candidate" ]] || continue
+            candidate_version="$("$candidate" --version | awk '
+              NR == 1 && $1 == "cmake" && $2 == "version" {
+                sub(/\r$/, "", $3)
+                print $3
+                exit
+              }
+            ')"
+            printf 'cmake candidate=%s version=%s\n' "$candidate" "${candidate_version:-unreported}"
+            if [[ "$candidate_version" == "$EXPECTED_CMAKE_BUILD_VERSION" ]]; then
+              CMAKE_BIN="$candidate"
+              break
+            fi
+          done
+          [[ -n "$CMAKE_BIN" ]] || {
+            echo "error: CMake build $EXPECTED_CMAKE_BUILD_VERSION is not installed" >&2
+            exit 1
+          }
+          echo "CMAKE_BIN=$CMAKE_BIN" >> "$GITHUB_ENV"
+
+      - name: Restore exact backend build cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/talktext-backends
+          key: talktext-backends-v1-${{ runner.os }}-${{ runner.arch }}-cmake-4.1.2-${{ hashFiles('dependencies.env', '.github/workflows/ci.yml') }}
+
+      - name: Restore digest-keyed model cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: models
+          key: talktext-model-v1-${{ hashFiles('dependencies.env') }}
+
+      - name: Install or verify the pinned production model
+        run: ./scripts/dependency-tool.sh install-model
+
+      - name: Build every exact supported backend revision
+        run: |
+          source dependencies.env
+          : "${CMAKE_BIN:?verified CMake path was not exported}"
+          backend_repository="$BACKEND_REPOSITORY_URL"
+          backend_cache="$HOME/.cache/talktext-backends/${{ matrix.architecture }}"
+          mkdir -p "$backend_cache"
+
+          for entry in $BACKEND_UPSTREAM_REVISIONS; do
+            version="${entry%%=*}"
+            revision="${entry#*=}"
+            destination="$backend_cache/$version/whisper-cli"
+            if [[ -x "$destination" && "$(lipo -archs "$destination")" == "${{ matrix.architecture }}" ]]; then
+              continue
+            fi
+
+            source_dir="$RUNNER_TEMP/whisper.cpp-$version"
+            build_dir="$source_dir/build"
+            rm -rf "$source_dir" "$backend_cache/$version"
+            mkdir -p "$source_dir" "$backend_cache/$version"
+            git -C "$source_dir" init --quiet
+            git -C "$source_dir" remote add origin "$backend_repository"
+            git -C "$source_dir" fetch --quiet --depth 1 origin "$revision"
+            git -C "$source_dir" checkout --quiet --detach FETCH_HEAD
+            test "$(git -C "$source_dir" rev-parse HEAD)" = "$revision"
+
+            "$CMAKE_BIN" \
+              -S "$source_dir" \
+              -B "$build_dir" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_OSX_ARCHITECTURES="${{ matrix.architecture }}" \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET="$TALKTEXT_MINIMUM_SYSTEM_VERSION" \
+              -DBUILD_SHARED_LIBS=OFF \
+              -DWHISPER_BUILD_TESTS=OFF \
+              -DWHISPER_BUILD_EXAMPLES=ON
+            "$CMAKE_BIN" --build "$build_dir" --config Release --parallel "$(sysctl -n hw.ncpu)" --target whisper-cli
+            install -m 755 "$build_dir/bin/whisper-cli" "$destination"
+            test "$(lipo -archs "$destination")" = "${{ matrix.architecture }}"
+          done
+
+      - name: Execute byte-for-byte production invocation matrix
+        run: |
+          source dependencies.env
+          backend_cache="$HOME/.cache/talktext-backends/${{ matrix.architecture }}"
+          for version in $BACKEND_SUPPORTED_VERSIONS; do
+            TALKTEXT_WHISPER_CLI="$backend_cache/$version/whisper-cli" \
+            TALKTEXT_WHISPER_CLI_VERSION="$version" \
+            TALKTEXT_MODEL_PATH="$GITHUB_WORKSPACE/models/$MODEL_FILE_NAME" \
+              ./tests/backend-contract-fixture.sh
+          done
+
+  required:
+    name: Required
+    if: ${{ always() }}
+    needs:
+      - quality
+      - backend-contract
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every macOS gate
+        env:
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          BACKEND_RESULT: ${{ needs.backend-contract.result }}
+        run: |
+          test "$QUALITY_RESULT" = success
+          test "$BACKEND_RESULT" = success
