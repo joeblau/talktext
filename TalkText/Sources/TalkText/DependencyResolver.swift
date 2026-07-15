@@ -486,9 +486,11 @@ struct TalkTextDependencyResolver: WhisperDependencyResolving {
         }
 
         let sidecarURL = URL(fileURLWithPath: executableURL.path + ".version")
-        if let sidecar = try? String(contentsOf: sidecarURL, encoding: .utf8),
-           let normalized = normalizedVersion(sidecar) {
-            return normalized
+        if FileManager.default.fileExists(atPath: sidecarURL.path) {
+            guard let sidecar = try? String(contentsOf: sidecarURL, encoding: .utf8) else {
+                return nil
+            }
+            return normalizedVersion(sidecar)
         }
 
         let components = canonical(executableURL).pathComponents
@@ -560,12 +562,12 @@ struct TalkTextDependencyResolver: WhisperDependencyResolving {
     }
 
     private func homebrewPrefixes() -> [URL] {
-        var prefixes: [URL] = []
         if let configured = nonemptyEnvironmentValue("HOMEBREW_PREFIX") {
-            prefixes.append(configuredURL(for: configured))
+            return [configuredURL(for: configured)]
         }
-        prefixes.append(contentsOf: configuration.homebrewPrefixes)
-        return deduplicated(prefixes.map { ($0, DependencySearchSource.homebrew) }).map(\.0)
+        return deduplicated(
+            configuration.homebrewPrefixes.map { ($0, DependencySearchSource.homebrew) }
+        ).map(\.0)
     }
 
     private func developmentRoots() -> [URL] {

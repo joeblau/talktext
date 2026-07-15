@@ -32,7 +32,10 @@ final binary.
   number policy: a new public build requires a version bump; mutable rebuilds
   under an existing version are not published.
 - The source tag must be exactly `v<the VERSION value>`, point at `HEAD`, and
-  the checkout must be clean. The archive is named
+  the checkout must be clean. Release verification is anchored to that full
+  commit ID; canonical-file hashes, the tag target, `HEAD`, and cleanliness are
+  rechecked after archive verification and immediately before each publication
+  transition. The archive is named
   `<CFBundleName>-<VERSION>.zip`.
 - `TalkText/TalkText.entitlements` is the reviewed, canonical entitlement set.
   The final signing command consumes it, and bundle verification compares the

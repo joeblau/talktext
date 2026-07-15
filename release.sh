@@ -6,6 +6,13 @@ DEPENDENCY_MANIFEST="$SCRIPT_DIR/dependencies.env"
 SOURCE_INFO="$SCRIPT_DIR/TalkText/Info.plist"
 RELEASE_TAG="${TALKTEXT_RELEASE_TAG:-${GITHUB_REF_NAME:-}}"
 DIST_DIR="$SCRIPT_DIR/dist"
+RELEASE_COMMAND="${1:-release}"
+CANONICAL_RELEASE_FILES=(
+    VERSION
+    dependencies.env
+    TalkText/Info.plist
+    TalkText/TalkText.entitlements
+)
 
 fail() {
     echo "error: $*" >&2
@@ -22,6 +29,50 @@ validate_path_component() {
     esac
 }
 
+verify_release_source_state() {
+    local expected_commit="$1"
+    local expected_tag="$2"
+    local actual_commit current_hash relative_path tagged_hash tagged_commit
+
+    [[ "$expected_commit" =~ ^[0-9a-f]{40}$ ]] || fail "immutable release commit must be a full Git object ID"
+    git -C "$SCRIPT_DIR" cat-file -e "$expected_commit^{commit}" 2>/dev/null || \
+        fail "immutable release commit does not exist locally: $expected_commit"
+    [[ "$expected_tag" == "$EXPECTED_TAG" ]] || \
+        fail "release tag must be $EXPECTED_TAG (found ${expected_tag:-none})"
+    [[ -n "$(git -C "$SCRIPT_DIR" tag --list "$expected_tag")" ]] || \
+        fail "release tag does not exist locally: $expected_tag"
+
+    tagged_commit="$(git -C "$SCRIPT_DIR" rev-list -n 1 "$expected_tag")"
+    [[ "$tagged_commit" == "$expected_commit" ]] || \
+        fail "$expected_tag no longer points at the immutable release commit"
+    actual_commit="$(git -C "$SCRIPT_DIR" rev-parse HEAD)"
+    [[ "$actual_commit" == "$expected_commit" ]] || \
+        fail "HEAD changed after release verification began"
+
+    for relative_path in "${CANONICAL_RELEASE_FILES[@]}"; do
+        [[ -f "$SCRIPT_DIR/$relative_path" && -r "$SCRIPT_DIR/$relative_path" ]] || \
+            fail "canonical release file is not readable: $relative_path"
+        git -C "$SCRIPT_DIR" cat-file -e "$expected_commit:$relative_path" 2>/dev/null || \
+            fail "immutable release commit is missing canonical file: $relative_path"
+        current_hash="$(shasum -a 256 "$SCRIPT_DIR/$relative_path" | awk '{print $1}')"
+        tagged_hash="$(git -C "$SCRIPT_DIR" show "$expected_commit:$relative_path" | shasum -a 256 | awk '{print $1}')"
+        [[ "$current_hash" == "$tagged_hash" ]] || \
+            fail "canonical release file changed after verification began: $relative_path"
+    done
+
+    [[ -z "$(git -C "$SCRIPT_DIR" status --porcelain --untracked-files=normal)" ]] || \
+        fail "release checkout changed after verification began"
+}
+
+case "$RELEASE_COMMAND" in
+    release | verify-source)
+        ;;
+    *)
+        fail "usage: release.sh [verify-source]"
+        ;;
+esac
+(( $# <= 1 )) || fail "usage: release.sh [verify-source]"
+
 if [[ -n "${TALKTEXT_VERSION_FILE:-}" ]]; then
     fail "release does not accept a VERSION file override"
 fi
@@ -35,9 +86,14 @@ export TALKTEXT_DEPENDENCY_MANIFEST="$DEPENDENCY_MANIFEST"
 VERSION="$("$SCRIPT_DIR/scripts/read-version.sh")"
 EXPECTED_TAG="v$VERSION"
 
-for command_name in git ditto codesign spctl xcrun plutil shasum; do
+for command_name in git plutil shasum; do
     command -v "$command_name" >/dev/null 2>&1 || fail "required release command is unavailable: $command_name"
 done
+if [[ "$RELEASE_COMMAND" == 'release' ]]; then
+    for command_name in ditto codesign spctl xcrun; do
+        command -v "$command_name" >/dev/null 2>&1 || fail "required release command is unavailable: $command_name"
+    done
+fi
 [[ -r "$SOURCE_INFO" ]] || fail "canonical Info.plist is not readable: $SOURCE_INFO"
 plutil -lint "$SOURCE_INFO" >/dev/null
 BUNDLE_NAME="$(plutil -extract CFBundleName raw -expect string -o - "$SOURCE_INFO")" || \
@@ -51,18 +107,24 @@ CHECKSUM_PATH="$ZIP_PATH.sha256"
 SUBMISSION_ZIP="$DIST_DIR/.$BUNDLE_NAME-$VERSION-notarization.zip"
 NOTARY_RESULT="$DIST_DIR/.$BUNDLE_NAME-$VERSION-notarization.json"
 
-[[ -n "${TALKTEXT_SIGNING_IDENTITY:-}" ]] || fail "TALKTEXT_SIGNING_IDENTITY is required"
-[[ -n "${APPLE_TEAM_ID:-}" ]] || fail "APPLE_TEAM_ID is required for signature verification"
-
 if [[ -z "$RELEASE_TAG" ]]; then
     RELEASE_TAG="$(git -C "$SCRIPT_DIR" describe --tags --exact-match HEAD 2>/dev/null || true)"
 fi
-[[ "$RELEASE_TAG" == "$EXPECTED_TAG" ]] || fail "release tag must be $EXPECTED_TAG (found ${RELEASE_TAG:-none})"
-[[ -n "$(git -C "$SCRIPT_DIR" tag --list "$RELEASE_TAG")" ]] || fail "release tag does not exist locally: $RELEASE_TAG"
-[[ "$(git -C "$SCRIPT_DIR" rev-list -n 1 "$RELEASE_TAG")" == "$(git -C "$SCRIPT_DIR" rev-parse HEAD)" ]] || \
-    fail "$RELEASE_TAG does not point at the checked-out commit"
-[[ -z "$(git -C "$SCRIPT_DIR" status --porcelain --untracked-files=normal)" ]] || \
-    fail "release checkout must be clean"
+RELEASE_COMMIT="${TALKTEXT_RELEASE_COMMIT:-${GITHUB_SHA:-}}"
+if [[ -z "$RELEASE_COMMIT" ]]; then
+    [[ "$RELEASE_COMMAND" == 'release' ]] || \
+        fail "TALKTEXT_RELEASE_COMMIT or GITHUB_SHA is required to recheck an immutable release"
+    RELEASE_COMMIT="$(git -C "$SCRIPT_DIR" rev-parse HEAD)"
+fi
+verify_release_source_state "$RELEASE_COMMIT" "$RELEASE_TAG"
+
+if [[ "$RELEASE_COMMAND" == 'verify-source' ]]; then
+    echo "Verified immutable release source $RELEASE_TAG at $RELEASE_COMMIT"
+    exit 0
+fi
+
+[[ -n "${TALKTEXT_SIGNING_IDENTITY:-}" ]] || fail "TALKTEXT_SIGNING_IDENTITY is required"
+[[ -n "${APPLE_TEAM_ID:-}" ]] || fail "APPLE_TEAM_ID is required for signature verification"
 
 NOTARY_ARGUMENTS=()
 if [[ -n "${NOTARYTOOL_PROFILE:-}" ]]; then
@@ -130,6 +192,8 @@ TALKTEXT_EXPECTED_SIGNATURE=developer-id \
 TALKTEXT_EXPECTED_TEAM_ID="$APPLE_TEAM_ID" \
 TALKTEXT_REQUIRE_NOTARIZATION=1 \
     "$SCRIPT_DIR/scripts/verify-bundle.sh" "$EXTRACTED_APP"
+
+verify_release_source_state "$RELEASE_COMMIT" "$RELEASE_TAG"
 
 (CDPATH= cd -- "$DIST_DIR" && shasum -a 256 "$ZIP_NAME" >"$ZIP_NAME.sha256")
 

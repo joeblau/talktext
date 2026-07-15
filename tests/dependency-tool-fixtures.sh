@@ -224,38 +224,61 @@ grep -Fq 'CMAKE_OSX_DEPLOYMENT_TARGET="$TALKTEXT_MINIMUM_SYSTEM_VERSION"' \
     fail 'CI backend builds do not use canonical minimum-system metadata'
 grep -Fq 'zip_name="$TALKTEXT_BUNDLE_NAME-$version.zip"' "$REPOSITORY_ROOT/.github/workflows/release.yml" || \
     fail 'release assets do not use canonical bundle-name metadata'
+[[ "$(grep -Fc './release.sh verify-source' "$REPOSITORY_ROOT/.github/workflows/release.yml")" == 2 ]] || \
+    fail 'release workflow does not recheck immutable source immediately before both publication transitions'
+grep -Fq 'TALKTEXT_RELEASE_COMMIT: ${{ github.sha }}' "$REPOSITORY_ROOT/.github/workflows/release.yml" || \
+    fail 'release workflow does not bind source checks to the immutable event commit'
 pass 'CI and release workflows consume canonical artifact and deployment metadata'
 
 METADATA_BUNDLE_REPOSITORY="$TEMP_ROOT/metadata-bundle-repository"
 METADATA_FAKE_BIN="$TEMP_ROOT/metadata-fake-bin"
 METADATA_PRODUCT_BIN="$TEMP_ROOT/metadata-products"
 METADATA_SWIFT_LOG="$TEMP_ROOT/metadata-swift.log"
-METADATA_VERIFY_LOG="$TEMP_ROOT/metadata-verify.log"
+METADATA_PACKAGE_DUMP="$TEMP_ROOT/metadata-package.json"
+METADATA_SPCTL_COUNT="$TEMP_ROOT/metadata-spctl-count"
 mkdir -p \
     "$METADATA_BUNDLE_REPOSITORY/TalkText" \
+    "$METADATA_BUNDLE_REPOSITORY/TalkText/Sources/TalkText" \
+    "$METADATA_BUNDLE_REPOSITORY/TalkText/Tests/TalkTextTests" \
     "$METADATA_BUNDLE_REPOSITORY/scripts" \
     "$METADATA_FAKE_BIN" \
     "$METADATA_PRODUCT_BIN"
 cp "$REPOSITORY_ROOT/bundle.sh" "$METADATA_BUNDLE_REPOSITORY/"
+cp "$REPOSITORY_ROOT/release.sh" "$METADATA_BUNDLE_REPOSITORY/"
+cp "$REPOSITORY_ROOT/.gitignore" "$METADATA_BUNDLE_REPOSITORY/"
 cp "$REPOSITORY_ROOT/VERSION" "$METADATA_BUNDLE_REPOSITORY/"
+cp "$REPOSITORY_ROOT/TalkText/Package.swift" "$METADATA_BUNDLE_REPOSITORY/TalkText/"
 cp "$REPOSITORY_ROOT/TalkText/Info.plist" "$METADATA_BUNDLE_REPOSITORY/TalkText/"
 cp "$REPOSITORY_ROOT/TalkText/TalkText.entitlements" "$METADATA_BUNDLE_REPOSITORY/TalkText/"
+cp "$REPOSITORY_ROOT/scripts/dependency-tool.sh" "$METADATA_BUNDLE_REPOSITORY/scripts/"
 cp "$REPOSITORY_ROOT/scripts/read-version.sh" "$METADATA_BUNDLE_REPOSITORY/scripts/"
+cp "$REPOSITORY_ROOT/scripts/verify-bundle.sh" "$METADATA_BUNDLE_REPOSITORY/scripts/"
+cp "$FIXTURE_MANIFEST" "$METADATA_BUNDLE_REPOSITORY/dependencies.env"
 plutil -replace CFBundleName -string EchoFixture "$METADATA_BUNDLE_REPOSITORY/TalkText/Info.plist"
 plutil -replace CFBundleExecutable -string EchoFixtureExecutable "$METADATA_BUNDLE_REPOSITORY/TalkText/Info.plist"
+plutil -replace CFBundleIdentifier -string com.example.echo-fixture "$METADATA_BUNDLE_REPOSITORY/TalkText/Info.plist"
 plutil -replace LSMinimumSystemVersion -string 13.3 "$METADATA_BUNDLE_REPOSITORY/TalkText/Info.plist"
 
-cat > "$METADATA_BUNDLE_REPOSITORY/scripts/dependency-tool.sh" <<'EOF'
-#!/bin/bash
-set -euo pipefail
-[[ "${1:-}" == 'verify-model' ]]
-EOF
-cat > "$METADATA_BUNDLE_REPOSITORY/scripts/verify-bundle.sh" <<'EOF'
-#!/bin/bash
-set -euo pipefail
-[[ -d "${1:-}" ]]
-printf '%s\n' "$1" >> "${METADATA_VERIFY_LOG:?}"
-EOF
+if ! CLANG_MODULE_CACHE_PATH="$TEMP_ROOT/swift-module-cache" \
+    SWIFTPM_MODULECACHE_OVERRIDE="$TEMP_ROOT/swift-module-cache" \
+    swift package --disable-sandbox dump-package \
+        --package-path "$METADATA_BUNDLE_REPOSITORY/TalkText" \
+        > "$METADATA_PACKAGE_DUMP"; then
+    fail 'real Package.swift did not evaluate with differential canonical metadata'
+fi
+PACKAGE_PRODUCT_NAME="$(plutil -extract products.0.name raw -o - "$METADATA_PACKAGE_DUMP")"
+PACKAGE_TARGET_NAME="$(plutil -extract targets.0.name raw -o - "$METADATA_PACKAGE_DUMP")"
+PACKAGE_NAME="$(plutil -extract name raw -o - "$METADATA_PACKAGE_DUMP")"
+PACKAGE_MINIMUM_SYSTEM_VERSION="$(plutil -extract platforms.0.version raw -o - "$METADATA_PACKAGE_DUMP")"
+assert_equal EchoFixture "$PACKAGE_NAME" \
+    'SwiftPM package name did not follow differential CFBundleName'
+assert_equal EchoFixtureExecutable "$PACKAGE_PRODUCT_NAME" \
+    'SwiftPM product name did not follow differential CFBundleExecutable'
+assert_equal EchoFixtureExecutable "$PACKAGE_TARGET_NAME" \
+    'SwiftPM executable target did not follow differential CFBundleExecutable'
+assert_equal 13.3 "$PACKAGE_MINIMUM_SYSTEM_VERSION" \
+    'SwiftPM platform did not follow differential LSMinimumSystemVersion'
+
 cat > "$METADATA_FAKE_BIN/swift" <<'EOF'
 #!/bin/bash
 set -euo pipefail
@@ -267,6 +290,10 @@ EOF
 cat > "$METADATA_FAKE_BIN/lipo" <<'EOF'
 #!/bin/bash
 set -euo pipefail
+if [[ "${1:-}" == '-archs' ]]; then
+    printf '%s\n' 'arm64 x86_64'
+    exit 0
+fi
 output=''
 while (( $# )); do
     if [[ "$1" == '-output' ]]; then
@@ -282,12 +309,89 @@ EOF
 cat > "$METADATA_FAKE_BIN/codesign" <<'EOF'
 #!/bin/bash
 set -euo pipefail
+
+if [[ " $* " == *' --entitlements '* ]]; then
+    cat "${METADATA_SOURCE_ENTITLEMENTS:?}"
+    exit 0
+fi
+if [[ " $* " == *' --display '* ]]; then
+    app_path="${!#}"
+    identifier="$(plutil -extract CFBundleIdentifier raw -expect string -o - "$app_path/Contents/Info.plist")"
+    printf '%s\n' \
+        "Identifier=$identifier" \
+        'flags=0x10000(runtime)' \
+        'Info.plist entries=18' \
+        'Sealed Resources version=2 rules=13 files=3'
+    if [[ "${TALKTEXT_EXPECTED_SIGNATURE:-adhoc}" == 'developer-id' ]]; then
+        printf '%s\n' \
+            'Authority=Developer ID Application: Fixture' \
+            'Timestamp=Jul 15, 2026 at 10:00:00' \
+            "TeamIdentifier=${TALKTEXT_EXPECTED_TEAM_ID:?}"
+    else
+        printf '%s\n' 'Signature=adhoc' 'TeamIdentifier=not set'
+    fi
+fi
+EOF
+cat > "$METADATA_FAKE_BIN/xattr" <<'EOF'
+#!/bin/bash
+set -euo pipefail
 exit 0
 EOF
-cp "$METADATA_FAKE_BIN/codesign" "$METADATA_FAKE_BIN/xattr"
+cat > "$METADATA_FAKE_BIN/file" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+printf '%s: Mach-O universal binary with 2 architectures\n' "${1:-fixture}"
+EOF
+cat > "$METADATA_FAKE_BIN/vtool" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+printf '%s\n' '      platform MACOS' '         minos 13.3'
+EOF
+cat > "$METADATA_FAKE_BIN/ditto" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+if [[ "${1:-}" == '-c' ]]; then
+    source_path="${@: -2:1}"
+    destination="${!#}"
+    rm -rf -- "${destination}.contents"
+    mkdir -p "${destination}.contents"
+    cp -R -- "$source_path" "${destination}.contents/"
+    : > "$destination"
+elif [[ "${1:-}" == '-x' ]]; then
+    source_path="${@: -2:1}"
+    destination="${!#}"
+    mkdir -p "$destination"
+    cp -R -- "${source_path}.contents/." "$destination/"
+else
+    exit 64
+fi
+EOF
+cat > "$METADATA_FAKE_BIN/xcrun" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+if [[ "${1:-}" == 'notarytool' && "${2:-}" == 'submit' ]]; then
+    printf '%s\n' '{"status":"Accepted","id":"fixture-notary-id"}'
+fi
+EOF
+cat > "$METADATA_FAKE_BIN/spctl" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+count=0
+if [[ -r "${METADATA_SPCTL_COUNT:?}" ]]; then
+    count="$(<"$METADATA_SPCTL_COUNT")"
+fi
+count=$((count + 1))
+printf '%s\n' "$count" > "$METADATA_SPCTL_COUNT"
+if [[ "${METADATA_MUTATE_ON_SPCTL:-0}" == 1 && "$count" == 2 ]]; then
+    printf '\n' >> "${METADATA_CANONICAL_INFO:?}"
+fi
+EOF
 printf '#!/bin/bash\nexit 0\n' > "$METADATA_PRODUCT_BIN/EchoFixtureExecutable"
 chmod 755 \
     "$METADATA_BUNDLE_REPOSITORY/bundle.sh" \
+    "$METADATA_BUNDLE_REPOSITORY/release.sh" \
     "$METADATA_BUNDLE_REPOSITORY/scripts/dependency-tool.sh" \
     "$METADATA_BUNDLE_REPOSITORY/scripts/read-version.sh" \
     "$METADATA_BUNDLE_REPOSITORY/scripts/verify-bundle.sh" \
@@ -295,13 +399,17 @@ chmod 755 \
     "$METADATA_FAKE_BIN/lipo" \
     "$METADATA_FAKE_BIN/codesign" \
     "$METADATA_FAKE_BIN/xattr" \
+    "$METADATA_FAKE_BIN/file" \
+    "$METADATA_FAKE_BIN/vtool" \
+    "$METADATA_FAKE_BIN/ditto" \
+    "$METADATA_FAKE_BIN/xcrun" \
+    "$METADATA_FAKE_BIN/spctl" \
     "$METADATA_PRODUCT_BIN/EchoFixtureExecutable"
 
 if ! PATH="$METADATA_FAKE_BIN:$PATH" \
+    METADATA_SOURCE_ENTITLEMENTS="$METADATA_BUNDLE_REPOSITORY/TalkText/TalkText.entitlements" \
     METADATA_PRODUCT_BIN="$METADATA_PRODUCT_BIN" \
     METADATA_SWIFT_LOG="$METADATA_SWIFT_LOG" \
-    METADATA_VERIFY_LOG="$METADATA_VERIFY_LOG" \
-    TALKTEXT_DEPENDENCY_MANIFEST="$FIXTURE_MANIFEST" \
     TALKTEXT_MODEL_PATH="$VALID_FIXTURE" \
     TALKTEXT_SIGNING_MODE=adhoc \
         "$METADATA_BUNDLE_REPOSITORY/bundle.sh" \
@@ -323,9 +431,108 @@ grep -Fq -- '--triple x86_64-apple-macosx13.3' "$METADATA_SWIFT_LOG" || \
 if grep -Fq 'apple-macosx14.0' "$METADATA_SWIFT_LOG"; then
     fail 'bundle retained the production deployment-target literal'
 fi
-grep -Fq '/EchoFixture.app' "$METADATA_VERIFY_LOG" || \
-    fail 'bundle verification did not receive the differential app path'
-pass 'bundle assembly follows differential canonical name, executable, and deployment target'
+grep -Eq '^Verified .*/EchoFixture\.app$' "$TEMP_ROOT/metadata-bundle.stdout" || \
+    fail 'real bundle verifier did not verify the differential app path'
+
+cp "$METADATA_APP/Contents/Info.plist" "$TEMP_ROOT/metadata-final-info.plist"
+plutil -replace CFBundleIdentifier -string com.joeblau.talktext "$METADATA_APP/Contents/Info.plist"
+PATH="$METADATA_FAKE_BIN:$PATH" \
+METADATA_SOURCE_ENTITLEMENTS="$METADATA_BUNDLE_REPOSITORY/TalkText/TalkText.entitlements" \
+    expect_failure 'real verifier canonical identifier mismatch' \
+    "$METADATA_BUNDLE_REPOSITORY/scripts/verify-bundle.sh" "$METADATA_APP"
+grep -q 'final CFBundleIdentifier differs from canonical Info.plist' "$TEMP_ROOT/last.stderr" || \
+    fail 'real verifier did not reject metadata differing from the altered canonical plist'
+cp "$TEMP_ROOT/metadata-final-info.plist" "$METADATA_APP/Contents/Info.plist"
+pass 'Package.swift, bundle assembly, and real verification follow differential canonical metadata'
+
+git -C "$METADATA_BUNDLE_REPOSITORY" init -q
+git -C "$METADATA_BUNDLE_REPOSITORY" config user.email fixture@example.com
+git -C "$METADATA_BUNDLE_REPOSITORY" config user.name 'Fixture Release'
+git -C "$METADATA_BUNDLE_REPOSITORY" add .
+git -C "$METADATA_BUNDLE_REPOSITORY" commit -qm 'Differential metadata fixture'
+METADATA_RELEASE_VERSION="$("$METADATA_BUNDLE_REPOSITORY/scripts/read-version.sh")"
+METADATA_RELEASE_TAG="v$METADATA_RELEASE_VERSION"
+git -C "$METADATA_BUNDLE_REPOSITORY" tag "$METADATA_RELEASE_TAG"
+METADATA_RELEASE_COMMIT="$(git -C "$METADATA_BUNDLE_REPOSITORY" rev-parse HEAD)"
+
+run_metadata_release() {
+    PATH="$METADATA_FAKE_BIN:$PATH" \
+    METADATA_CANONICAL_INFO="$METADATA_BUNDLE_REPOSITORY/TalkText/Info.plist" \
+    METADATA_MUTATE_ON_SPCTL="${METADATA_MUTATE_ON_SPCTL:-0}" \
+    METADATA_PRODUCT_BIN="$METADATA_PRODUCT_BIN" \
+    METADATA_SOURCE_ENTITLEMENTS="$METADATA_BUNDLE_REPOSITORY/TalkText/TalkText.entitlements" \
+    METADATA_SPCTL_COUNT="$METADATA_SPCTL_COUNT" \
+    METADATA_SWIFT_LOG="$METADATA_SWIFT_LOG" \
+    APPLE_TEAM_ID=FIXTURETEAM \
+    NOTARYTOOL_PROFILE=fixture-profile \
+    TALKTEXT_MODEL_PATH="$VALID_FIXTURE" \
+    TALKTEXT_RELEASE_COMMIT="$METADATA_RELEASE_COMMIT" \
+    TALKTEXT_RELEASE_TAG="$METADATA_RELEASE_TAG" \
+    TALKTEXT_SIGNING_IDENTITY='Developer ID Application: Fixture' \
+        "$METADATA_BUNDLE_REPOSITORY/release.sh"
+}
+
+if ! run_metadata_release \
+    > "$TEMP_ROOT/metadata-release.stdout" \
+    2> "$TEMP_ROOT/metadata-release.stderr"; then
+    sed -n '1,160p' "$TEMP_ROOT/metadata-release.stderr" >&2
+    fail 'real release.sh failed with differential canonical metadata'
+fi
+METADATA_RELEASE_ZIP="$METADATA_BUNDLE_REPOSITORY/dist/EchoFixture-$METADATA_RELEASE_VERSION.zip"
+[[ -f "$METADATA_RELEASE_ZIP" ]] || fail 'release archive did not use differential CFBundleName'
+[[ -f "$METADATA_RELEASE_ZIP.sha256" ]] || fail 'release checksum did not follow differential archive path'
+assert_absent "$METADATA_BUNDLE_REPOSITORY/dist/TalkText-$METADATA_RELEASE_VERSION.zip"
+grep -Eq "Artifact: .*/EchoFixture-$METADATA_RELEASE_VERSION\\.zip$" "$TEMP_ROOT/metadata-release.stdout" || \
+    fail 'release output retained the production archive path'
+
+PATH="$METADATA_FAKE_BIN:$PATH" \
+TALKTEXT_RELEASE_COMMIT="$METADATA_RELEASE_COMMIT" \
+TALKTEXT_RELEASE_TAG="$METADATA_RELEASE_TAG" \
+    "$METADATA_BUNDLE_REPOSITORY/release.sh" verify-source \
+    > "$TEMP_ROOT/metadata-source-verify.stdout"
+grep -Fq "Verified immutable release source $METADATA_RELEASE_TAG at $METADATA_RELEASE_COMMIT" \
+    "$TEMP_ROOT/metadata-source-verify.stdout" || \
+    fail 'standalone pre-publication source verification did not bind the tag and commit'
+
+run_metadata_source_verify() {
+    PATH="$METADATA_FAKE_BIN:$PATH" \
+    TALKTEXT_RELEASE_COMMIT="$METADATA_RELEASE_COMMIT" \
+    TALKTEXT_RELEASE_TAG="$METADATA_RELEASE_TAG" \
+        "$METADATA_BUNDLE_REPOSITORY/release.sh" verify-source
+}
+
+METADATA_OTHER_COMMIT="$(
+    printf 'fixture release drift\n' | \
+        git -C "$METADATA_BUNDLE_REPOSITORY" commit-tree \
+            "$METADATA_RELEASE_COMMIT^{tree}" \
+            -p "$METADATA_RELEASE_COMMIT"
+)"
+git -C "$METADATA_BUNDLE_REPOSITORY" tag -f "$METADATA_RELEASE_TAG" "$METADATA_OTHER_COMMIT" >/dev/null
+expect_failure 'immutable release tag drift' run_metadata_source_verify
+grep -q "$METADATA_RELEASE_TAG no longer points at the immutable release commit" "$TEMP_ROOT/last.stderr" || \
+    fail 'standalone source verification did not reject tag drift'
+git -C "$METADATA_BUNDLE_REPOSITORY" tag -f "$METADATA_RELEASE_TAG" "$METADATA_RELEASE_COMMIT" >/dev/null
+
+git -C "$METADATA_BUNDLE_REPOSITORY" update-ref HEAD "$METADATA_OTHER_COMMIT"
+expect_failure 'immutable release HEAD drift' run_metadata_source_verify
+grep -q 'HEAD changed after release verification began' "$TEMP_ROOT/last.stderr" || \
+    fail 'standalone source verification did not reject HEAD drift'
+git -C "$METADATA_BUNDLE_REPOSITORY" update-ref HEAD "$METADATA_RELEASE_COMMIT"
+
+: > "$METADATA_BUNDLE_REPOSITORY/unexpected-release-input"
+expect_failure 'immutable release worktree drift' run_metadata_source_verify
+grep -q 'release checkout changed after verification began' "$TEMP_ROOT/last.stderr" || \
+    fail 'standalone source verification did not reject worktree drift'
+rm -f "$METADATA_BUNDLE_REPOSITORY/unexpected-release-input"
+pass 'standalone release source verification rejects tag, HEAD, and worktree drift'
+
+rm -f "$METADATA_SPCTL_COUNT"
+METADATA_MUTATE_ON_SPCTL=1 \
+    expect_failure 'release source drift after archive verification' run_metadata_release
+grep -q 'canonical release file changed after verification began: TalkText/Info.plist' \
+    "$TEMP_ROOT/last.stderr" || \
+    fail 'release did not fail closed when canonical metadata drifted after archive verification'
+pass 'release archive derivation follows canonical metadata and immutable source drift fails closed'
 
 DEVELOPMENT_ROOT="$RESOLVER_HOME/configured"
 INFERRED_BACKEND="$RESOLVER_REPOSITORY/.dependencies/bin/$FIXTURE_BACKEND"
@@ -411,13 +618,12 @@ grep -q '^version=1\.8\.4$' <<< "$PROBE_OUTPUT" || \
 pass 'version sidecar trims only surrounding whitespace and normalizes v'
 
 printf '1.8. 4\n' > "${PROBE_BACKEND}.version"
-PROBE_OUTPUT="$(
-    MOCK_BACKEND_VERSION_OUTPUT='fixture version 1.9.1' \
-        run_resolver "$WORKING_DIRECTORY" probe-backend "$PROBE_BACKEND"
-)"
-grep -q '^version=1\.9\.1$' <<< "$PROBE_OUTPUT" || \
-    fail 'invalid sidecar did not fall through to executable version output'
-pass 'internal sidecar whitespace is rejected instead of removed'
+MOCK_BACKEND_VERSION_OUTPUT='fixture version 1.9.1' \
+    expect_failure 'malformed version sidecar' \
+    run_resolver "$WORKING_DIRECTORY" probe-backend "$PROBE_BACKEND"
+grep -q 'did not report a version' "$TEMP_ROOT/last.stderr" || \
+    fail 'malformed sidecar did not fail closed'
+pass 'malformed version sidecar is authoritative invalid metadata'
 
 CELLAR_BACKEND="$TEMP_ROOT/Cellar/whisper-cpp/v1.8.4/bin/$FIXTURE_BACKEND"
 make_backend "$CELLAR_BACKEND"

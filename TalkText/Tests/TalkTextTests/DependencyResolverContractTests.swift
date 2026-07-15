@@ -264,6 +264,24 @@ final class DependencyResolverContractTests: XCTestCase {
         XCTAssertEqual(try readyPreflight(from: resolver).backend.version, "1.9.1")
     }
 
+    func testMalformedVersionSidecarFailsClosed() throws {
+        let backend = try makeExecutable(at: fixtureDirectory.appendingPathComponent("bundle/bin/whisper-cli"))
+        try Data("1.8. 4\n".utf8).write(to: URL(fileURLWithPath: backend.path + ".version"))
+        let model = try makeModel(at: fixtureDirectory.appendingPathComponent("model.bin"))
+        let resolver = makeResolver(
+            environment: [
+                "PATH": "",
+                "TALKTEXT_WHISPER_CLI": backend.path,
+                "TALKTEXT_MODEL_PATH": model.path,
+            ],
+            runner: StubDependencyProbeRunner.compatible(versionOutput: "whisper.cpp version 1.9.1")
+        )
+
+        guard case .failure(.backendVersionUnreported) = resolver.preflight() else {
+            return XCTFail("Expected malformed sidecar metadata to fail closed")
+        }
+    }
+
     func testProductionInvocationArgumentsAreExact() {
         let arguments = WhisperBackendContract.productionArguments(
             modelURL: URL(fileURLWithPath: "/model.ggml"),
@@ -287,8 +305,14 @@ final class DependencyResolverContractTests: XCTestCase {
             .appendingPathComponent("dependencies.env")
         let manifest = try parseManifest(at: manifestURL)
 
+        XCTAssertEqual(manifest["BACKEND_EXECUTABLE"], WhisperBackendContract.executableName)
+        XCTAssertEqual(manifest["BACKEND_FORMULA"], WhisperBackendContract.formulaName)
         XCTAssertEqual(manifest["MODEL_FILE_NAME"], WhisperBackendContract.modelFileName)
         XCTAssertEqual(try UInt64(XCTUnwrap(manifest["MODEL_SIZE_BYTES"])), WhisperBackendContract.modelSizeBytes)
+        XCTAssertEqual(
+            try data(fromHexadecimal: XCTUnwrap(manifest["MODEL_MAGIC_HEX"])),
+            WhisperBackendContract.modelMagic
+        )
         XCTAssertEqual(
             manifest["BACKEND_SUPPORTED_VERSIONS"]?.split(separator: " ").map(String.init),
             WhisperBackendContract.supportedVersions
@@ -405,6 +429,24 @@ final class DependencyResolverContractTests: XCTestCase {
             values[key] = value
         }
     }
+
+    private func data(fromHexadecimal value: String) throws -> Data {
+        guard value.count.isMultiple(of: 2) else {
+            throw HexadecimalFixtureError.invalidValue(value)
+        }
+        return try stride(from: 0, to: value.count, by: 2).reduce(into: Data()) { data, offset in
+            let start = value.index(value.startIndex, offsetBy: offset)
+            let end = value.index(start, offsetBy: 2)
+            guard let byte = UInt8(value[start ..< end], radix: 16) else {
+                throw HexadecimalFixtureError.invalidValue(value)
+            }
+            data.append(byte)
+        }
+    }
+}
+
+private enum HexadecimalFixtureError: Error {
+    case invalidValue(String)
 }
 
 private struct StubDependencyProbeRunner: DependencyProbeRunning {

@@ -1,6 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 
+BACKEND_SEARCH_PATH_SET="${PATH+x}"
+BACKEND_SEARCH_PATH="${PATH-}"
+PATH="${PATH:+$PATH:}/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH
+
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPOSITORY_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd -P)"
 MANIFEST_PATH="${TALKTEXT_DEPENDENCY_MANIFEST:-$REPOSITORY_ROOT/dependencies.env}"
@@ -200,6 +205,8 @@ trim_surrounding_whitespace() {
 
 configured_path() {
     local path="$1"
+    local component component_index remainder
+    local -a components=()
 
     case "$path" in
         '~')
@@ -210,16 +217,49 @@ configured_path() {
             ;;
     esac
 
-    if [[ "$path" == /* ]]; then
-        printf '%s\n' "$path"
+    [[ "$path" == /* ]] || path="$(pwd -P)/$path"
+
+    # Match URL.standardizedFileURL: collapse separators and '.' components,
+    # and resolve '..' lexically without requiring the discarded component to
+    # exist on disk. Symlinks are resolved only after a candidate is selected.
+    remainder="${path#/}"
+    while :; do
+        if [[ "$remainder" == */* ]]; then
+            component="${remainder%%/*}"
+            remainder="${remainder#*/}"
+        else
+            component="$remainder"
+            remainder=''
+        fi
+
+        case "$component" in
+            '' | '.')
+                ;;
+            '..')
+                if (( ${#components[@]} )); then
+                    component_index=$(( ${#components[@]} - 1 ))
+                    unset "components[$component_index]"
+                fi
+                ;;
+            *)
+                components+=("$component")
+                ;;
+        esac
+
+        [[ -n "$remainder" ]] || break
+    done
+
+    if (( ${#components[@]} )); then
+        local IFS='/'
+        printf '/%s\n' "${components[*]}"
     else
-        printf '%s/%s\n' "$(pwd -P)" "$path"
+        printf '/\n'
     fi
 }
 
 resolve_backend() {
-    local candidate path_entry prefix development_root current_directory
-    local -a development_roots path_entries
+    local candidate path_entry path_remainder prefix development_root current_directory
+    local -a development_roots homebrew_prefixes
 
     if [[ -n "$(trim_surrounding_whitespace "${TALKTEXT_WHISPER_CLI:-}")" ]]; then
         candidate="$(canonical_path "$(configured_path "$TALKTEXT_WHISPER_CLI")")"
@@ -239,18 +279,30 @@ resolve_backend() {
         done
     fi
 
-    IFS=':' read -r -a path_entries <<< "${PATH:-}"
-    for path_entry in "${path_entries[@]}"; do
-        [[ -n "$path_entry" ]] || path_entry="$(pwd -P)"
-        path_entry="$(configured_path "$path_entry")"
-        candidate="$path_entry/$BACKEND_EXECUTABLE"
-        if is_executable_file "$candidate"; then
-            canonical_path "$candidate"
-            return
-        fi
-    done
+    # POSIX PATH treats every empty component (including a sole, leading, or
+    # trailing component) as the current directory. Parse it without Bash's
+    # read-array elision so the Swift and shell candidate lists stay identical.
+    if [[ -n "$BACKEND_SEARCH_PATH_SET" ]]; then
+        path_remainder="$BACKEND_SEARCH_PATH:"
+        while [[ "$path_remainder" == *:* ]]; do
+            path_entry="${path_remainder%%:*}"
+            path_remainder="${path_remainder#*:}"
+            [[ -n "$path_entry" ]] || path_entry="$(pwd -P)"
+            path_entry="$(configured_path "$path_entry")"
+            candidate="$path_entry/$BACKEND_EXECUTABLE"
+            if is_executable_file "$candidate"; then
+                canonical_path "$candidate"
+                return
+            fi
+        done
+    fi
 
-    for prefix in "${HOMEBREW_PREFIX:-}" /opt/homebrew /usr/local; do
+    if [[ -n "$(trim_surrounding_whitespace "${HOMEBREW_PREFIX:-}")" ]]; then
+        homebrew_prefixes=("$HOMEBREW_PREFIX")
+    else
+        homebrew_prefixes=(/opt/homebrew /usr/local)
+    fi
+    for prefix in "${homebrew_prefixes[@]}"; do
         [[ -n "$(trim_surrounding_whitespace "$prefix")" ]] || continue
         prefix="$(configured_path "$prefix")"
         candidate="$prefix/bin/$BACKEND_EXECUTABLE"
@@ -308,12 +360,12 @@ extract_backend_version() {
         return
     fi
 
-    if [[ -r "${executable}.version" ]]; then
-        sidecar="$(<"${executable}.version")"
-        if version="$(normalized_backend_version "$sidecar")"; then
-            printf '%s\n' "$version"
-            return
+    if [[ -e "${executable}.version" || -L "${executable}.version" ]]; then
+        if [[ -f "${executable}.version" && -r "${executable}.version" ]]; then
+            sidecar="$(<"${executable}.version")"
+            normalized_backend_version "$sidecar" || true
         fi
+        return
     fi
 
     resolved="$(canonical_path "$executable")"
