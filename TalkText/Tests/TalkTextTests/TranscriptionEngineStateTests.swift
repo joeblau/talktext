@@ -411,7 +411,8 @@ final class TranscriptionEngineStateTests: XCTestCase {
         )
         let store = EngineFileStoreFake()
         let engine = makeEngine(store: store, transcriber: transcriber)
-        let hotKeyController = HotKeyController(service: EngineHotKeyServiceFake())
+        let hotKeyService = EngineHotKeyServiceFake()
+        let hotKeyController = HotKeyController(service: hotKeyService)
         let appDelegate = AppDelegate(
             transcriptionEngine: engine,
             hotKeyController: hotKeyController
@@ -430,6 +431,7 @@ final class TranscriptionEngineStateTests: XCTestCase {
         XCTAssertEqual(errno, ESRCH)
         XCTAssertEqual(store.removedURLs, store.allocatedURLs)
         XCTAssertEqual(store.instanceCleanupCount, 1)
+        XCTAssertEqual(hotKeyService.uninstallCount, 1)
     }
 
     private func makeEngine(
@@ -614,6 +616,8 @@ private struct EngineAudioValidatorFake: AudioValidating {
 
 @MainActor
 private final class EngineHotKeyServiceFake: GlobalHotKeyService {
+    private(set) var uninstallCount = 0
+
     func install(
         action: @escaping @MainActor @Sendable () -> Void
     ) -> Result<Void, HotKeyInstallationError> {
@@ -621,6 +625,7 @@ private final class EngineHotKeyServiceFake: GlobalHotKeyService {
     }
 
     func uninstall() -> Result<Void, HotKeyCleanupError> {
-        .success(())
+        uninstallCount += 1
+        return .success(())
     }
 }

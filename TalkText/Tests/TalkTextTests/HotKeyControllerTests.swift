@@ -161,6 +161,42 @@ final class HotKeyControllerTests: XCTestCase {
         XCTAssertTrue(api.unregisteredHotKeys.isEmpty)
     }
 
+    func testCarbonHandlerRegistrationFailureWithHandleRollsBackAndPropagatesFailure() {
+        let handler = eventHandlerRef(1)
+        let api = FakeCarbonHotKeyAPI(
+            handlerResults: [carbonResult(-7003, handler)],
+            hotKeyResults: []
+        )
+        let service = CarbonGlobalHotKeyService(api: api)
+
+        let result = service.install {}
+
+        assertInstallationFailure(result, equals: .handlerRegistrationFailed(-7003))
+        XCTAssertEqual(api.installedEventHandlerCount, 1)
+        XCTAssertTrue(api.registrationOptions.isEmpty)
+        XCTAssertEqual(api.removedEventHandlers, [handler])
+        XCTAssertTrue(api.unregisteredHotKeys.isEmpty)
+    }
+
+    func testCarbonHandlerRegistrationFailureSurfacesRollbackFailure() {
+        let handler = eventHandlerRef(1)
+        let cleanupError = HotKeyCleanupError.handlerRemovalFailed(-7004)
+        let api = FakeCarbonHotKeyAPI(
+            handlerResults: [carbonResult(-7003, handler)],
+            hotKeyResults: [],
+            removeStatuses: [-7004]
+        )
+        let service = CarbonGlobalHotKeyService(api: api)
+
+        let result = service.install {}
+
+        assertInstallationFailure(result, equals: .cleanupFailed(cleanupError))
+        XCTAssertEqual(api.installedEventHandlerCount, 1)
+        XCTAssertTrue(api.registrationOptions.isEmpty)
+        XCTAssertEqual(api.removedEventHandlers, [handler])
+        XCTAssertTrue(api.unregisteredHotKeys.isEmpty)
+    }
+
     func testCarbonRollbackFailureBlocksInstallationUntilHandlerRemovalSucceeds() {
         let firstHandler = eventHandlerRef(1)
         let secondHandler = eventHandlerRef(2)
@@ -305,7 +341,7 @@ final class HotKeyControllerTests: XCTestCase {
         XCTAssertEqual(api.removedEventHandlers, [firstHandler])
     }
 
-    func testTerminationCleanupReleasesCarbonHotKeyAndHandler() {
+    func testCarbonUninstallReleasesHotKeyAndHandler() {
         let handler = eventHandlerRef(1)
         let hotKey = eventHotKeyRef(2)
         let api = FakeCarbonHotKeyAPI(
