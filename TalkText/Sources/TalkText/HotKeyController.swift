@@ -2,7 +2,7 @@ import Carbon.HIToolbox
 import Combine
 import os
 
-private let hotKeyLogger = Logger(subsystem: "com.joeblau.talktext", category: "hotkey")
+private let hotKeyLogger = Logger(subsystem: AppIdentity.bundleIdentifier, category: "hotkey")
 
 enum HotKeyInstallationError: Error, Equatable, Sendable {
     case handlerRegistrationFailed(OSStatus)

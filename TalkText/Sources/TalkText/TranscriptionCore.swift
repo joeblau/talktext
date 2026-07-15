@@ -4,7 +4,7 @@ import Foundation
 import os
 
 private let recordingFileStoreLog = OSLog(
-    subsystem: "com.joeblau.talktext",
+    subsystem: AppIdentity.bundleIdentifier,
     category: "recording-file-store"
 )
 

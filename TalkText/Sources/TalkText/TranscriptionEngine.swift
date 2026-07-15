@@ -2,7 +2,7 @@ import AppKit
 import Foundation
 import os
 
-private let logger = Logger(subsystem: "com.joeblau.talktext", category: "engine")
+private let logger = Logger(subsystem: AppIdentity.bundleIdentifier, category: "engine")
 
 @MainActor
 final class TranscriptionEngine: ObservableObject {
@@ -86,7 +86,7 @@ final class TranscriptionEngine: ObservableObject {
         dependencyPreflight: any WhisperDependencyPreflighting,
         transcriber: any WhisperTranscribing,
         textDelivery: any TextDelivering,
-        applicationBundleIdentifier: String? = "com.joeblau.talktext",
+        applicationBundleIdentifier: String? = AppIdentity.bundleIdentifier,
         maximumDuration: TimeInterval = TranscriptionEngine.maximumRecordingDuration,
         performStartupCleanup: Bool = true,
         startupPresentation: Presentation? = nil
