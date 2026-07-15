@@ -166,7 +166,13 @@ jobs:
           CMAKE_BIN=''
           for candidate in "${cmake_candidates[@]}"; do
             [[ -x "$candidate" ]] || continue
-            candidate_version="$("$candidate" --version | sed -nE 's/^cmake version ([0-9.]+)$/\1/p')"
+            candidate_version="$("$candidate" --version | awk '
+              NR == 1 && $1 == "cmake" && $2 == "version" {
+                sub(/\r$/, "", $3)
+                print $3
+                exit
+              }
+            ')"
             printf 'cmake candidate=%s version=%s\n' "$candidate" "${candidate_version:-unreported}"
             if [[ "$candidate_version" == "$EXPECTED_CMAKE_VERSION" ]]; then
               CMAKE_BIN="$candidate"
