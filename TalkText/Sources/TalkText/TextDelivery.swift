@@ -5,8 +5,18 @@ import Foundation
 struct PasteTarget: Equatable, Sendable {
     let processIdentifier: pid_t
     let bundleIdentifier: String?
-    let launchDate: Date?
+    let launchDate: Date
     let bundleURL: URL?
+
+    init?(processIdentifier: pid_t, bundleIdentifier: String?, launchDate: Date?, bundleURL: URL?) {
+        guard let launchDate else {
+            return nil
+        }
+        self.processIdentifier = processIdentifier
+        self.bundleIdentifier = bundleIdentifier
+        self.launchDate = launchDate
+        self.bundleURL = bundleURL
+    }
 }
 
 enum TargetProcessAvailability: Equatable, Sendable {
@@ -15,11 +25,18 @@ enum TargetProcessAvailability: Equatable, Sendable {
     case identityChanged
 }
 
+enum TargetActivationOutcome: Equatable, Sendable {
+    case requested
+    case targetExited
+    case identityChanged
+    case rejected
+}
+
 @MainActor
 protocol WorkspaceServing: AnyObject {
     func currentExternalTarget(excludingBundleIdentifier: String?) -> PasteTarget?
     func availability(of target: PasteTarget) -> TargetProcessAvailability
-    func activate(_ target: PasteTarget) -> Bool
+    func activate(_ target: PasteTarget) -> TargetActivationOutcome
     func frontmostTarget() -> PasteTarget?
 }
 
@@ -46,19 +63,21 @@ final class SystemWorkspaceService: WorkspaceServing {
         return targetMatches(target, application: application) ? .available : .identityChanged
     }
 
-    func activate(_ target: PasteTarget) -> Bool {
-        guard availability(of: target) == .available,
-              let application = NSRunningApplication(processIdentifier: target.processIdentifier) else {
-            return false
+    func activate(_ target: PasteTarget) -> TargetActivationOutcome {
+        guard let application = NSRunningApplication(processIdentifier: target.processIdentifier) else {
+            return .targetExited
         }
-        return application.activate(options: [.activateAllWindows])
+        guard targetMatches(target, application: application) else {
+            return .identityChanged
+        }
+        return application.activate(options: [.activateAllWindows]) ? .requested : .rejected
     }
 
     func frontmostTarget() -> PasteTarget? {
-        workspace.frontmostApplication.map(target(for:))
+        workspace.frontmostApplication.flatMap(target(for:))
     }
 
-    private func target(for application: NSRunningApplication) -> PasteTarget {
+    private func target(for application: NSRunningApplication) -> PasteTarget? {
         PasteTarget(
             processIdentifier: application.processIdentifier,
             bundleIdentifier: application.bundleIdentifier,
@@ -68,18 +87,30 @@ final class SystemWorkspaceService: WorkspaceServing {
     }
 
     private func targetMatches(_ target: PasteTarget, application: NSRunningApplication) -> Bool {
-        guard application.processIdentifier == target.processIdentifier,
-              application.bundleIdentifier == target.bundleIdentifier else {
+        Self.targetMatches(
+            target,
+            processIdentifier: application.processIdentifier,
+            bundleIdentifier: application.bundleIdentifier,
+            launchDate: application.launchDate,
+            bundleURL: application.bundleURL
+        )
+    }
+
+    static func targetMatches(
+        _ target: PasteTarget,
+        processIdentifier: pid_t,
+        bundleIdentifier: String?,
+        launchDate: Date?,
+        bundleURL: URL?
+    ) -> Bool {
+        guard let launchDate,
+              processIdentifier == target.processIdentifier,
+              bundleIdentifier == target.bundleIdentifier,
+              launchDate == target.launchDate else {
             return false
         }
-
-        if target.launchDate != nil || application.launchDate != nil {
-            guard target.launchDate == application.launchDate else {
-                return false
-            }
-        }
-        if target.bundleURL != nil || application.bundleURL != nil {
-            guard target.bundleURL?.standardizedFileURL == application.bundleURL?.standardizedFileURL else {
+        if target.bundleURL != nil || bundleURL != nil {
+            guard target.bundleURL?.standardizedFileURL == bundleURL?.standardizedFileURL else {
                 return false
             }
         }
@@ -173,7 +204,6 @@ final class SystemAccessibilityService: AccessibilityServing {
             0,
             min(selectedRange.length, currentNSString.length - selectedRange.location)
         )
-
         let replacementRange = NSRange(
             location: selectedRange.location,
             length: selectedRange.length
@@ -190,7 +220,6 @@ final class SystemAccessibilityService: AccessibilityServing {
         guard setValueError == .success else {
             return .failed(errorCode: setValueError.rawValue)
         }
-
         var insertionRange = CFRange(
             location: selectedRange.location + insertedNSString.length,
             length: 0
@@ -267,7 +296,6 @@ final class SystemPasteEventPoster: PasteEventPosting {
               let commandUp = CGEvent(keyboardEventSource: source, virtualKey: 0x37, keyDown: false) else {
             return false
         }
-
         keyDown.flags = .maskCommand
         keyUp.flags = .maskCommand
         commandDown.postToPid(target.processIdentifier)
@@ -286,10 +314,16 @@ struct PasteboardSnapshot: Equatable, Sendable {
     let items: [PasteboardItemSnapshot]
 }
 
+enum PasteboardSnapshotFailure: Error, Equatable, Sendable {
+    case clipboardChanged
+    case representationReadFailed(type: String)
+}
+
 enum PasteboardMutationFailure: Equatable, Sendable {
     case clearFailed
     case writeFailed
     case verificationFailed
+    case representationWriteFailed(type: String)
 }
 
 enum PasteboardReplacementResult: Equatable, Sendable {
@@ -306,7 +340,7 @@ enum ClipboardRestorationOutcome: Equatable, Sendable {
 @MainActor
 protocol PasteboardServing: AnyObject {
     var changeCount: Int { get }
-    func snapshot() -> PasteboardSnapshot
+    func snapshot() -> Result<PasteboardSnapshot, PasteboardSnapshotFailure>
     func replaceContents(with text: String) -> PasteboardReplacementResult
     func restore(_ snapshot: PasteboardSnapshot, ifUnchangedSince changeCount: Int) -> ClipboardRestorationOutcome
 }
@@ -314,26 +348,38 @@ protocol PasteboardServing: AnyObject {
 @MainActor
 final class SystemPasteboardService: PasteboardServing {
     private let pasteboard: NSPasteboard
+    private let representationWriter: (NSPasteboardItem, Data, NSPasteboard.PasteboardType) -> Bool
 
-    init(pasteboard: NSPasteboard = .general) {
+    init(
+        pasteboard: NSPasteboard = .general,
+        representationWriter: @escaping (NSPasteboardItem, Data, NSPasteboard.PasteboardType) -> Bool = { $0.setData($1, forType: $2) }
+    ) {
         self.pasteboard = pasteboard
+        self.representationWriter = representationWriter
     }
 
     var changeCount: Int {
         pasteboard.changeCount
     }
 
-    func snapshot() -> PasteboardSnapshot {
+    func snapshot() -> Result<PasteboardSnapshot, PasteboardSnapshotFailure> {
+        let initialChangeCount = pasteboard.changeCount
         let items = pasteboard.pasteboardItems ?? []
-        return PasteboardSnapshot(items: items.map { item in
+        var snapshots: [PasteboardItemSnapshot] = []
+        for item in items {
             var representations: [String: Data] = [:]
             for type in item.types {
-                if let data = item.data(forType: type) {
-                    representations[type.rawValue] = data
+                guard let data = item.data(forType: type) else {
+                    return .failure(.representationReadFailed(type: type.rawValue))
                 }
+                representations[type.rawValue] = data
             }
-            return PasteboardItemSnapshot(representations: representations)
-        })
+            snapshots.append(PasteboardItemSnapshot(representations: representations))
+        }
+        guard pasteboard.changeCount == initialChangeCount else {
+            return .failure(.clipboardChanged)
+        }
+        return .success(PasteboardSnapshot(items: snapshots))
     }
 
     func replaceContents(with text: String) -> PasteboardReplacementResult {
@@ -358,30 +404,35 @@ final class SystemPasteboardService: PasteboardServing {
         guard pasteboard.changeCount == changeCount else {
             return .skippedBecauseClipboardChanged
         }
-
+        var items: [NSPasteboardItem] = []
+        for snapshotItem in snapshot.items {
+            let item = NSPasteboardItem()
+            for (rawType, data) in snapshotItem.representations {
+                let type = NSPasteboard.PasteboardType(rawType)
+                guard representationWriter(item, data, type) else {
+                    return .failed(.representationWriteFailed(type: rawType))
+                }
+            }
+            items.append(item)
+        }
         let beforeClear = pasteboard.changeCount
+        guard beforeClear == changeCount else { return .skippedBecauseClipboardChanged }
         let clearedCount = pasteboard.clearContents()
         guard clearedCount != beforeClear else {
             return .failed(.clearFailed)
         }
-
-        guard !snapshot.items.isEmpty else {
+        guard !items.isEmpty else {
             return .restored
         }
-        let items = snapshot.items.map { snapshotItem in
-            let item = NSPasteboardItem()
-            for (rawType, data) in snapshotItem.representations {
-                item.setData(data, forType: NSPasteboard.PasteboardType(rawType))
-            }
-            return item
+        guard pasteboard.writeObjects(items) else {
+            return .failed(.writeFailed)
         }
-        return pasteboard.writeObjects(items) ? .restored : .failed(.writeFailed)
+        return .restored
     }
 }
 
 @MainActor
 protocol DeliverySleeping: AnyObject {
-    /// Returns false if the calling task was cancelled before the delay elapsed.
     func sleep(for duration: TimeInterval) async -> Bool
 }
 
@@ -409,6 +460,7 @@ enum ManualPasteReason: Equatable, Sendable {
 }
 
 enum DeliveryFailure: Equatable, Sendable {
+    case pasteboardSnapshotFailed(PasteboardSnapshotFailure)
     case pasteboardWriteFailed(PasteboardMutationFailure, restoration: ClipboardRestorationOutcome)
 }
 
@@ -426,9 +478,6 @@ protocol TextDelivering: AnyObject {
     func deliver(_ text: String, to target: PasteTarget?) async -> DeliveryOutcome
 }
 
-/// Delivers only to the application identity captured at recording start.
-/// Clipboard access is serialized, and each return value describes the final
-/// insertion, paste, restoration, or manual-copy result rather than scheduled work.
 @MainActor
 final class TextDeliveryService: TextDelivering {
     private let workspace: any WorkspaceServing
@@ -482,7 +531,6 @@ final class TextDeliveryService: TextDelivering {
            accessibility.insert(text, into: target) == .inserted {
             return .inserted
         }
-
         guard await acquireClipboardTransaction() else {
             return .cancelled(restoration: nil)
         }
@@ -490,30 +538,26 @@ final class TextDeliveryService: TextDelivering {
         guard !Task.isCancelled else {
             return .cancelled(restoration: nil)
         }
-
-        let originalContents = pasteboard.snapshot()
+        let originalContents: PasteboardSnapshot
+        switch pasteboard.snapshot() {
+        case let .success(snapshot):
+            originalContents = snapshot
+        case let .failure(failure):
+            return .failed(.pasteboardSnapshotFailed(failure))
+        }
         let replacement = pasteboard.replaceContents(with: text)
         let transientChangeCount: Int
         switch replacement {
         case let .replaced(changeCount):
             transientChangeCount = changeCount
         case let .failed(failure, currentChangeCount):
-            let restoration = pasteboard.restore(
-                originalContents,
-                ifUnchangedSince: currentChangeCount
-            )
+            let restoration = pasteboard.restore(originalContents, ifUnchangedSince: currentChangeCount)
             return .failed(.pasteboardWriteFailed(failure, restoration: restoration))
         }
 
         if Task.isCancelled {
-            return .cancelled(
-                restoration: pasteboard.restore(
-                    originalContents,
-                    ifUnchangedSince: transientChangeCount
-                )
-            )
+            return .cancelled(restoration: pasteboard.restore(originalContents, ifUnchangedSince: transientChangeCount))
         }
-
         guard let target else {
             return .copiedForManualPaste(.noSessionTarget)
         }
@@ -526,7 +570,6 @@ final class TextDeliveryService: TextDelivering {
         case .available:
             break
         }
-
         guard accessibility.ensurePermission(prompt: true) else {
             return .copiedForManualPaste(.targetCouldNotBeVerified)
         }
@@ -546,12 +589,7 @@ final class TextDeliveryService: TextDelivering {
         var targetConfirmedFrontmost = false
         for _ in 0..<activationAttempts {
             if Task.isCancelled {
-                return .cancelled(
-                    restoration: pasteboard.restore(
-                        originalContents,
-                        ifUnchangedSince: transientChangeCount
-                    )
-                )
+                return .cancelled(restoration: pasteboard.restore(originalContents, ifUnchangedSince: transientChangeCount))
             }
 
             switch workspace.availability(of: target) {
@@ -563,17 +601,21 @@ final class TextDeliveryService: TextDelivering {
                 break
             }
 
-            _ = workspace.activate(target)
+            let activationOutcome = workspace.activate(target)
+            switch activationOutcome {
+            case .targetExited:
+                return .copiedForManualPaste(.targetExited)
+            case .identityChanged:
+                return .copiedForManualPaste(.targetIdentityChanged)
+            case .requested, .rejected:
+                break
+            }
             guard await sleeper.sleep(for: activationRetryDelay) else {
-                return .cancelled(
-                    restoration: pasteboard.restore(
-                        originalContents,
-                        ifUnchangedSince: transientChangeCount
-                    )
-                )
+                return .cancelled(restoration: pasteboard.restore(originalContents, ifUnchangedSince: transientChangeCount))
             }
 
-            if workspace.frontmostTarget() == target {
+            if activationOutcome == .requested,
+               workspace.frontmostTarget() == target {
                 targetConfirmedFrontmost = true
                 break
             }
@@ -601,19 +643,9 @@ final class TextDeliveryService: TextDelivering {
         }
 
         guard await sleeper.sleep(for: restorationDelay) else {
-            return .cancelled(
-                restoration: pasteboard.restore(
-                    originalContents,
-                    ifUnchangedSince: transientChangeCount
-                )
-            )
+            return .cancelled(restoration: pasteboard.restore(originalContents, ifUnchangedSince: transientChangeCount))
         }
-        return .pasted(
-            restoration: pasteboard.restore(
-                originalContents,
-                ifUnchangedSince: transientChangeCount
-            )
-        )
+        return .pasted(restoration: pasteboard.restore(originalContents, ifUnchangedSince: transientChangeCount))
     }
 
     private func acquireClipboardTransaction() async -> Bool {

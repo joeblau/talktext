@@ -256,6 +256,7 @@ final class EngineTranscriberFake: WhisperTranscribing, @unchecked Sendable {
 final class EngineDeliveryFake: TextDelivering {
     var capturedTarget: PasteTarget?
     var outcome: DeliveryOutcome?
+    private(set) var captureCount = 0
     private(set) var deliveredTexts: [String] = []
     private(set) var deliveredTargets: [PasteTarget?] = []
     private var continuation: CheckedContinuation<DeliveryOutcome, Never>?
@@ -265,7 +266,8 @@ final class EngineDeliveryFake: TextDelivering {
     }
 
     func captureCurrentTarget(excludingBundleIdentifier: String?) -> PasteTarget? {
-        capturedTarget
+        captureCount += 1
+        return capturedTarget
     }
 
     func deliver(_ text: String, to target: PasteTarget?) async -> DeliveryOutcome {

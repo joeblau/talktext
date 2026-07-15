@@ -143,7 +143,12 @@ extension TranscriptionEngine {
                     statusText: "Copied, but automatic paste failed. Paste manually."
                 )
             }
-        case .failed:
+        case .failed(.pasteboardSnapshotFailed):
+            Presentation(
+                state: .failed,
+                statusText: "Couldn’t safely preserve the clipboard, so delivery was stopped."
+            )
+        case .failed(.pasteboardWriteFailed):
             Presentation(
                 state: .failed,
                 statusText: "Couldn’t copy or paste the transcription. Please try again."

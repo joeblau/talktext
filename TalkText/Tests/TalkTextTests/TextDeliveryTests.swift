@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import XCTest
 @testable import TalkText
@@ -48,22 +49,41 @@ final class TextDeliveryTests: XCTestCase {
         XCTAssertEqual(pasteboard.restoreCount, 0, "manual-copy policy leaves the transcription available")
     }
 
-    func testPIDReuseOrRelaunchFailsClosedWithManualCopy() async {
+    func testSamePIDSameBundleRelaunchWithoutLaunchDateFailsClosed() async {
         let intended = makeTarget(pid: 301)
         let workspace = DeliveryFakeWorkspace(capturedTarget: intended, frontmost: intended)
-        workspace.availability = .identityChanged
+        workspace.availabilityResolver = { target in
+            SystemWorkspaceService.targetMatches(
+                target,
+                processIdentifier: target.processIdentifier,
+                bundleIdentifier: target.bundleIdentifier,
+                launchDate: nil,
+                bundleURL: target.bundleURL
+            ) ? .available : .identityChanged
+        }
         let pasteboard = DeliveryFakePasteboard()
         let eventPoster = DeliveryFakeEventPoster()
+        let accessibility = DeliveryFakeAccessibility(insertionOutcome: .inserted)
         let service = makeService(
             workspace: workspace,
-            accessibility: DeliveryFakeAccessibility(insertionOutcome: .targetNotFocused),
+            accessibility: accessibility,
             pasteboard: pasteboard,
             eventPoster: eventPoster
         )
 
+        XCTAssertNil(
+            PasteTarget(
+                processIdentifier: intended.processIdentifier,
+                bundleIdentifier: intended.bundleIdentifier,
+                launchDate: nil,
+                bundleURL: intended.bundleURL
+            ),
+            "A target without a process-instance launch token must not be captured"
+        )
         let outcome = await service.deliver("copy me", to: intended)
 
         XCTAssertEqual(outcome, .copiedForManualPaste(.targetIdentityChanged))
+        XCTAssertEqual(accessibility.insertedTargets, [])
         XCTAssertEqual(eventPoster.postedTargets, [])
         XCTAssertEqual(pasteboard.currentString, "copy me")
     }
@@ -131,6 +151,26 @@ final class TextDeliveryTests: XCTestCase {
         XCTAssertNil(pasteboard.currentString)
     }
 
+    func testRejectedActivationIsRetriedButNeverTreatedAsFrontmostConfirmation() async {
+        let intended = makeTarget(pid: 551)
+        let workspace = DeliveryFakeWorkspace(capturedTarget: intended, frontmost: intended)
+        workspace.activationOutcome = .rejected
+        let eventPoster = DeliveryFakeEventPoster()
+        let service = makeService(
+            workspace: workspace,
+            accessibility: DeliveryFakeAccessibility(insertionOutcome: .targetNotFocused),
+            pasteboard: DeliveryFakePasteboard(),
+            eventPoster: eventPoster,
+            activationAttempts: 3
+        )
+
+        let outcome = await service.deliver("manual", to: intended)
+
+        XCTAssertEqual(outcome, .copiedForManualPaste(.activationFailed))
+        XCTAssertEqual(workspace.activationCount, 3)
+        XCTAssertEqual(eventPoster.postedTargets, [])
+    }
+
     func testPasteboardWriteFailureIsCheckedAndOriginalClipboardRestored() async {
         let intended = makeTarget(pid: 601)
         let pasteboard = DeliveryFakePasteboard()
@@ -150,6 +190,67 @@ final class TextDeliveryTests: XCTestCase {
         )
         XCTAssertEqual(pasteboard.restoreCount, 1)
         XCTAssertNil(pasteboard.currentString)
+    }
+
+    func testPasteboardSnapshotFailureStopsBeforeClipboardMutation() async {
+        let intended = makeTarget(pid: 651)
+        let pasteboard = DeliveryFakePasteboard()
+        let failure = PasteboardSnapshotFailure.representationReadFailed(type: "public.rtf")
+        pasteboard.snapshotFailure = failure
+        let eventPoster = DeliveryFakeEventPoster()
+        let service = makeService(
+            workspace: DeliveryFakeWorkspace(capturedTarget: intended, frontmost: intended),
+            accessibility: DeliveryFakeAccessibility(insertionOutcome: .targetNotFocused),
+            pasteboard: pasteboard,
+            eventPoster: eventPoster
+        )
+
+        let outcome = await service.deliver("must not replace", to: intended)
+
+        XCTAssertEqual(outcome, .failed(.pasteboardSnapshotFailed(failure)))
+        XCTAssertEqual(pasteboard.replaceTexts, [])
+        XCTAssertEqual(pasteboard.restoreCount, 0)
+        XCTAssertEqual(eventPoster.postedTargets, [])
+    }
+
+    func testPerRepresentationRestorationFailureIsNeverReportedAsRestored() async {
+        let intended = makeTarget(pid: 652)
+        let pasteboard = DeliveryFakePasteboard()
+        pasteboard.restorationOutcome = .failed(.representationWriteFailed(type: "public.rtf"))
+        let service = makeService(
+            workspace: DeliveryFakeWorkspace(capturedTarget: intended, frontmost: intended),
+            accessibility: DeliveryFakeAccessibility(insertionOutcome: .targetNotFocused),
+            pasteboard: pasteboard,
+            eventPoster: DeliveryFakeEventPoster()
+        )
+
+        let outcome = await service.deliver("paste", to: intended)
+
+        XCTAssertEqual(
+            outcome,
+            .pasted(restoration: .failed(.representationWriteFailed(type: "public.rtf")))
+        )
+        XCTAssertEqual(pasteboard.restoreCount, 1)
+    }
+
+    func testSystemRestorationChecksEveryRepresentationBeforeClearingClipboard() {
+        let rawType = "public.rtf"
+        let pasteboard = NSPasteboard(
+            name: NSPasteboard.Name("TalkTextTests.\(UUID().uuidString)")
+        )
+        let service = SystemPasteboardService(
+            pasteboard: pasteboard,
+            representationWriter: { _, _, _ in false }
+        )
+        let snapshot = PasteboardSnapshot(
+            items: [PasteboardItemSnapshot(representations: [rawType: Data("original".utf8)])]
+        )
+        let originalChangeCount = pasteboard.changeCount
+
+        let outcome = service.restore(snapshot, ifUnchangedSince: originalChangeCount)
+
+        XCTAssertEqual(outcome, .failed(.representationWriteFailed(type: rawType)))
+        XCTAssertEqual(pasteboard.changeCount, originalChangeCount)
     }
 
     func testEventPostFailureLeavesExplicitManualCopy() async {
@@ -318,7 +419,7 @@ final class TextDeliveryTests: XCTestCase {
             bundleIdentifier: "test.app.\(pid)",
             launchDate: Date(timeIntervalSince1970: TimeInterval(pid)),
             bundleURL: URL(fileURLWithPath: "/Applications/Test-\(pid).app")
-        )
+        )!
     }
 
     private func waitUntil(
@@ -348,7 +449,8 @@ private final class DeliveryFakeWorkspace: WorkspaceServing {
     var frontmost: PasteTarget?
     var availability: TargetProcessAvailability = .available
     var availabilitySequence: [TargetProcessAvailability] = []
-    var activationResult = true
+    var availabilityResolver: ((PasteTarget) -> TargetProcessAvailability)?
+    var activationOutcome: TargetActivationOutcome = .requested
     var frontmostAfterActivationCount: Int?
     private(set) var activationCount = 0
 
@@ -362,18 +464,21 @@ private final class DeliveryFakeWorkspace: WorkspaceServing {
     }
 
     func availability(of target: PasteTarget) -> TargetProcessAvailability {
+        if let availabilityResolver {
+            return availabilityResolver(target)
+        }
         if !availabilitySequence.isEmpty {
             return availabilitySequence.removeFirst()
         }
         return availability
     }
 
-    func activate(_ target: PasteTarget) -> Bool {
+    func activate(_ target: PasteTarget) -> TargetActivationOutcome {
         activationCount += 1
         if let threshold = frontmostAfterActivationCount, activationCount >= threshold {
             frontmost = target
         }
-        return activationResult
+        return activationOutcome
     }
 
     func frontmostTarget() -> PasteTarget? {
@@ -434,14 +539,20 @@ private final class DeliveryFakePasteboard: PasteboardServing {
     private(set) var restoreCount = 0
     private(set) var maximumConcurrentTransactions = 0
     var replacementFailure: PasteboardMutationFailure?
+    var snapshotFailure: PasteboardSnapshotFailure?
     var restorationOutcome: ClipboardRestorationOutcome = .restored
     private var transactionDepth = 0
 
-    func snapshot() -> PasteboardSnapshot {
+    func snapshot() -> Result<PasteboardSnapshot, PasteboardSnapshotFailure> {
+        if let snapshotFailure {
+            return .failure(snapshotFailure)
+        }
         transactionDepth += 1
         maximumConcurrentTransactions = max(maximumConcurrentTransactions, transactionDepth)
-        return PasteboardSnapshot(
-            items: [PasteboardItemSnapshot(representations: ["public.utf8-plain-text": Data("original".utf8)])]
+        return .success(
+            PasteboardSnapshot(
+                items: [PasteboardItemSnapshot(representations: ["public.utf8-plain-text": Data("original".utf8)])]
+            )
         )
     }
 

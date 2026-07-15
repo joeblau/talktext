@@ -269,10 +269,14 @@ final class TranscriptionEngineStateTests: XCTestCase {
         XCTAssertEqual(store.removedURLs.count, 1)
     }
 
-    func testEngineRemainsDeliveringUntilAwaitedDeliveryFinishes() async {
+    func testRapidTogglesCannotStartAnotherSessionWhileDeliveryIsPending() async {
         let store = EngineFileStoreFake()
         let delivery = EngineDeliveryFake(outcome: nil)
+        let factory = EngineRecorderFactoryFake(
+            recorders: [EngineRecorderFake(), EngineRecorderFake()]
+        )
         let engine = makeEngine(
+            factory: factory,
             store: store,
             transcriber: EngineTranscriberFake(outcome: .success("secret")),
             delivery: delivery
@@ -285,9 +289,25 @@ final class TranscriptionEngineStateTests: XCTestCase {
 
         XCTAssertFalse(engine.isInteractive)
         XCTAssertEqual(store.removedURLs.count, 1)
+        engine.toggleRecording()
+        engine.toggleRecording()
+        engine.toggleRecording()
+        await spinMainActor()
+
+        XCTAssertEqual(delivery.captureCount, 1, "No second session may start")
+        XCTAssertEqual(factory.creationCount, 1, "No second recorder may start")
+        XCTAssertEqual(delivery.deliveredTexts, ["secret"], "No second delivery may start")
+
         delivery.resolve(.inserted)
         await waitUntil { engine.state == .idle }
         XCTAssertEqual(engine.statusText, "Inserted! Press Ctrl+Space to record")
+
+        engine.toggleRecording()
+        await waitUntil { engine.state == .recording }
+        XCTAssertEqual(delivery.captureCount, 2)
+        XCTAssertEqual(factory.creationCount, 2)
+        XCTAssertEqual(delivery.deliveredTexts, ["secret"])
+        engine.cancelCurrentOperation()
     }
 
     func testEveryTranscriptionTerminalOutcomeCleansRecording() async {

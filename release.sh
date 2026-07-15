@@ -3,19 +3,25 @@ set -euo pipefail
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 DEPENDENCY_MANIFEST="$SCRIPT_DIR/dependencies.env"
+SOURCE_INFO="$SCRIPT_DIR/TalkText/Info.plist"
 VERSION="$("$SCRIPT_DIR/scripts/read-version.sh")"
 RELEASE_TAG="${TALKTEXT_RELEASE_TAG:-${GITHUB_REF_NAME:-}}"
 EXPECTED_TAG="v$VERSION"
 DIST_DIR="$SCRIPT_DIR/dist"
-ZIP_NAME="TalkText-$VERSION.zip"
-ZIP_PATH="$DIST_DIR/$ZIP_NAME"
-CHECKSUM_PATH="$ZIP_PATH.sha256"
-SUBMISSION_ZIP="$DIST_DIR/.TalkText-$VERSION-notarization.zip"
-NOTARY_RESULT="$DIST_DIR/.TalkText-$VERSION-notarization.json"
 
 fail() {
     echo "error: $*" >&2
     exit 1
+}
+
+validate_path_component() {
+    local key="$1"
+    local value="$2"
+    case "$value" in
+        '' | '.' | '..' | */* | *$'\n'* | *$'\r'*)
+            fail "canonical $key is not a safe path component: $value"
+            ;;
+    esac
 }
 
 if [[ -n "${TALKTEXT_DEPENDENCY_MANIFEST:-}" && "$TALKTEXT_DEPENDENCY_MANIFEST" != "$DEPENDENCY_MANIFEST" ]]; then
@@ -26,6 +32,18 @@ export TALKTEXT_DEPENDENCY_MANIFEST="$DEPENDENCY_MANIFEST"
 for command_name in git ditto codesign spctl xcrun plutil shasum; do
     command -v "$command_name" >/dev/null 2>&1 || fail "required release command is unavailable: $command_name"
 done
+[[ -r "$SOURCE_INFO" ]] || fail "canonical Info.plist is not readable: $SOURCE_INFO"
+plutil -lint "$SOURCE_INFO" >/dev/null
+BUNDLE_NAME="$(plutil -extract CFBundleName raw -expect string -o - "$SOURCE_INFO")" || \
+    fail "canonical Info.plist must define a string CFBundleName"
+validate_path_component CFBundleName "$BUNDLE_NAME"
+
+APP_PATH="$SCRIPT_DIR/$BUNDLE_NAME.app"
+ZIP_NAME="$BUNDLE_NAME-$VERSION.zip"
+ZIP_PATH="$DIST_DIR/$ZIP_NAME"
+CHECKSUM_PATH="$ZIP_PATH.sha256"
+SUBMISSION_ZIP="$DIST_DIR/.$BUNDLE_NAME-$VERSION-notarization.zip"
+NOTARY_RESULT="$DIST_DIR/.$BUNDLE_NAME-$VERSION-notarization.json"
 
 [[ -n "${TALKTEXT_SIGNING_IDENTITY:-}" ]] || fail "TALKTEXT_SIGNING_IDENTITY is required"
 [[ -n "${APPLE_TEAM_ID:-}" ]] || fail "APPLE_TEAM_ID is required for signature verification"
@@ -74,7 +92,7 @@ TALKTEXT_EXPECTED_TEAM_ID="$APPLE_TEAM_ID" \
 
 # Submit a transport archive. The final public archive is produced only after
 # the accepted ticket has been stapled to the app.
-ditto -c -k --sequesterRsrc --keepParent "$SCRIPT_DIR/TalkText.app" "$SUBMISSION_ZIP"
+ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$SUBMISSION_ZIP"
 
 echo "==> Submitting for notarization..."
 xcrun notarytool submit "$SUBMISSION_ZIP" \
@@ -90,18 +108,18 @@ if [[ "$NOTARY_STATUS" != 'Accepted' ]]; then
 fi
 
 echo "==> Stapling accepted ticket $NOTARY_ID..."
-xcrun stapler staple -v "$SCRIPT_DIR/TalkText.app"
+xcrun stapler staple -v "$APP_PATH"
 TALKTEXT_EXPECTED_SIGNATURE=developer-id \
 TALKTEXT_EXPECTED_TEAM_ID="$APPLE_TEAM_ID" \
 TALKTEXT_REQUIRE_NOTARIZATION=1 \
-    "$SCRIPT_DIR/scripts/verify-bundle.sh" "$SCRIPT_DIR/TalkText.app"
+    "$SCRIPT_DIR/scripts/verify-bundle.sh" "$APP_PATH"
 
 echo "==> Creating final release archive..."
-ditto -c -k --sequesterRsrc --keepParent "$SCRIPT_DIR/TalkText.app" "$ZIP_PATH"
+ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$ZIP_PATH"
 
 EXTRACT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/talktext-release-verify.XXXXXX")"
 ditto -x -k "$ZIP_PATH" "$EXTRACT_DIR"
-EXTRACTED_APP="$EXTRACT_DIR/TalkText.app"
+EXTRACTED_APP="$EXTRACT_DIR/$BUNDLE_NAME.app"
 TALKTEXT_EXPECTED_SIGNATURE=developer-id \
 TALKTEXT_EXPECTED_TEAM_ID="$APPLE_TEAM_ID" \
 TALKTEXT_REQUIRE_NOTARIZATION=1 \

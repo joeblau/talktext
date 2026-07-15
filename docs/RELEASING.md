@@ -18,7 +18,11 @@ final binary.
 
 - `TalkText/Info.plist` is the only source for the bundle identifier,
   executable name, minimum system version, permission text, and other bundle
-  metadata. It intentionally contains no version keys.
+  metadata. `TalkText/Package.swift` reads `CFBundleExecutable` and
+  `LSMinimumSystemVersion` from this file when SwiftPM evaluates the manifest,
+  and the bundle and release scripts use the same metadata for product,
+  deployment-target, and artifact lookup. The plist intentionally contains no
+  version keys.
 - `VERSION` is the only version source. It must be one line containing a
   three-component numeric semantic version such as `1.2.3`.
 - Public releases use that same value for both
@@ -27,7 +31,7 @@ final binary.
   under an existing version are not published.
 - The source tag must be exactly `v<the VERSION value>`, point at `HEAD`, and
   the checkout must be clean. The archive is named
-  `TalkText-<VERSION>.zip`.
+  `<CFBundleName>-<VERSION>.zip`.
 - `TalkText/TalkText.entitlements` is the reviewed, canonical entitlement set.
   The final signing command consumes it, and bundle verification compares the
   entitlements embedded in the code signature with that file.

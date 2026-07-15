@@ -126,6 +126,12 @@ final class TranscriptionEnginePresentationTests: XCTestCase {
             TranscriptionEngine.presentation(for: writeFailure).state,
             .failed
         )
+        let snapshotFailure = DeliveryOutcome.failed(
+            .pasteboardSnapshotFailed(.representationReadFailed(type: "public.rtf"))
+        )
+        let snapshotPresentation = TranscriptionEngine.presentation(for: snapshotFailure)
+        XCTAssertEqual(snapshotPresentation.state, .failed)
+        XCTAssertTrue(snapshotPresentation.statusText.contains("delivery was stopped"))
         XCTAssertEqual(
             TranscriptionEngine.presentation(for: .cancelled(restoration: nil)).state,
             .failed

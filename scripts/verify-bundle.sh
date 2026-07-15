@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPOSITORY_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd -P)"
-APP_PATH="${1:-$REPOSITORY_ROOT/TalkText.app}"
+APP_PATH="${1:-}"
 SOURCE_INFO="$REPOSITORY_ROOT/TalkText/Info.plist"
 SOURCE_ENTITLEMENTS="$REPOSITORY_ROOT/TalkText/TalkText.entitlements"
 DEPENDENCY_MANIFEST="${TALKTEXT_DEPENDENCY_MANIFEST:-$REPOSITORY_ROOT/dependencies.env}"
@@ -19,6 +19,10 @@ plist_value() {
     /usr/libexec/PlistBuddy -c "Print :$2" "$1"
 }
 
+plist_string() {
+    plutil -extract "$2" raw -expect string -o - "$1"
+}
+
 normalize_architectures() {
     tr ' ' '\n' | sed '/^$/d' | LC_ALL=C sort | paste -sd ' ' -
 }
@@ -27,14 +31,30 @@ for command_name in codesign lipo plutil file vtool; do
     command -v "$command_name" >/dev/null 2>&1 || fail "required command is unavailable: $command_name"
 done
 [[ -x /usr/libexec/PlistBuddy ]] || fail "/usr/libexec/PlistBuddy is unavailable"
-[[ -d "$APP_PATH" ]] || fail "app bundle is missing: $APP_PATH"
 [[ -r "$SOURCE_INFO" ]] || fail "canonical Info.plist is missing"
 [[ -r "$SOURCE_ENTITLEMENTS" ]] || fail "canonical entitlements are missing"
+plutil -lint "$SOURCE_INFO" "$SOURCE_ENTITLEMENTS" >/dev/null
+
+EXPECTED_EXECUTABLE_NAME="$(plist_string "$SOURCE_INFO" CFBundleExecutable)" || \
+    fail "canonical Info.plist is missing CFBundleExecutable"
+EXPECTED_BUNDLE_NAME="$(plist_string "$SOURCE_INFO" CFBundleName)" || \
+    fail "canonical Info.plist is missing CFBundleName"
+EXPECTED_BUNDLE_IDENTIFIER="$(plist_string "$SOURCE_INFO" CFBundleIdentifier)" || \
+    fail "canonical Info.plist is missing CFBundleIdentifier"
+EXPECTED_PACKAGE_TYPE="$(plist_string "$SOURCE_INFO" CFBundlePackageType)" || \
+    fail "canonical Info.plist is missing CFBundlePackageType"
+EXPECTED_MINIMUM_SYSTEM_VERSION="$(plist_string "$SOURCE_INFO" LSMinimumSystemVersion)" || \
+    fail "canonical Info.plist is missing LSMinimumSystemVersion"
+
+if [[ -z "$APP_PATH" ]]; then
+    APP_PATH="$REPOSITORY_ROOT/$EXPECTED_BUNDLE_NAME.app"
+fi
+[[ -d "$APP_PATH" ]] || fail "app bundle is missing: $APP_PATH"
 
 VERSION="$("$SCRIPT_DIR/read-version.sh")"
 FINAL_INFO="$APP_PATH/Contents/Info.plist"
 [[ -r "$FINAL_INFO" ]] || fail "final Info.plist is missing"
-plutil -lint "$SOURCE_INFO" "$SOURCE_ENTITLEMENTS" "$FINAL_INFO" >/dev/null
+plutil -lint "$FINAL_INFO" >/dev/null
 
 for version_key in CFBundleVersion CFBundleShortVersionString; do
     if plist_value "$SOURCE_INFO" "$version_key" >/dev/null 2>&1; then
@@ -47,12 +67,7 @@ done
 CANONICAL_KEYS=(
     CFBundleDevelopmentRegion
     CFBundleDisplayName
-    CFBundleExecutable
-    CFBundleIdentifier
     CFBundleInfoDictionaryVersion
-    CFBundleName
-    CFBundlePackageType
-    LSMinimumSystemVersion
     LSUIElement
     NSHighResolutionCapable
     NSMicrophoneUsageDescription
@@ -63,12 +78,23 @@ for key in "${CANONICAL_KEYS[@]}"; do
     [[ "$source_value" == "$final_value" ]] || fail "final $key differs from canonical Info.plist"
 done
 
-EXECUTABLE_NAME="$(plist_value "$FINAL_INFO" CFBundleExecutable)"
-BUNDLE_IDENTIFIER="$(plist_value "$FINAL_INFO" CFBundleIdentifier)"
-[[ "$EXECUTABLE_NAME" == 'TalkText' ]] || fail "CFBundleExecutable must be TalkText"
-[[ "$BUNDLE_IDENTIFIER" == 'com.joeblau.talktext' ]] || fail "unexpected bundle identifier: $BUNDLE_IDENTIFIER"
-[[ "$(plist_value "$FINAL_INFO" CFBundlePackageType)" == 'APPL' ]] || fail "CFBundlePackageType must be APPL"
-[[ "$(plist_value "$FINAL_INFO" LSMinimumSystemVersion)" == '14.0' ]] || fail "minimum macOS version must be 14.0"
+EXECUTABLE_NAME="$(plist_string "$FINAL_INFO" CFBundleExecutable)" || fail "final Info.plist is missing CFBundleExecutable"
+BUNDLE_NAME="$(plist_string "$FINAL_INFO" CFBundleName)" || fail "final Info.plist is missing CFBundleName"
+BUNDLE_IDENTIFIER="$(plist_string "$FINAL_INFO" CFBundleIdentifier)" || fail "final Info.plist is missing CFBundleIdentifier"
+PACKAGE_TYPE="$(plist_string "$FINAL_INFO" CFBundlePackageType)" || fail "final Info.plist is missing CFBundlePackageType"
+MINIMUM_SYSTEM_VERSION="$(plist_string "$FINAL_INFO" LSMinimumSystemVersion)" || \
+    fail "final Info.plist is missing LSMinimumSystemVersion"
+
+[[ "$EXECUTABLE_NAME" == "$EXPECTED_EXECUTABLE_NAME" ]] || \
+    fail "final CFBundleExecutable differs from canonical Info.plist"
+[[ "$BUNDLE_NAME" == "$EXPECTED_BUNDLE_NAME" ]] || \
+    fail "final CFBundleName differs from canonical Info.plist"
+[[ "$BUNDLE_IDENTIFIER" == "$EXPECTED_BUNDLE_IDENTIFIER" ]] || \
+    fail "final CFBundleIdentifier differs from canonical Info.plist"
+[[ "$PACKAGE_TYPE" == "$EXPECTED_PACKAGE_TYPE" ]] || \
+    fail "final CFBundlePackageType differs from canonical Info.plist"
+[[ "$MINIMUM_SYSTEM_VERSION" == "$EXPECTED_MINIMUM_SYSTEM_VERSION" ]] || \
+    fail "final LSMinimumSystemVersion differs from canonical Info.plist"
 [[ "$(plist_value "$FINAL_INFO" LSUIElement)" == 'true' ]] || fail "TalkText must remain a menu-bar-only app"
 [[ -n "$(plist_value "$FINAL_INFO" NSMicrophoneUsageDescription)" ]] || fail "microphone usage text is empty"
 
@@ -83,7 +109,9 @@ EXPECTED_ARCHITECTURES_NORMALIZED="$(printf '%s\n' "${EXPECTED_ARCHITECTURES[*]}
 for architecture in "${EXPECTED_ARCHITECTURES[@]}"; do
     BUILD_VERSION="$(vtool -show-build -arch "$architecture" "$EXECUTABLE")"
     grep -Eq '^[[:space:]]*platform MACOS$' <<< "$BUILD_VERSION" || fail "$architecture slice is not a macOS executable"
-    grep -Eq '^[[:space:]]*minos 14\.0$' <<< "$BUILD_VERSION" || fail "$architecture slice does not target macOS 14.0"
+    SLICE_MINIMUM_SYSTEM_VERSION="$(awk '$1 == "minos" { print $2; exit }' <<< "$BUILD_VERSION")"
+    [[ "$SLICE_MINIMUM_SYSTEM_VERSION" == "$EXPECTED_MINIMUM_SYSTEM_VERSION" ]] || \
+        fail "$architecture slice minimum system version differs from canonical Info.plist"
 done
 
 # Source the canonical dependency name, then independently verify the model

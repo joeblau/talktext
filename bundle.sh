@@ -3,8 +3,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PACKAGE_DIR="$SCRIPT_DIR/TalkText"
-APP_NAME="TalkText"
-BUNDLE_PATH="$SCRIPT_DIR/$APP_NAME.app"
 INFO_TEMPLATE="$PACKAGE_DIR/Info.plist"
 ENTITLEMENTS="$PACKAGE_DIR/TalkText.entitlements"
 DEPENDENCY_MANIFEST="${TALKTEXT_DEPENDENCY_MANIFEST:-$SCRIPT_DIR/dependencies.env}"
@@ -16,11 +14,35 @@ fail() {
     exit 1
 }
 
+validate_path_component() {
+    local key="$1"
+    local value="$2"
+    case "$value" in
+        '' | '.' | '..' | */* | *$'\n'* | *$'\r'*)
+            fail "canonical $key is not a safe path component: $value"
+            ;;
+    esac
+}
+
 for command_name in swift lipo plutil codesign xattr; do
     command -v "$command_name" >/dev/null 2>&1 || fail "required command is unavailable: $command_name"
 done
 [[ -x /usr/libexec/PlistBuddy ]] || fail "/usr/libexec/PlistBuddy is unavailable"
+[[ -r "$INFO_TEMPLATE" ]] || fail "canonical Info.plist is not readable: $INFO_TEMPLATE"
 [[ -r "$DEPENDENCY_MANIFEST" ]] || fail "dependency manifest is not readable: $DEPENDENCY_MANIFEST"
+plutil -lint "$INFO_TEMPLATE" >/dev/null
+
+EXECUTABLE_NAME="$(plutil -extract CFBundleExecutable raw -expect string -o - "$INFO_TEMPLATE")" || \
+    fail "canonical Info.plist must define a string CFBundleExecutable"
+BUNDLE_NAME="$(plutil -extract CFBundleName raw -expect string -o - "$INFO_TEMPLATE")" || \
+    fail "canonical Info.plist must define a string CFBundleName"
+MINIMUM_SYSTEM_VERSION="$(plutil -extract LSMinimumSystemVersion raw -expect string -o - "$INFO_TEMPLATE")" || \
+    fail "canonical Info.plist must define a string LSMinimumSystemVersion"
+validate_path_component CFBundleExecutable "$EXECUTABLE_NAME"
+validate_path_component CFBundleName "$BUNDLE_NAME"
+[[ "$MINIMUM_SYSTEM_VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || \
+    fail "canonical LSMinimumSystemVersion is not a numeric version: $MINIMUM_SYSTEM_VERSION"
+BUNDLE_PATH="$SCRIPT_DIR/$BUNDLE_NAME.app"
 
 # shellcheck source=/dev/null
 source "$DEPENDENCY_MANIFEST"
@@ -47,7 +69,7 @@ esac
 build_product() {
     local architecture="$1"
     local scratch_path="$PACKAGE_DIR/.build/release-$architecture"
-    local triple="$architecture-apple-macosx14.0"
+    local triple="$architecture-apple-macosx$MINIMUM_SYSTEM_VERSION"
     local bin_path
 
     if ! swift build \
@@ -67,8 +89,8 @@ build_product() {
         --show-bin-path)"; then
         fail "could not resolve SwiftPM product path for $architecture"
     fi
-    [[ -x "$bin_path/$APP_NAME" ]] || fail "SwiftPM did not produce $bin_path/$APP_NAME"
-    printf '%s\n' "$bin_path/$APP_NAME"
+    [[ -x "$bin_path/$EXECUTABLE_NAME" ]] || fail "SwiftPM did not produce $bin_path/$EXECUTABLE_NAME"
+    printf '%s\n' "$bin_path/$EXECUTABLE_NAME"
 }
 
 echo "==> Building warnings-as-errors Universal 2 release..."
@@ -87,15 +109,15 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-WORK_BUNDLE="$WORK_DIR/$APP_NAME.app"
+WORK_BUNDLE="$WORK_DIR/$BUNDLE_NAME.app"
 CONTENTS="$WORK_BUNDLE/Contents"
 MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
 mkdir -p "$MACOS" "$RESOURCES/models"
 
 echo "==> Assembling canonical bundle metadata and resources..."
-lipo -create "$ARM64_PRODUCT" "$X86_64_PRODUCT" -output "$MACOS/$APP_NAME"
-chmod 755 "$MACOS/$APP_NAME"
+lipo -create "$ARM64_PRODUCT" "$X86_64_PRODUCT" -output "$MACOS/$EXECUTABLE_NAME"
+chmod 755 "$MACOS/$EXECUTABLE_NAME"
 cp -- "$MODEL_PATH" "$RESOURCES/models/$MODEL_FILE_NAME"
 TALKTEXT_DEPENDENCY_MANIFEST="$DEPENDENCY_MANIFEST" \
     "$SCRIPT_DIR/scripts/dependency-tool.sh" verify-model "$RESOURCES/models/$MODEL_FILE_NAME"
