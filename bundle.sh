@@ -5,7 +5,8 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PACKAGE_DIR="$SCRIPT_DIR/TalkText"
 INFO_TEMPLATE="$PACKAGE_DIR/Info.plist"
 ENTITLEMENTS="$PACKAGE_DIR/TalkText.entitlements"
-DEPENDENCY_MANIFEST="${TALKTEXT_DEPENDENCY_MANIFEST:-$SCRIPT_DIR/dependencies.env}"
+CANONICAL_DEPENDENCY_MANIFEST="$SCRIPT_DIR/dependencies.env"
+DEPENDENCY_MANIFEST="${TALKTEXT_DEPENDENCY_MANIFEST:-$CANONICAL_DEPENDENCY_MANIFEST}"
 SIGNING_MODE="${TALKTEXT_SIGNING_MODE:-adhoc}"
 ARCHITECTURES=(arm64 x86_64)
 
@@ -13,6 +14,15 @@ fail() {
     echo "error: $*" >&2
     exit 1
 }
+
+if [[ -n "${TALKTEXT_VERSION_FILE:-}" ]]; then
+    fail "bundle does not accept a VERSION file override"
+fi
+unset TALKTEXT_VERSION_FILE
+
+if [[ "$SIGNING_MODE" == 'developer-id' && "$DEPENDENCY_MANIFEST" != "$CANONICAL_DEPENDENCY_MANIFEST" ]]; then
+    fail "Developer ID bundling does not accept a dependency manifest override"
+fi
 
 validate_path_component() {
     local key="$1"

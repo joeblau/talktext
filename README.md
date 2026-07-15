@@ -18,7 +18,7 @@ From a clean checkout, run:
 ```
 
 Setup resolves or installs a supported backend, downloads the pinned
-`ggml-distil-large-v3.bin` model with retries and verification, and builds the
+`ggml-base.en.bin` model with retries and verification, and builds the
 release executable. It prints an absolute, shell-escaped command that works
 from the caller's current directory. The equivalent command from the
 repository root is:
@@ -86,13 +86,14 @@ verified download succeeds, and retained under an `.invalid.<timestamp>`
 quarantine name for diagnosis.
 
 Production setup and release reject `TALKTEXT_DEPENDENCY_MANIFEST` values that
-do not name the repository's reviewed manifest. Tests exercise alternate
-manifests by invoking `scripts/dependency-tool.sh` directly.
+do not name the repository's reviewed manifest. Developer ID bundling and
+verification enforce the same boundary before sourcing a manifest. Tests
+exercise alternate manifests only on non-production paths.
 
 Setup, bundling, and release all use the same verifier. To audit a local cache:
 
 ```sh
-./scripts/dependency-tool.sh verify-model ./models/ggml-distil-large-v3.bin
+./scripts/dependency-tool.sh verify-model ./models/ggml-base.en.bin
 ```
 
 Updating the model is an explicit dependency review:

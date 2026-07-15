@@ -4,9 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 DEPENDENCY_MANIFEST="$SCRIPT_DIR/dependencies.env"
 SOURCE_INFO="$SCRIPT_DIR/TalkText/Info.plist"
-VERSION="$("$SCRIPT_DIR/scripts/read-version.sh")"
 RELEASE_TAG="${TALKTEXT_RELEASE_TAG:-${GITHUB_REF_NAME:-}}"
-EXPECTED_TAG="v$VERSION"
 DIST_DIR="$SCRIPT_DIR/dist"
 
 fail() {
@@ -24,10 +22,18 @@ validate_path_component() {
     esac
 }
 
+if [[ -n "${TALKTEXT_VERSION_FILE:-}" ]]; then
+    fail "release does not accept a VERSION file override"
+fi
+unset TALKTEXT_VERSION_FILE
+
 if [[ -n "${TALKTEXT_DEPENDENCY_MANIFEST:-}" && "$TALKTEXT_DEPENDENCY_MANIFEST" != "$DEPENDENCY_MANIFEST" ]]; then
     fail "release does not accept a dependency manifest override"
 fi
 export TALKTEXT_DEPENDENCY_MANIFEST="$DEPENDENCY_MANIFEST"
+
+VERSION="$("$SCRIPT_DIR/scripts/read-version.sh")"
+EXPECTED_TAG="v$VERSION"
 
 for command_name in git ditto codesign spctl xcrun plutil shasum; do
     command -v "$command_name" >/dev/null 2>&1 || fail "required release command is unavailable: $command_name"

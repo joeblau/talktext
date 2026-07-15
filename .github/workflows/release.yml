@@ -32,6 +32,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Export canonical bundle metadata
+        run: ./scripts/export-canonical-metadata.sh
+
       - name: Verify pinned runner and toolchain
         run: |
           test "$(uname -m)" = "x86_64"
@@ -112,9 +115,9 @@ jobs:
         run: |
           source dependencies.env
           version="$(./scripts/read-version.sh)"
-          zip_name="TalkText-$version.zip"
+          zip_name="$TALKTEXT_BUNDLE_NAME-$version.zip"
           release_preamble="$(printf '%s\n\n%s\n\n%s' \
-            'This release is a notarized Universal 2 build for Apple Silicon and Intel Macs running macOS 14 or newer.' \
+            "This release is a notarized Universal 2 build for Apple Silicon and Intel Macs running macOS $TALKTEXT_MINIMUM_SYSTEM_VERSION or newer." \
             "Pinned model: $MODEL_REPOSITORY@$MODEL_REVISION (sha256:$MODEL_SHA256)." \
             "Supported whisper-cli versions and commits: $BACKEND_UPSTREAM_REVISIONS.")"
           gh release create "$GITHUB_REF_NAME" \
@@ -122,7 +125,7 @@ jobs:
             "dist/$zip_name.sha256" \
             --draft \
             --verify-tag \
-            --title "TalkText $version" \
+            --title "$TALKTEXT_BUNDLE_NAME $version" \
             --generate-notes \
             --notes "$release_preamble"
 
@@ -132,7 +135,7 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           version="$(./scripts/read-version.sh)"
-          zip_name="TalkText-$version.zip"
+          zip_name="$TALKTEXT_BUNDLE_NAME-$version.zip"
           download_dir="$RUNNER_TEMP/downloaded-release"
           extracted_dir="$RUNNER_TEMP/downloaded-release-extracted"
           mkdir -p "$download_dir" "$extracted_dir"
@@ -143,7 +146,7 @@ jobs:
           TALKTEXT_EXPECTED_TEAM_ID="$APPLE_TEAM_ID" \
           TALKTEXT_REQUIRE_NOTARIZATION=1 \
           TALKTEXT_X86_64_SMOKE_TEST=1 \
-            ./scripts/verify-bundle.sh "$extracted_dir/TalkText.app"
+            ./scripts/verify-bundle.sh "$extracted_dir/$TALKTEXT_BUNDLE_NAME.app"
 
       - name: Publish only after downloaded-asset verification
         env:

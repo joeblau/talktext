@@ -29,7 +29,7 @@ if ! BACKEND_PATH="$("$DEPENDENCY_TOOL" resolve-backend)"; then
 fi
 "$DEPENDENCY_TOOL" probe-backend "$BACKEND_PATH" | sed 's/^/    /'
 
-echo "==> Installing the pinned distil-large-v3 model..."
+echo "==> Installing the pinned base.en model..."
 MODEL_PATH="$REPOSITORY_ROOT/models/$MODEL_FILE_NAME"
 "$DEPENDENCY_TOOL" install-model "$MODEL_PATH"
 

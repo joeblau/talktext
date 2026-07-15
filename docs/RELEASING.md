@@ -20,11 +20,13 @@ final binary.
   executable name, minimum system version, permission text, and other bundle
   metadata. `TalkText/Package.swift` reads `CFBundleExecutable` and
   `LSMinimumSystemVersion` from this file when SwiftPM evaluates the manifest,
-  and the bundle and release scripts use the same metadata for product,
-  deployment-target, and artifact lookup. The plist intentionally contains no
-  version keys.
+  and the bundle scripts and GitHub workflows export the same metadata for
+  product, deployment-target, and artifact lookup. The plist intentionally
+  contains no version keys.
 - `VERSION` is the only version source. It must be one line containing a
-  three-component numeric semantic version such as `1.2.3`.
+  three-component numeric semantic version such as `1.2.3`. Bundle,
+  verification, and release entry points reject `TALKTEXT_VERSION_FILE` so an
+  external fixture cannot select production metadata or archive names.
 - Public releases use that same value for both
   `CFBundleShortVersionString` and `CFBundleVersion`. This is the explicit build
   number policy: a new public build requires a version bump; mutable rebuilds

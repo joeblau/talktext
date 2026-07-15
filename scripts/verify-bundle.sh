@@ -6,7 +6,8 @@ REPOSITORY_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd -P)"
 APP_PATH="${1:-}"
 SOURCE_INFO="$REPOSITORY_ROOT/TalkText/Info.plist"
 SOURCE_ENTITLEMENTS="$REPOSITORY_ROOT/TalkText/TalkText.entitlements"
-DEPENDENCY_MANIFEST="${TALKTEXT_DEPENDENCY_MANIFEST:-$REPOSITORY_ROOT/dependencies.env}"
+CANONICAL_DEPENDENCY_MANIFEST="$REPOSITORY_ROOT/dependencies.env"
+DEPENDENCY_MANIFEST="${TALKTEXT_DEPENDENCY_MANIFEST:-$CANONICAL_DEPENDENCY_MANIFEST}"
 EXPECTED_SIGNATURE="${TALKTEXT_EXPECTED_SIGNATURE:-adhoc}"
 EXPECTED_ARCHITECTURES=(arm64 x86_64)
 
@@ -14,6 +15,15 @@ fail() {
     echo "error: $*" >&2
     exit 1
 }
+
+if [[ -n "${TALKTEXT_VERSION_FILE:-}" ]]; then
+    fail "bundle verification does not accept a VERSION file override"
+fi
+unset TALKTEXT_VERSION_FILE
+
+if [[ "$EXPECTED_SIGNATURE" == 'developer-id' && "$DEPENDENCY_MANIFEST" != "$CANONICAL_DEPENDENCY_MANIFEST" ]]; then
+    fail "Developer ID verification does not accept a dependency manifest override"
+fi
 
 plist_value() {
     /usr/libexec/PlistBuddy -c "Print :$2" "$1"

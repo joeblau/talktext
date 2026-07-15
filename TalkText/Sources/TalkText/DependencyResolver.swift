@@ -7,8 +7,8 @@ import Foundation
 enum WhisperBackendContract {
     static let executableName = "whisper-cli"
     static let formulaName = "whisper-cpp"
-    static let modelFileName = "ggml-distil-large-v3.bin"
-    static let modelSizeBytes: UInt64 = 1_519_521_155
+    static let modelFileName = "ggml-base.en.bin"
+    static let modelSizeBytes: UInt64 = 147_964_211
     static let modelMagic = Data([0x6c, 0x6d, 0x67, 0x67])
     static let supportedVersions = ["1.8.4", "1.9.1"]
     static let requiredOptions = ["--model", "--file", "--no-timestamps", "--threads"]
@@ -80,7 +80,7 @@ enum TalkTextDependencyPreflightFailure: Error, Equatable, Sendable {
         case .missingBinary:
             "whisper-cli was not found. Run ./setup.sh or set TALKTEXT_WHISPER_CLI to a supported executable."
         case .missingModel:
-            "The verified distil-large-v3 model was not found. Run ./setup.sh or set TALKTEXT_MODEL_PATH."
+            "The verified base.en model was not found. Run ./setup.sh or set TALKTEXT_MODEL_PATH."
         case let .invalidModel(path, reason):
             "The Whisper model at \(path) is invalid (\(reason)). Run ./setup.sh to verify or replace it."
         case let .backendProbeFailed(path):

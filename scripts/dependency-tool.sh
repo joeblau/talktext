@@ -99,6 +99,7 @@ install_model() {
     local destination="${1:-$REPOSITORY_ROOT/models/$MODEL_FILE_NAME}"
     local destination_dir temp_path quarantine_path timestamp
     local had_invalid_cache=0
+    local quarantine_created=0
 
     destination_dir="$(dirname -- "$destination")"
     mkdir -p "$destination_dir"
@@ -137,15 +138,30 @@ install_model() {
         timestamp="$(date -u '+%Y%m%dT%H%M%SZ')"
         quarantine_path="${destination}.invalid.${timestamp}.$$"
         # Preserve the rejected inode under a diagnostic name without moving
-        # the live path away. The verified temporary file can then replace the
-        # destination with one same-filesystem rename and no missing-path gap.
-        ln -- "$destination" "$quarantine_path"
-        echo "    Quarantined invalid model as: $quarantine_path" >&2
+        # the live path away. Fall back to a copy on filesystems that cannot
+        # create hard links, and never let a diagnostic copy block repair.
+        if "${LN_BIN:-ln}" -- "$destination" "$quarantine_path"; then
+            quarantine_created=1
+            echo "    Hard-linked invalid model as: $quarantine_path" >&2
+        elif "${CP_BIN:-cp}" -p -- "$destination" "$quarantine_path"; then
+            quarantine_created=1
+            echo "    Hard-link quarantine unavailable; copied invalid model as: $quarantine_path" >&2
+        else
+            rm -f -- "$quarantine_path"
+            quarantine_path=''
+            echo "    Warning: could not preserve a quarantine copy; continuing with verified replacement." >&2
+        fi
     fi
 
     # The temporary file is created in the destination directory, so rename is
     # an atomic replacement on the same filesystem.
-    mv -f -- "$temp_path" "$destination"
+    if ! mv -f -- "$temp_path" "$destination"; then
+        if (( quarantine_created )); then
+            rm -f -- "$quarantine_path" || \
+                echo "    Warning: could not remove quarantine after failed replacement: $quarantine_path" >&2
+        fi
+        fail "atomic model replacement failed; existing model was left unchanged"
+    fi
     trap - EXIT HUP INT TERM
     echo "    Installed verified model: $destination"
 }

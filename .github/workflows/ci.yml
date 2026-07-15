@@ -29,6 +29,9 @@ jobs:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
+      - name: Export canonical bundle metadata
+        run: ./scripts/export-canonical-metadata.sh
+
       - name: Verify pinned runner and toolchain
         run: |
           test "$(uname -m)" = "x86_64"
@@ -72,7 +75,7 @@ jobs:
               swift build \
                 --package-path TalkText \
                 --configuration "$configuration" \
-                --triple "$architecture-apple-macosx14.0" \
+                --triple "$architecture-apple-macosx$TALKTEXT_MINIMUM_SYSTEM_VERSION" \
                 --scratch-path "TalkText/.build/$configuration-$architecture" \
                 -Xswiftc -warnings-as-errors
             done
@@ -83,7 +86,7 @@ jobs:
           swift test \
             --package-path TalkText \
             --configuration debug \
-            --triple x86_64-apple-macosx14.0 \
+            --triple "x86_64-apple-macosx$TALKTEXT_MINIMUM_SYSTEM_VERSION" \
             --scratch-path TalkText/.build/tests-x86_64 \
             -Xswiftc -warnings-as-errors
           bash tests/dependency-tool-fixtures.sh
@@ -106,15 +109,15 @@ jobs:
           TALKTEXT_SIGNING_MODE=adhoc \
             ./bundle.sh
 
-          archive="$RUNNER_TEMP/TalkText-ci.zip"
+          archive="$RUNNER_TEMP/$TALKTEXT_BUNDLE_NAME-ci.zip"
           extracted="$RUNNER_TEMP/extracted"
-          ditto -c -k --sequesterRsrc --keepParent TalkText.app "$archive"
+          ditto -c -k --sequesterRsrc --keepParent "$TALKTEXT_BUNDLE_NAME.app" "$archive"
           mkdir -p "$extracted"
           ditto -x -k "$archive" "$extracted"
           TALKTEXT_DEPENDENCY_MANIFEST="$fixture_dir/dependencies.env" \
           TALKTEXT_EXPECTED_SIGNATURE=adhoc \
           TALKTEXT_X86_64_SMOKE_TEST=1 \
-            ./scripts/verify-bundle.sh "$extracted/TalkText.app"
+            ./scripts/verify-bundle.sh "$extracted/$TALKTEXT_BUNDLE_NAME.app"
 
   backend-contract:
     name: Backend contract (${{ matrix.architecture }})
@@ -139,6 +142,9 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Export canonical bundle metadata
+        run: ./scripts/export-canonical-metadata.sh
 
       - name: Verify pinned native runner and build tools
         run: |
@@ -232,7 +238,7 @@ jobs:
               -B "$build_dir" \
               -DCMAKE_BUILD_TYPE=Release \
               -DCMAKE_OSX_ARCHITECTURES="${{ matrix.architecture }}" \
-              -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET="$TALKTEXT_MINIMUM_SYSTEM_VERSION" \
               -DBUILD_SHARED_LIBS=OFF \
               -DWHISPER_BUILD_TESTS=OFF \
               -DWHISPER_BUILD_EXAMPLES=ON

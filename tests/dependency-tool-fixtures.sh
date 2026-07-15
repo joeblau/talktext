@@ -80,6 +80,8 @@ run_install() {
     MOCK_EXPECTED_CONNECT_TIMEOUT=15 \
     MOCK_EXPECTED_RETRIES=3 \
     MOCK_EXPECTED_URL="$FIXTURE_MODEL_URL" \
+    LN_BIN="${INSTALL_LN_BIN:-}" \
+    CP_BIN="${INSTALL_CP_BIN:-}" \
         "$TOOL" install-model "$destination"
 }
 
@@ -148,6 +150,182 @@ expect_failure 'release manifest override' \
 grep -q 'does not accept a dependency manifest override' "$TEMP_ROOT/last.stderr" || \
     fail 'release did not reject the test dependency manifest explicitly'
 pass 'production release rejects a test dependency manifest override'
+
+BUNDLE_MANIFEST_SOURCE_MARKER="$TEMP_ROOT/bundle-manifest-was-sourced"
+BUNDLE_POISON_MANIFEST="$TEMP_ROOT/bundle-poison-dependencies.env"
+cp "$FIXTURE_MANIFEST" "$BUNDLE_POISON_MANIFEST"
+cat >> "$BUNDLE_POISON_MANIFEST" <<'EOF'
+: > "${BUNDLE_MANIFEST_SOURCE_MARKER:?}"
+EOF
+expect_failure 'Developer ID bundle manifest override' \
+    env \
+        BUNDLE_MANIFEST_SOURCE_MARKER="$BUNDLE_MANIFEST_SOURCE_MARKER" \
+        TALKTEXT_DEPENDENCY_MANIFEST="$BUNDLE_POISON_MANIFEST" \
+        TALKTEXT_SIGNING_MODE=developer-id \
+        "$REPOSITORY_ROOT/bundle.sh"
+grep -q 'Developer ID bundling does not accept a dependency manifest override' "$TEMP_ROOT/last.stderr" || \
+    fail 'Developer ID bundling did not reject the test dependency manifest explicitly'
+assert_absent "$BUNDLE_MANIFEST_SOURCE_MARKER"
+pass 'Developer ID bundling rejects a noncanonical manifest before sourcing it'
+
+EXTERNAL_VERSION="$TEMP_ROOT/external-VERSION"
+printf '9.9.9\n' > "$EXTERNAL_VERSION"
+
+expect_failure 'release version override' \
+    env TALKTEXT_VERSION_FILE="$EXTERNAL_VERSION" "$REPOSITORY_ROOT/release.sh"
+grep -q 'release does not accept a VERSION file override' "$TEMP_ROOT/last.stderr" || \
+    fail 'release did not reject the external VERSION explicitly'
+pass 'production release rejects an external VERSION file'
+
+expect_failure 'bundle version override' \
+    env \
+        TALKTEXT_SIGNING_MODE=developer-id \
+        TALKTEXT_VERSION_FILE="$EXTERNAL_VERSION" \
+        "$REPOSITORY_ROOT/bundle.sh"
+grep -q 'bundle does not accept a VERSION file override' "$TEMP_ROOT/last.stderr" || \
+    fail 'bundle did not reject the external VERSION explicitly'
+pass 'bundle assembly rejects an external VERSION file'
+
+expect_failure 'bundle verification version override' \
+    env TALKTEXT_VERSION_FILE="$EXTERNAL_VERSION" "$REPOSITORY_ROOT/scripts/verify-bundle.sh"
+grep -q 'bundle verification does not accept a VERSION file override' "$TEMP_ROOT/last.stderr" || \
+    fail 'bundle verification did not reject the external VERSION explicitly'
+pass 'bundle verification rejects an external VERSION file'
+
+METADATA_EXPORT_REPOSITORY="$TEMP_ROOT/metadata-export-repository"
+METADATA_EXPORT_ENV="$TEMP_ROOT/metadata-export.env"
+mkdir -p "$METADATA_EXPORT_REPOSITORY/scripts" "$METADATA_EXPORT_REPOSITORY/TalkText"
+cp "$REPOSITORY_ROOT/scripts/export-canonical-metadata.sh" "$METADATA_EXPORT_REPOSITORY/scripts/"
+cp "$REPOSITORY_ROOT/TalkText/Info.plist" "$METADATA_EXPORT_REPOSITORY/TalkText/"
+plutil -replace CFBundleName -string EchoFixture "$METADATA_EXPORT_REPOSITORY/TalkText/Info.plist"
+plutil -replace CFBundleExecutable -string EchoFixtureExecutable "$METADATA_EXPORT_REPOSITORY/TalkText/Info.plist"
+plutil -replace LSMinimumSystemVersion -string 13.3 "$METADATA_EXPORT_REPOSITORY/TalkText/Info.plist"
+GITHUB_ENV="$METADATA_EXPORT_ENV" "$METADATA_EXPORT_REPOSITORY/scripts/export-canonical-metadata.sh"
+grep -Fxq 'TALKTEXT_BUNDLE_NAME=EchoFixture' "$METADATA_EXPORT_ENV" || \
+    fail 'metadata exporter retained the production bundle-name literal'
+grep -Fxq 'TALKTEXT_EXECUTABLE_NAME=EchoFixtureExecutable' "$METADATA_EXPORT_ENV" || \
+    fail 'metadata exporter retained the production executable-name literal'
+grep -Fxq 'TALKTEXT_MINIMUM_SYSTEM_VERSION=13.3' "$METADATA_EXPORT_ENV" || \
+    fail 'metadata exporter retained the production deployment-target literal'
+pass 'workflow metadata export follows differential canonical plist values'
+
+for workflow in "$REPOSITORY_ROOT/.github/workflows/ci.yml" "$REPOSITORY_ROOT/.github/workflows/release.yml"; do
+    grep -Fq 'run: ./scripts/export-canonical-metadata.sh' "$workflow" || \
+        fail "workflow does not export canonical metadata: $workflow"
+done
+if grep -Eq 'apple-macosx14\.0|CMAKE_OSX_DEPLOYMENT_TARGET=14\.0|TalkText-ci\.zip|zip_name="TalkText-|/TalkText\.app' \
+    "$REPOSITORY_ROOT/.github/workflows/ci.yml" "$REPOSITORY_ROOT/.github/workflows/release.yml"; then
+    fail 'workflow retains a hard-coded app artifact or deployment target'
+fi
+grep -Fq 'apple-macosx$TALKTEXT_MINIMUM_SYSTEM_VERSION' "$REPOSITORY_ROOT/.github/workflows/ci.yml" || \
+    fail 'CI Swift triples do not use canonical minimum-system metadata'
+grep -Fq 'CMAKE_OSX_DEPLOYMENT_TARGET="$TALKTEXT_MINIMUM_SYSTEM_VERSION"' \
+    "$REPOSITORY_ROOT/.github/workflows/ci.yml" || \
+    fail 'CI backend builds do not use canonical minimum-system metadata'
+grep -Fq 'zip_name="$TALKTEXT_BUNDLE_NAME-$version.zip"' "$REPOSITORY_ROOT/.github/workflows/release.yml" || \
+    fail 'release assets do not use canonical bundle-name metadata'
+pass 'CI and release workflows consume canonical artifact and deployment metadata'
+
+METADATA_BUNDLE_REPOSITORY="$TEMP_ROOT/metadata-bundle-repository"
+METADATA_FAKE_BIN="$TEMP_ROOT/metadata-fake-bin"
+METADATA_PRODUCT_BIN="$TEMP_ROOT/metadata-products"
+METADATA_SWIFT_LOG="$TEMP_ROOT/metadata-swift.log"
+METADATA_VERIFY_LOG="$TEMP_ROOT/metadata-verify.log"
+mkdir -p \
+    "$METADATA_BUNDLE_REPOSITORY/TalkText" \
+    "$METADATA_BUNDLE_REPOSITORY/scripts" \
+    "$METADATA_FAKE_BIN" \
+    "$METADATA_PRODUCT_BIN"
+cp "$REPOSITORY_ROOT/bundle.sh" "$METADATA_BUNDLE_REPOSITORY/"
+cp "$REPOSITORY_ROOT/VERSION" "$METADATA_BUNDLE_REPOSITORY/"
+cp "$REPOSITORY_ROOT/TalkText/Info.plist" "$METADATA_BUNDLE_REPOSITORY/TalkText/"
+cp "$REPOSITORY_ROOT/TalkText/TalkText.entitlements" "$METADATA_BUNDLE_REPOSITORY/TalkText/"
+cp "$REPOSITORY_ROOT/scripts/read-version.sh" "$METADATA_BUNDLE_REPOSITORY/scripts/"
+plutil -replace CFBundleName -string EchoFixture "$METADATA_BUNDLE_REPOSITORY/TalkText/Info.plist"
+plutil -replace CFBundleExecutable -string EchoFixtureExecutable "$METADATA_BUNDLE_REPOSITORY/TalkText/Info.plist"
+plutil -replace LSMinimumSystemVersion -string 13.3 "$METADATA_BUNDLE_REPOSITORY/TalkText/Info.plist"
+
+cat > "$METADATA_BUNDLE_REPOSITORY/scripts/dependency-tool.sh" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+[[ "${1:-}" == 'verify-model' ]]
+EOF
+cat > "$METADATA_BUNDLE_REPOSITORY/scripts/verify-bundle.sh" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+[[ -d "${1:-}" ]]
+printf '%s\n' "$1" >> "${METADATA_VERIFY_LOG:?}"
+EOF
+cat > "$METADATA_FAKE_BIN/swift" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${METADATA_SWIFT_LOG:?}"
+if [[ " $* " == *' --show-bin-path '* ]]; then
+    printf '%s\n' "${METADATA_PRODUCT_BIN:?}"
+fi
+EOF
+cat > "$METADATA_FAKE_BIN/lipo" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+output=''
+while (( $# )); do
+    if [[ "$1" == '-output' ]]; then
+        output="$2"
+        shift 2
+    else
+        shift
+    fi
+done
+[[ -n "$output" ]]
+: > "$output"
+EOF
+cat > "$METADATA_FAKE_BIN/codesign" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+exit 0
+EOF
+cp "$METADATA_FAKE_BIN/codesign" "$METADATA_FAKE_BIN/xattr"
+printf '#!/bin/bash\nexit 0\n' > "$METADATA_PRODUCT_BIN/EchoFixtureExecutable"
+chmod 755 \
+    "$METADATA_BUNDLE_REPOSITORY/bundle.sh" \
+    "$METADATA_BUNDLE_REPOSITORY/scripts/dependency-tool.sh" \
+    "$METADATA_BUNDLE_REPOSITORY/scripts/read-version.sh" \
+    "$METADATA_BUNDLE_REPOSITORY/scripts/verify-bundle.sh" \
+    "$METADATA_FAKE_BIN/swift" \
+    "$METADATA_FAKE_BIN/lipo" \
+    "$METADATA_FAKE_BIN/codesign" \
+    "$METADATA_FAKE_BIN/xattr" \
+    "$METADATA_PRODUCT_BIN/EchoFixtureExecutable"
+
+if ! PATH="$METADATA_FAKE_BIN:$PATH" \
+    METADATA_PRODUCT_BIN="$METADATA_PRODUCT_BIN" \
+    METADATA_SWIFT_LOG="$METADATA_SWIFT_LOG" \
+    METADATA_VERIFY_LOG="$METADATA_VERIFY_LOG" \
+    TALKTEXT_DEPENDENCY_MANIFEST="$FIXTURE_MANIFEST" \
+    TALKTEXT_MODEL_PATH="$VALID_FIXTURE" \
+    TALKTEXT_SIGNING_MODE=adhoc \
+        "$METADATA_BUNDLE_REPOSITORY/bundle.sh" \
+        > "$TEMP_ROOT/metadata-bundle.stdout" \
+        2> "$TEMP_ROOT/metadata-bundle.stderr"; then
+    sed -n '1,120p' "$TEMP_ROOT/metadata-bundle.stderr" >&2
+    fail 'differential canonical-metadata bundle failed'
+fi
+
+METADATA_APP="$METADATA_BUNDLE_REPOSITORY/EchoFixture.app"
+[[ -d "$METADATA_APP" ]] || fail 'bundle did not use the differential CFBundleName'
+assert_absent "$METADATA_BUNDLE_REPOSITORY/TalkText.app"
+[[ -x "$METADATA_APP/Contents/MacOS/EchoFixtureExecutable" ]] || \
+    fail 'bundle did not use the differential CFBundleExecutable'
+grep -Fq -- '--triple arm64-apple-macosx13.3' "$METADATA_SWIFT_LOG" || \
+    fail 'arm64 bundle build did not use the differential deployment target'
+grep -Fq -- '--triple x86_64-apple-macosx13.3' "$METADATA_SWIFT_LOG" || \
+    fail 'x86_64 bundle build did not use the differential deployment target'
+if grep -Fq 'apple-macosx14.0' "$METADATA_SWIFT_LOG"; then
+    fail 'bundle retained the production deployment-target literal'
+fi
+grep -Fq '/EchoFixture.app' "$METADATA_VERIFY_LOG" || \
+    fail 'bundle verification did not receive the differential app path'
+pass 'bundle assembly follows differential canonical name, executable, and deployment target'
 
 DEVELOPMENT_ROOT="$RESOLVER_HOME/configured"
 INFERRED_BACKEND="$RESOLVER_REPOSITORY/.dependencies/bin/$FIXTURE_BACKEND"
@@ -329,11 +507,51 @@ cmp "$TEMP_ROOT/rename-failure/original.bin" "$TEMP_ROOT/rename-failure/model.bi
 assert_absent "$RENAME_FAILURE_MISSING"
 assert_no_download_temps "$TEMP_ROOT/rename-failure"
 QUARANTINE_COUNT="$(find "$TEMP_ROOT/rename-failure" -name 'model.bin.invalid.*' | wc -l | tr -d '[:space:]')"
-[[ "$QUARANTINE_COUNT" == 1 ]] || fail 'failed rename did not preserve exactly one quarantine'
-QUARANTINE_PATH="$(find "$TEMP_ROOT/rename-failure" -name 'model.bin.invalid.*' -print -quit)"
-cmp "$TEMP_ROOT/rename-failure/original.bin" "$QUARANTINE_PATH" >/dev/null || \
-    fail 'failed rename quarantine did not preserve the previous destination'
-pass 'failed atomic rename leaves the existing destination live and unchanged'
+[[ "$QUARANTINE_COUNT" == 0 ]] || fail 'failed rename left a redundant quarantine behind'
+grep -q 'atomic model replacement failed; existing model was left unchanged' "$TEMP_ROOT/last.stderr" || \
+    fail 'failed rename did not report the preserved live destination'
+
+ATOMIC_DESTINATION="$TEMP_ROOT/rename-failure/model.bin" \
+ATOMIC_MISSING_MARKER="$RENAME_FAILURE_MISSING" \
+ATOMIC_MV_FAIL_REPLACEMENT=1 \
+ATOMIC_MV_LOG="$RENAME_FAILURE_LOG" \
+PATH="$MV_WRAPPER_DIRECTORY:$PATH" \
+REAL_MV="$REAL_MV" \
+    expect_failure 'atomic rename retry failure' \
+    run_install valid "$TEMP_ROOT/rename-failure/model.bin"
+cmp "$TEMP_ROOT/rename-failure/original.bin" "$TEMP_ROOT/rename-failure/model.bin" >/dev/null || \
+    fail 'failed retry changed the existing destination'
+assert_absent "$RENAME_FAILURE_MISSING"
+assert_no_download_temps "$TEMP_ROOT/rename-failure"
+QUARANTINE_COUNT="$(find "$TEMP_ROOT/rename-failure" -name 'model.bin.invalid.*' | wc -l | tr -d '[:space:]')"
+[[ "$QUARANTINE_COUNT" == 0 ]] || fail 'failed retry accumulated another quarantine'
+pass 'failed atomic replacement cleans its quarantine and remains retry-idempotent'
+
+NO_HARD_LINK="$TEMP_ROOT/no-hard-link"
+cat > "$NO_HARD_LINK" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+exit 95
+EOF
+chmod 755 "$NO_HARD_LINK"
+mkdir -p "$TEMP_ROOT/copy-quarantine"
+printf 'invalid cache on a no-hard-link filesystem\n' > "$TEMP_ROOT/copy-quarantine/model.bin"
+cp "$TEMP_ROOT/copy-quarantine/model.bin" "$TEMP_ROOT/copy-quarantine/original.bin"
+INSTALL_LN_BIN="$NO_HARD_LINK" \
+    run_install valid "$TEMP_ROOT/copy-quarantine/model.bin" \
+    > "$TEMP_ROOT/copy-quarantine/stdout" \
+    2> "$TEMP_ROOT/copy-quarantine/stderr"
+cmp "$VALID_FIXTURE" "$TEMP_ROOT/copy-quarantine/model.bin" >/dev/null || \
+    fail 'hard-link failure blocked verified model repair'
+QUARANTINE_COUNT="$(find "$TEMP_ROOT/copy-quarantine" -name 'model.bin.invalid.*' | wc -l | tr -d '[:space:]')"
+[[ "$QUARANTINE_COUNT" == 1 ]] || fail 'copy fallback did not preserve exactly one quarantine'
+QUARANTINE_PATH="$(find "$TEMP_ROOT/copy-quarantine" -name 'model.bin.invalid.*' -print -quit)"
+cmp "$TEMP_ROOT/copy-quarantine/original.bin" "$QUARANTINE_PATH" >/dev/null || \
+    fail 'copy fallback quarantine did not preserve the invalid cache'
+grep -q 'Hard-link quarantine unavailable; copied invalid model as:' "$TEMP_ROOT/copy-quarantine/stderr" || \
+    fail 'hard-link fallback was not reported clearly'
+assert_no_download_temps "$TEMP_ROOT/copy-quarantine"
+pass 'no-hard-link filesystems fall back to a copied quarantine without blocking repair'
 
 mkdir -p "$TEMP_ROOT/atomic"
 printf 'not-a-model\n' > "$TEMP_ROOT/atomic/model.bin"
