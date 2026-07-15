@@ -85,10 +85,11 @@ release.
 
 ## Required branch check
 
-Repository administrators must protect `main` and require the exact status
-check context `CI / Required`. Pull requests and pushes to `main` run that
-check. Tag releases call the same reusable workflow first, and publishing
-cannot start unless it succeeds.
+Repository administrators must protect `main` and require the `Required`
+check run from GitHub Actions. The REST branch-protection context is exactly
+`Required`; some GitHub UI surfaces qualify it as `CI / Required`. Pull
+requests and pushes to `main` run that check. Tag releases call the same
+reusable workflow first, and publishing cannot start unless it succeeds.
 
 The check pins macOS to `macos-15-intel` and `macos-15`, Xcode to 16.4, CMake
 to the runner's exact `4.1.2-gc33710e` build (package version 4.1.2), third-party lint tool versions and
