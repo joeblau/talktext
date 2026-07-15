@@ -32,7 +32,7 @@ validate_path_component() {
 verify_release_source_state() {
     local expected_commit="$1"
     local expected_tag="$2"
-    local actual_commit current_hash relative_path tagged_hash tagged_commit
+    local actual_commit current_hash relative_path source_status tagged_hash tagged_commit
 
     [[ "$expected_commit" =~ ^[0-9a-f]{40}$ ]] || fail "immutable release commit must be a full Git object ID"
     git -C "$SCRIPT_DIR" cat-file -e "$expected_commit^{commit}" 2>/dev/null || \
@@ -60,7 +60,16 @@ verify_release_source_state() {
             fail "canonical release file changed after verification began: $relative_path"
     done
 
-    [[ -z "$(git -C "$SCRIPT_DIR" status --porcelain --untracked-files=normal)" ]] || \
+    # The canonical app path is generated release output, so exclude exactly
+    # that untracked path without hiding any tracked source or other worktree
+    # change. This remains correct when CFBundleName changes.
+    [[ -z "$(git -C "$SCRIPT_DIR" ls-files -- ":(literal)$BUNDLE_NAME.app")" ]] || \
+        fail "canonical generated app path overlaps tracked release source: $BUNDLE_NAME.app"
+    source_status="$(
+        git -C "$SCRIPT_DIR" status --porcelain --untracked-files=normal -- \
+            . ":(exclude,literal)$BUNDLE_NAME.app"
+    )"
+    [[ -z "$source_status" ]] || \
         fail "release checkout changed after verification began"
 }
 

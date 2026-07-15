@@ -337,7 +337,7 @@ struct TalkTextDependencyResolver: WhisperDependencyResolving {
 
     private func resolveBackendPath() -> Result<ResolvedDependencyPath, TalkTextDependencyPreflightFailure> {
         if let override = nonemptyEnvironmentValue("TALKTEXT_WHISPER_CLI") {
-            let url = configuredURL(for: override)
+            let url = canonical(configuredURL(for: override))
             guard isReadableRegularFile(url), FileManager.default.isExecutableFile(atPath: url.path) else {
                 return .failure(.invalidOverride(
                     variable: "TALKTEXT_WHISPER_CLI",
@@ -345,7 +345,7 @@ struct TalkTextDependencyResolver: WhisperDependencyResolving {
                     requirement: "a readable executable file"
                 ))
             }
-            return .success(ResolvedDependencyPath(url: canonical(url), source: .override))
+            return .success(ResolvedDependencyPath(url: url, source: .override))
         }
 
         var candidates: [(URL, DependencySearchSource)] = []
@@ -372,18 +372,18 @@ struct TalkTextDependencyResolver: WhisperDependencyResolving {
             .userData
         ))
 
-        let uniqueCandidates = deduplicated(candidates)
+        let uniqueCandidates = deduplicated(candidates.map { (canonical($0.0), $0.1) })
         if let match = uniqueCandidates.first(where: {
             isReadableRegularFile($0.0) && FileManager.default.isExecutableFile(atPath: $0.0.path)
         }) {
-            return .success(ResolvedDependencyPath(url: canonical(match.0), source: match.1))
+            return .success(ResolvedDependencyPath(url: match.0, source: match.1))
         }
         return .failure(.missingBinary(searchedPaths: uniqueCandidates.map(\.0.path)))
     }
 
     private func resolveModelPath() -> Result<ResolvedDependencyPath, TalkTextDependencyPreflightFailure> {
         if let override = nonemptyEnvironmentValue("TALKTEXT_MODEL_PATH") {
-            let url = configuredURL(for: override)
+            let url = canonical(configuredURL(for: override))
             guard isReadableRegularFile(url) else {
                 return .failure(.invalidOverride(
                     variable: "TALKTEXT_MODEL_PATH",
@@ -391,7 +391,7 @@ struct TalkTextDependencyResolver: WhisperDependencyResolving {
                     requirement: "a readable regular file"
                 ))
             }
-            return .success(ResolvedDependencyPath(url: canonical(url), source: .override))
+            return .success(ResolvedDependencyPath(url: url, source: .override))
         }
 
         var candidates: [(URL, DependencySearchSource)] = []
@@ -418,9 +418,9 @@ struct TalkTextDependencyResolver: WhisperDependencyResolving {
             candidates.append((prefix.appendingPathComponent("share/whisper/models/\(configuration.modelFileName)"), .homebrew))
         }
 
-        let uniqueCandidates = deduplicated(candidates)
+        let uniqueCandidates = deduplicated(candidates.map { (canonical($0.0), $0.1) })
         if let match = uniqueCandidates.first(where: { isReadableRegularFile($0.0) }) {
-            return .success(ResolvedDependencyPath(url: canonical(match.0), source: match.1))
+            return .success(ResolvedDependencyPath(url: match.0, source: match.1))
         }
         return .failure(.missingModel(searchedPaths: uniqueCandidates.map(\.0.path)))
     }
@@ -486,8 +486,13 @@ struct TalkTextDependencyResolver: WhisperDependencyResolving {
         }
 
         let sidecarURL = URL(fileURLWithPath: executableURL.path + ".version")
-        if FileManager.default.fileExists(atPath: sidecarURL.path) {
-            guard let sidecar = try? String(contentsOf: sidecarURL, encoding: .utf8) else {
+        // A sidecar filesystem entry is authoritative, including a dangling
+        // symlink. Unreadable or invalid metadata fails closed instead of
+        // falling through to a lower-priority version source.
+        if filesystemEntryExists(at: sidecarURL) {
+            let resolvedSidecarURL = canonical(sidecarURL)
+            guard isReadableRegularFile(resolvedSidecarURL),
+                  let sidecar = try? String(contentsOf: resolvedSidecarURL, encoding: .utf8) else {
                 return nil
             }
             return normalizedVersion(sidecar)
@@ -605,6 +610,11 @@ struct TalkTextDependencyResolver: WhisperDependencyResolving {
             return false
         }
         return type == .typeRegular
+    }
+
+    private func filesystemEntryExists(at url: URL) -> Bool {
+        var status = stat()
+        return lstat(url.path, &status) == 0
     }
 
     private func canonical(_ url: URL) -> URL {

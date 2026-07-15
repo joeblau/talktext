@@ -41,6 +41,29 @@ final class DependencyResolverParityTests: XCTestCase {
                 swift.version,
                 "\(scenario.rawValue) normalized different backend versions"
             )
+
+            if let expected = fixture.expectedObservation {
+                XCTAssertEqual(
+                    shell.path,
+                    expected.path,
+                    "\(scenario.rawValue) shell selected an unexpected backend path"
+                )
+                XCTAssertEqual(
+                    shell.version,
+                    expected.version,
+                    "\(scenario.rawValue) shell normalized an unexpected backend version"
+                )
+                XCTAssertEqual(
+                    swift.path,
+                    expected.path,
+                    "\(scenario.rawValue) Swift selected an unexpected backend path"
+                )
+                XCTAssertEqual(
+                    swift.version,
+                    expected.version,
+                    "\(scenario.rawValue) Swift normalized an unexpected backend version"
+                )
+            }
         }
     }
 
@@ -90,6 +113,7 @@ final class DependencyResolverParityTests: XCTestCase {
             "TALKTEXT_WHISPER_CLI_VERSION": "",
         ]
         var bundleResourceURL: URL?
+        var expectedObservation: ResolverParityObservation?
 
         switch scenario {
         case .overrideDotDot:
@@ -133,6 +157,38 @@ final class DependencyResolverParityTests: XCTestCase {
             )
             try writeSidecar("1.8.4", for: backend)
             environment["PATH"] = ""
+        case .pathHomebrewSymlink:
+            let prefix = root.appendingPathComponent("homebrew", isDirectory: true)
+            let backend = try makeBackend(
+                at: prefix.appendingPathComponent("Cellar/whisper-cpp/1.8.4/bin/whisper-cli")
+            )
+            try makeSymlink(
+                at: prefix.appendingPathComponent("bin/whisper-cli"),
+                destinationPath: "../Cellar/whisper-cpp/1.8.4/bin/whisper-cli"
+            )
+            environment["PATH"] = "\(prefix.appendingPathComponent("bin").path):/usr/bin:/bin"
+            expectedObservation = ResolverParityObservation(path: backend.path, version: "1.8.4")
+        case .symlinkedOverride:
+            let backend = try makeBackend(
+                at: workingDirectory.appendingPathComponent("override-target/whisper-cli")
+            )
+            try writeSidecar(" \n v1.8.4 \t\n", for: backend)
+            try makeSymlink(
+                at: workingDirectory.appendingPathComponent("override-link/whisper-cli"),
+                destinationPath: "../override-target/whisper-cli"
+            )
+            environment["TALKTEXT_WHISPER_CLI"] = "override-link/whisper-cli"
+            expectedObservation = ResolverParityObservation(path: backend.path, version: "1.8.4")
+        case .danglingVersionSidecar:
+            let backend = try makeBackend(
+                at: workingDirectory.appendingPathComponent("dangling-sidecar/whisper-cli")
+            )
+            try makeSymlink(
+                at: URL(fileURLWithPath: backend.path + ".version"),
+                destinationPath: "missing-version"
+            )
+            environment["TALKTEXT_WHISPER_CLI"] = "dangling-sidecar/whisper-cli"
+            expectedObservation = ResolverParityObservation(path: backend.path, version: nil)
         case .homebrewDotDot:
             let backend = try makeBackend(
                 at: workingDirectory.appendingPathComponent("homebrew/bin/whisper-cli")
@@ -161,7 +217,8 @@ final class DependencyResolverParityTests: XCTestCase {
             executableURL: shellCheckout.appendingPathComponent("TalkText/.build/debug/TalkText"),
             currentDirectoryURL: workingDirectory,
             homeDirectoryURL: homeDirectory,
-            shellToolURL: shellTool
+            shellToolURL: shellTool,
+            expectedObservation: expectedObservation
         )
     }
 
@@ -289,6 +346,17 @@ final class DependencyResolverParityTests: XCTestCase {
     private func writeSidecar(_ value: String, for backend: URL) throws {
         try Data(value.utf8).write(to: URL(fileURLWithPath: backend.path + ".version"))
     }
+
+    private func makeSymlink(at url: URL, destinationPath: String) throws {
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createSymbolicLink(
+            atPath: url.path,
+            withDestinationPath: destinationPath
+        )
+    }
 }
 
 private enum ResolverParityScenario: String, CaseIterable {
@@ -299,6 +367,9 @@ private enum ResolverParityScenario: String, CaseIterable {
     case pathLeadingEmpty = "path-leading-empty"
     case pathTrailingEmpty = "path-trailing-empty"
     case pathOnlyEmpty = "path-only-empty"
+    case pathHomebrewSymlink = "path-homebrew-symlink"
+    case symlinkedOverride = "symlinked-override"
+    case danglingVersionSidecar = "dangling-version-sidecar"
     case homebrewDotDot = "homebrew-dot-dot"
     case developmentDotDot = "development-dot-dot"
     case malformedSidecar = "malformed-sidecar"
@@ -312,6 +383,7 @@ private struct ResolverParityFixture {
     let currentDirectoryURL: URL
     let homeDirectoryURL: URL
     let shellToolURL: URL
+    let expectedObservation: ResolverParityObservation?
 }
 
 private struct ResolverParityObservation: Equatable {

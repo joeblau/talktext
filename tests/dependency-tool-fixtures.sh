@@ -235,29 +235,46 @@ METADATA_FAKE_BIN="$TEMP_ROOT/metadata-fake-bin"
 METADATA_PRODUCT_BIN="$TEMP_ROOT/metadata-products"
 METADATA_SWIFT_LOG="$TEMP_ROOT/metadata-swift.log"
 METADATA_PACKAGE_DUMP="$TEMP_ROOT/metadata-package.json"
+METADATA_REAL_BUILD="$TEMP_ROOT/metadata-real-build"
 METADATA_SPCTL_COUNT="$TEMP_ROOT/metadata-spctl-count"
 mkdir -p \
     "$METADATA_BUNDLE_REPOSITORY/TalkText" \
-    "$METADATA_BUNDLE_REPOSITORY/TalkText/Sources/TalkText" \
-    "$METADATA_BUNDLE_REPOSITORY/TalkText/Tests/TalkTextTests" \
     "$METADATA_BUNDLE_REPOSITORY/scripts" \
     "$METADATA_FAKE_BIN" \
     "$METADATA_PRODUCT_BIN"
 cp "$REPOSITORY_ROOT/bundle.sh" "$METADATA_BUNDLE_REPOSITORY/"
 cp "$REPOSITORY_ROOT/release.sh" "$METADATA_BUNDLE_REPOSITORY/"
+cp "$REPOSITORY_ROOT/setup.sh" "$METADATA_BUNDLE_REPOSITORY/"
 cp "$REPOSITORY_ROOT/.gitignore" "$METADATA_BUNDLE_REPOSITORY/"
 cp "$REPOSITORY_ROOT/VERSION" "$METADATA_BUNDLE_REPOSITORY/"
 cp "$REPOSITORY_ROOT/TalkText/Package.swift" "$METADATA_BUNDLE_REPOSITORY/TalkText/"
 cp "$REPOSITORY_ROOT/TalkText/Info.plist" "$METADATA_BUNDLE_REPOSITORY/TalkText/"
 cp "$REPOSITORY_ROOT/TalkText/TalkText.entitlements" "$METADATA_BUNDLE_REPOSITORY/TalkText/"
+cp -R "$REPOSITORY_ROOT/TalkText/Sources" "$METADATA_BUNDLE_REPOSITORY/TalkText/"
+cp -R "$REPOSITORY_ROOT/TalkText/Tests" "$METADATA_BUNDLE_REPOSITORY/TalkText/"
 cp "$REPOSITORY_ROOT/scripts/dependency-tool.sh" "$METADATA_BUNDLE_REPOSITORY/scripts/"
+cp "$REPOSITORY_ROOT/scripts/export-canonical-metadata.sh" "$METADATA_BUNDLE_REPOSITORY/scripts/"
 cp "$REPOSITORY_ROOT/scripts/read-version.sh" "$METADATA_BUNDLE_REPOSITORY/scripts/"
 cp "$REPOSITORY_ROOT/scripts/verify-bundle.sh" "$METADATA_BUNDLE_REPOSITORY/scripts/"
 cp "$FIXTURE_MANIFEST" "$METADATA_BUNDLE_REPOSITORY/dependencies.env"
 plutil -replace CFBundleName -string EchoFixture "$METADATA_BUNDLE_REPOSITORY/TalkText/Info.plist"
 plutil -replace CFBundleExecutable -string EchoFixtureExecutable "$METADATA_BUNDLE_REPOSITORY/TalkText/Info.plist"
 plutil -replace CFBundleIdentifier -string com.example.echo-fixture "$METADATA_BUNDLE_REPOSITORY/TalkText/Info.plist"
+plutil -replace CFBundlePackageType -string FICT "$METADATA_BUNDLE_REPOSITORY/TalkText/Info.plist"
 plutil -replace LSMinimumSystemVersion -string 13.3 "$METADATA_BUNDLE_REPOSITORY/TalkText/Info.plist"
+
+git -C "$METADATA_BUNDLE_REPOSITORY" init -q
+git -C "$METADATA_BUNDLE_REPOSITORY" config user.email fixture@example.com
+git -C "$METADATA_BUNDLE_REPOSITORY" config user.name 'Fixture Release'
+git -C "$METADATA_BUNDLE_REPOSITORY" add .
+git -C "$METADATA_BUNDLE_REPOSITORY" commit -qm 'Differential metadata fixture sources'
+METADATA_RELEASE_VERSION="$("$METADATA_BUNDLE_REPOSITORY/scripts/read-version.sh")"
+METADATA_RELEASE_TAG="v$METADATA_RELEASE_VERSION"
+git -C "$METADATA_BUNDLE_REPOSITORY" tag "$METADATA_RELEASE_TAG"
+METADATA_RELEASE_COMMIT="$(git -C "$METADATA_BUNDLE_REPOSITORY" rev-parse HEAD)"
+[[ -z "$(git -C "$METADATA_BUNDLE_REPOSITORY" status --porcelain --untracked-files=normal)" ]] || \
+    fail 'differential canonical-metadata repository did not start clean'
+pass 'differential canonical-metadata fixture starts from a clean source-only Git commit'
 
 if ! CLANG_MODULE_CACHE_PATH="$TEMP_ROOT/swift-module-cache" \
     SWIFTPM_MODULECACHE_OVERRIDE="$TEMP_ROOT/swift-module-cache" \
@@ -278,6 +295,28 @@ assert_equal EchoFixtureExecutable "$PACKAGE_TARGET_NAME" \
     'SwiftPM executable target did not follow differential CFBundleExecutable'
 assert_equal 13.3 "$PACKAGE_MINIMUM_SYSTEM_VERSION" \
     'SwiftPM platform did not follow differential LSMinimumSystemVersion'
+
+if ! CLANG_MODULE_CACHE_PATH="$TEMP_ROOT/swift-module-cache" \
+    SWIFTPM_MODULECACHE_OVERRIDE="$TEMP_ROOT/swift-module-cache" \
+    swift build --disable-sandbox \
+        --package-path "$METADATA_BUNDLE_REPOSITORY/TalkText" \
+        --scratch-path "$METADATA_REAL_BUILD" \
+        > "$TEMP_ROOT/metadata-real-build.stdout" \
+        2> "$TEMP_ROOT/metadata-real-build.stderr"; then
+    sed -n '1,120p' "$TEMP_ROOT/metadata-real-build.stderr" >&2
+    fail 'real package did not compile with differential canonical metadata'
+fi
+METADATA_REAL_BIN="$(
+    CLANG_MODULE_CACHE_PATH="$TEMP_ROOT/swift-module-cache" \
+    SWIFTPM_MODULECACHE_OVERRIDE="$TEMP_ROOT/swift-module-cache" \
+        swift build --disable-sandbox \
+            --package-path "$METADATA_BUNDLE_REPOSITORY/TalkText" \
+            --scratch-path "$METADATA_REAL_BUILD" \
+            --show-bin-path
+)"
+[[ -x "$METADATA_REAL_BIN/EchoFixtureExecutable" ]] || \
+    fail 'real package compile did not produce the differential CFBundleExecutable'
+pass 'real package compiles under differential canonical metadata'
 
 cat > "$METADATA_FAKE_BIN/swift" <<'EOF'
 #!/bin/bash
@@ -392,7 +431,9 @@ printf '#!/bin/bash\nexit 0\n' > "$METADATA_PRODUCT_BIN/EchoFixtureExecutable"
 chmod 755 \
     "$METADATA_BUNDLE_REPOSITORY/bundle.sh" \
     "$METADATA_BUNDLE_REPOSITORY/release.sh" \
+    "$METADATA_BUNDLE_REPOSITORY/setup.sh" \
     "$METADATA_BUNDLE_REPOSITORY/scripts/dependency-tool.sh" \
+    "$METADATA_BUNDLE_REPOSITORY/scripts/export-canonical-metadata.sh" \
     "$METADATA_BUNDLE_REPOSITORY/scripts/read-version.sh" \
     "$METADATA_BUNDLE_REPOSITORY/scripts/verify-bundle.sh" \
     "$METADATA_FAKE_BIN/swift" \
@@ -405,6 +446,29 @@ chmod 755 \
     "$METADATA_FAKE_BIN/xcrun" \
     "$METADATA_FAKE_BIN/spctl" \
     "$METADATA_PRODUCT_BIN/EchoFixtureExecutable"
+
+METADATA_SETUP_BACKEND="$TEMP_ROOT/metadata-setup-backend"
+METADATA_SETUP_EXECUTABLE="$METADATA_BUNDLE_REPOSITORY/TalkText/.build/release/EchoFixtureExecutable"
+make_backend "$METADATA_SETUP_BACKEND"
+mkdir -p \
+    "$(dirname -- "$METADATA_SETUP_EXECUTABLE")" \
+    "$METADATA_BUNDLE_REPOSITORY/models"
+cp "$METADATA_PRODUCT_BIN/EchoFixtureExecutable" "$METADATA_SETUP_EXECUTABLE"
+cp "$VALID_FIXTURE" "$METADATA_BUNDLE_REPOSITORY/models/fixture-model.bin"
+chmod 755 "$METADATA_SETUP_EXECUTABLE"
+METADATA_SETUP_EXECUTABLE="$(canonical_fixture_path "$METADATA_SETUP_EXECUTABLE")"
+if ! PATH="$METADATA_FAKE_BIN:$PATH" \
+    METADATA_SWIFT_LOG="$METADATA_SWIFT_LOG" \
+    TALKTEXT_WHISPER_CLI="$METADATA_SETUP_BACKEND" \
+        "$METADATA_BUNDLE_REPOSITORY/setup.sh" \
+        > "$TEMP_ROOT/metadata-setup.stdout" \
+        2> "$TEMP_ROOT/metadata-setup.stderr"; then
+    sed -n '1,120p' "$TEMP_ROOT/metadata-setup.stderr" >&2
+    fail 'setup did not follow differential canonical executable metadata'
+fi
+grep -Fq "   $METADATA_SETUP_EXECUTABLE" "$TEMP_ROOT/metadata-setup.stdout" || \
+    fail 'setup output did not use the differential CFBundleExecutable path'
+pass 'setup derives its built executable path from canonical metadata'
 
 if ! PATH="$METADATA_FAKE_BIN:$PATH" \
     METADATA_SOURCE_ENTITLEMENTS="$METADATA_BUNDLE_REPOSITORY/TalkText/TalkText.entitlements" \
@@ -424,6 +488,11 @@ METADATA_APP="$METADATA_BUNDLE_REPOSITORY/EchoFixture.app"
 assert_absent "$METADATA_BUNDLE_REPOSITORY/TalkText.app"
 [[ -x "$METADATA_APP/Contents/MacOS/EchoFixtureExecutable" ]] || \
     fail 'bundle did not use the differential CFBundleExecutable'
+METADATA_PACKAGE_TYPE="$(
+    plutil -extract CFBundlePackageType raw -expect string -o - "$METADATA_APP/Contents/Info.plist"
+)"
+assert_equal FICT "$METADATA_PACKAGE_TYPE" \
+    'bundle did not use the differential CFBundlePackageType'
 grep -Fq -- '--triple arm64-apple-macosx13.3' "$METADATA_SWIFT_LOG" || \
     fail 'arm64 bundle build did not use the differential deployment target'
 grep -Fq -- '--triple x86_64-apple-macosx13.3' "$METADATA_SWIFT_LOG" || \
@@ -445,15 +514,18 @@ grep -q 'final CFBundleIdentifier differs from canonical Info.plist' "$TEMP_ROOT
 cp "$TEMP_ROOT/metadata-final-info.plist" "$METADATA_APP/Contents/Info.plist"
 pass 'Package.swift, bundle assembly, and real verification follow differential canonical metadata'
 
-git -C "$METADATA_BUNDLE_REPOSITORY" init -q
-git -C "$METADATA_BUNDLE_REPOSITORY" config user.email fixture@example.com
-git -C "$METADATA_BUNDLE_REPOSITORY" config user.name 'Fixture Release'
-git -C "$METADATA_BUNDLE_REPOSITORY" add .
-git -C "$METADATA_BUNDLE_REPOSITORY" commit -qm 'Differential metadata fixture'
-METADATA_RELEASE_VERSION="$("$METADATA_BUNDLE_REPOSITORY/scripts/read-version.sh")"
-METADATA_RELEASE_TAG="v$METADATA_RELEASE_VERSION"
-git -C "$METADATA_BUNDLE_REPOSITORY" tag "$METADATA_RELEASE_TAG"
-METADATA_RELEASE_COMMIT="$(git -C "$METADATA_BUNDLE_REPOSITORY" rev-parse HEAD)"
+[[ -z "$(
+    git -C "$METADATA_BUNDLE_REPOSITORY" ls-files -- \
+        'EchoFixture.app' 'EchoFixture.app/**'
+)" ]] || fail 'differential metadata fixture committed a generated app bundle'
+[[ -d "$METADATA_BUNDLE_REPOSITORY/EchoFixture.app" ]] || \
+    fail 'differential metadata fixture did not generate the canonical app bundle'
+# The generated bundle may be ignored or merely untracked, but it must never be
+# staged, and it must never dirty the release cleanliness check.
+! git -C "$METADATA_BUNDLE_REPOSITORY" status --porcelain --untracked-files=all -- EchoFixture.app | \
+    grep -Eq '^[MARCD]' || \
+    fail 'generated differential app bundle was staged into the release source'
+pass 'differential metadata fixture does not commit generated app bundles'
 
 run_metadata_release() {
     PATH="$METADATA_FAKE_BIN:$PATH" \

@@ -196,6 +196,13 @@ is_executable_file() {
     [[ -f "$1" && -r "$1" && -x "$1" ]]
 }
 
+canonical_executable_path() {
+    local path
+    path="$(canonical_path "$1")"
+    is_executable_file "$path" || return 1
+    printf '%s\n' "$path"
+}
+
 trim_surrounding_whitespace() {
     local value="$1"
     value="${value#"${value%%[![:space:]]*}"}"
@@ -272,8 +279,8 @@ resolve_backend() {
         for candidate in \
             "$TALKTEXT_BUNDLE_RESOURCES/bin/$BACKEND_EXECUTABLE" \
             "$TALKTEXT_BUNDLE_RESOURCES/$BACKEND_EXECUTABLE"; do
-            if is_executable_file "$candidate"; then
-                canonical_path "$candidate"
+            if candidate="$(canonical_executable_path "$candidate")"; then
+                printf '%s\n' "$candidate"
                 return
             fi
         done
@@ -290,8 +297,8 @@ resolve_backend() {
             [[ -n "$path_entry" ]] || path_entry="$(pwd -P)"
             path_entry="$(configured_path "$path_entry")"
             candidate="$path_entry/$BACKEND_EXECUTABLE"
-            if is_executable_file "$candidate"; then
-                canonical_path "$candidate"
+            if candidate="$(canonical_executable_path "$candidate")"; then
+                printf '%s\n' "$candidate"
                 return
             fi
         done
@@ -306,8 +313,8 @@ resolve_backend() {
         [[ -n "$(trim_surrounding_whitespace "$prefix")" ]] || continue
         prefix="$(configured_path "$prefix")"
         candidate="$prefix/bin/$BACKEND_EXECUTABLE"
-        if is_executable_file "$candidate"; then
-            canonical_path "$candidate"
+        if candidate="$(canonical_executable_path "$candidate")"; then
+            printf '%s\n' "$candidate"
             return
         fi
     done
@@ -327,16 +334,16 @@ resolve_backend() {
         for candidate in \
             "$development_root/.dependencies/bin/$BACKEND_EXECUTABLE" \
             "$development_root/bin/$BACKEND_EXECUTABLE"; do
-            if is_executable_file "$candidate"; then
-                canonical_path "$candidate"
+            if candidate="$(canonical_executable_path "$candidate")"; then
+                printf '%s\n' "$candidate"
                 return
             fi
         done
     done
 
     candidate="${HOME:-}/.local/bin/$BACKEND_EXECUTABLE"
-    if is_executable_file "$candidate"; then
-        canonical_path "$candidate"
+    if candidate="$(canonical_executable_path "$candidate")"; then
+        printf '%s\n' "$candidate"
         return
     fi
 
@@ -360,6 +367,9 @@ extract_backend_version() {
         return
     fi
 
+    # A sidecar filesystem entry is authoritative, including a dangling
+    # symlink. Unreadable or invalid metadata fails closed instead of falling
+    # through to a lower-priority version source.
     if [[ -e "${executable}.version" || -L "${executable}.version" ]]; then
         if [[ -f "${executable}.version" && -r "${executable}.version" ]]; then
             sidecar="$(<"${executable}.version")"
@@ -389,6 +399,7 @@ extract_backend_version() {
 probe_backend() {
     local executable="${1:-}" help_output version flag supported_version is_supported=0
     [[ -n "$executable" ]] || executable="$(resolve_backend)"
+    executable="$(canonical_path "$executable")"
     is_executable_file "$executable" || fail "backend is not a readable executable: $executable"
 
     if ! help_output="$({ "$executable" --help; } 2>&1)"; then

@@ -35,7 +35,27 @@ MODEL_PATH="$REPOSITORY_ROOT/models/$MODEL_FILE_NAME"
 
 echo "==> Building app..."
 swift build --package-path "$REPOSITORY_ROOT/TalkText" -c release
-APP_PATH="$REPOSITORY_ROOT/TalkText/.build/release/TalkText"
+METADATA_FILE="$(mktemp "${TMPDIR:-/tmp}/talktext-canonical-metadata.XXXXXX")"
+cleanup_metadata() {
+    rm -f -- "$METADATA_FILE"
+}
+trap cleanup_metadata EXIT HUP INT TERM
+"$REPOSITORY_ROOT/scripts/export-canonical-metadata.sh" "$METADATA_FILE"
+EXECUTABLE_NAME=''
+while IFS='=' read -r key value; do
+    if [[ "$key" == 'TALKTEXT_EXECUTABLE_NAME' ]]; then
+        EXECUTABLE_NAME="$value"
+        break
+    fi
+done < "$METADATA_FILE"
+[[ -n "$EXECUTABLE_NAME" ]] || {
+    echo "error: canonical metadata export did not define TALKTEXT_EXECUTABLE_NAME" >&2
+    exit 1
+}
+rm -f -- "$METADATA_FILE"
+trap - EXIT HUP INT TERM
+
+APP_PATH="$REPOSITORY_ROOT/TalkText/.build/release/$EXECUTABLE_NAME"
 [[ -x "$APP_PATH" ]] || {
     echo "error: Swift build completed without producing $APP_PATH" >&2
     exit 1
