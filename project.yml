@@ -42,11 +42,11 @@ targets:
         GENERATE_INFOPLIST_FILE: NO
         INFOPLIST_FILE: TalkText/Info.plist
         CODE_SIGN_ENTITLEMENTS: TalkText/TalkText.entitlements
-        # Ad-hoc signing keeps development builds runnable without credentials.
-        # Release signing is Developer ID and lives in bundle.sh.
-        CODE_SIGN_STYLE: Manual
-        CODE_SIGN_IDENTITY: "-"
-        DEVELOPMENT_TEAM: ""
+    # Signing lives in Signing.xcconfig so a machine-specific team never lands in
+    # this tracked spec. See that file for why the identity matters to TCC.
+    configFiles:
+      Debug: Signing.xcconfig
+      Release: Signing.xcconfig
     postBuildScripts:
       - name: Inject version from VERSION
         script: "\"$SRCROOT/scripts/inject-build-version.sh\""

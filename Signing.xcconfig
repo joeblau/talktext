@@ -1,0 +1,21 @@
+// Development signing for the generated Xcode project.
+//
+// Why this file exists: an ad-hoc signature's designated requirement pins the
+// exact cdhash, which changes on every build. macOS TCC stores that requirement
+// when you grant Accessibility or microphone access, so each rebuild invalidates
+// the grant and the app is re-prompted on every paste, while the stale entry
+// still appears (enabled) in System Settings. Signing with a certificate
+// identity keeps the requirement stable across rebuilds, so the grants stick.
+//
+// The defaults below are ad-hoc so that a checkout without a signing
+// certificate still builds. scripts/generate-xcodeproj.sh detects an
+// "Apple Development" identity and writes Local.xcconfig with it, which is
+// included last and wins. Local.xcconfig is not tracked: it holds a
+// machine-specific team ID.
+//
+// Releases are signed with Developer ID by bundle.sh, not from here.
+
+CODE_SIGN_STYLE = Manual
+CODE_SIGN_IDENTITY = -
+
+#include? "Local.xcconfig"
