@@ -1,0 +1,86 @@
+# Development-only Xcode project.
+#
+# TalkText needs a real app bundle to work: microphone TCC, accessibility, and
+# LSUIElement all depend on it, so `swift run` cannot exercise the app. This
+# generates an Xcode app target for running and debugging that bundle.
+#
+# Releases are NOT built from here. `swift build` + ./bundle.sh remains the
+# release path and is what CI verifies.
+#
+# The names below are written literally so that a plain `xcodegen generate`
+# produces a correct project. They are not a second source of truth: the app
+# bundle's identity comes from the canonical TalkText/Info.plist that Xcode reads
+# directly, the version is injected from VERSION at build time, and
+# scripts/generate-xcodeproj.sh fails if anything here drifts from those sources.
+
+name: TalkText
+
+options:
+  createIntermediateGroups: true
+  deploymentTarget:
+    macOS: "14.0" # Checked against LSMinimumSystemVersion by generate-xcodeproj.sh.
+  minimumXcodeGenVersion: "2.42.0"
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    # The version-injection phase reads VERSION and writes the built plist.
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+
+targets:
+  TalkText:
+    type: application
+    platform: macOS
+    sources:
+      - path: TalkText/Sources/TalkText
+    settings:
+      base:
+        PRODUCT_NAME: TalkText # Checked against CFBundleExecutable.
+        PRODUCT_BUNDLE_IDENTIFIER: com.joeblau.talktext # Checked against CFBundleIdentifier.
+        # The tracked plist is canonical; Xcode must not synthesize its own.
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: TalkText/Info.plist
+        CODE_SIGN_ENTITLEMENTS: TalkText/TalkText.entitlements
+        # Ad-hoc signing keeps development builds runnable without credentials.
+        # Release signing is Developer ID and lives in bundle.sh.
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "-"
+        DEVELOPMENT_TEAM: ""
+    postBuildScripts:
+      - name: Inject version from VERSION
+        script: "\"$SRCROOT/scripts/inject-build-version.sh\""
+        basedOnDependencyAnalysis: false
+
+  TalkTextTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: TalkText/Tests/TalkTextTests
+    dependencies:
+      - target: TalkText
+    settings:
+      base:
+        # The tests use `@testable import TalkText`.
+        ENABLE_TESTABILITY: YES
+        # Test-bundle scaffolding, not canonical app metadata: let Xcode
+        # generate this plist. Only the app bundle uses the tracked one.
+        GENERATE_INFOPLIST_FILE: YES
+
+schemes:
+  TalkText:
+    build:
+      targets:
+        TalkText: all
+        TalkTextTests: [test]
+    run:
+      config: Debug
+      environmentVariables:
+        # An Xcode build runs from DerivedData, so the resolver cannot infer the
+        # checkout the way it does for a SwiftPM build. Point it at the checkout
+        # so the app finds models/ without copying the model into the bundle.
+        TALKTEXT_DEVELOPMENT_ROOT: $(SRCROOT)
+    test:
+      config: Debug
+      targets:
+        - TalkTextTests
