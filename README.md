@@ -58,8 +58,23 @@ Xcode build reports the same version as a released one. Its scheme sets
 DerivedData cannot infer the checkout the way the SwiftPM executable does.
 
 A bare `xcodegen generate` also works. Prefer the script: it additionally fails
-when the names in `project.yml` drift from the canonical `Info.plist`, which a
-plain `xcodegen` run cannot check.
+when the names in `project.yml` drift from the canonical `Info.plist`, and it
+resolves local signing, neither of which a plain `xcodegen` run can do.
+
+Development builds are signed with your own Apple Development certificate, which
+the script finds in your keychain and writes to an untracked `Local.xcconfig`.
+This matters for more than trust prompts: an ad-hoc signature's designated
+requirement pins the exact code hash, so every rebuild invalidates the
+Accessibility and microphone grants and macOS re-prompts on the next paste, while
+the stale entry still shows as enabled in System Settings. A certificate identity
+keeps that requirement stable, so the grants survive rebuilds. Without a
+certificate the project still builds ad-hoc, with that caveat.
+
+After switching signing identities, clear the stale grant once:
+
+```sh
+tccutil reset Accessibility com.joeblau.talktext
+```
 
 Xcode builds are ad-hoc signed and for development only. Release artifacts still
 come from `./bundle.sh`, which is what CI verifies.
