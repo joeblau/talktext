@@ -11,6 +11,20 @@ TalkText is a macOS menu bar app for recording speech, transcribing it with `whi
 
 ## Local Development
 
+To build and launch the signed development app without opening Xcode, run from
+the repository root or the `TalkText/` Swift package directory:
+
+```sh
+bun macos
+```
+
+The command regenerates the development project, builds `TalkText.app` with
+`xcodebuild`, stops an older running instance, and launches the new build. It
+uses the same stable local signing configuration described below, so macOS
+permission grants survive rebuilds when an Apple Development certificate is
+available. The one-time project generator dependencies are `xcodegen` and
+`jq` (`brew install xcodegen jq`).
+
 From a clean checkout, run:
 
 ```sh
