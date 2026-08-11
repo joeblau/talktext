@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct MenuBarView: View {
@@ -25,6 +26,24 @@ struct MenuBarView: View {
                 }
                 Button("Retry Ctrl+Space") {
                     hotKeyController.retry()
+                }
+            }
+
+            if let recovery = engine.whisperRecovery {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(recovery.message)
+                        .font(.caption)
+                    Text(recovery.command)
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .padding(6)
+                        .background(.quaternary, in: RoundedRectangle(cornerRadius: 4))
+                    Button(recovery.copyButtonTitle) {
+                        copyToPasteboard(recovery.command)
+                    }
+                    Button("Check Whisper Again") {
+                        engine.prepareDependencies(forceRefresh: true)
+                    }
                 }
             }
 
@@ -76,5 +95,11 @@ struct MenuBarView: View {
         case .requestingPermission, .starting, .stopping, .transcribing, .delivering:
             false
         }
+    }
+
+    private func copyToPasteboard(_ text: String) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
     }
 }

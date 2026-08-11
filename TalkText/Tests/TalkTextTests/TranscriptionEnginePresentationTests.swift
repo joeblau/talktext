@@ -4,6 +4,65 @@ import XCTest
 
 @MainActor
 final class TranscriptionEnginePresentationTests: XCTestCase {
+    func testMissingWhisperOffersCopyableInstallCommand() {
+        let presentation = TranscriptionEngine.presentation(
+            for: .missingBinary(searchedPaths: [])
+        )
+
+        XCTAssertEqual(presentation.state, .failed)
+        XCTAssertEqual(
+            presentation.whisperRecovery,
+            .install
+        )
+        XCTAssertEqual(
+            presentation.whisperRecovery?.command,
+            "brew install whisper-cpp"
+        )
+    }
+
+    func testBrokenWhisperOffersCopyableReinstallCommand() {
+        let brokenBackendFailures: [TalkTextDependencyPreflightFailure] = [
+            .backendProbeFailed(path: "/usr/local/bin/whisper-cli"),
+            .backendMissingOptions(
+                path: "/usr/local/bin/whisper-cli",
+                options: ["--threads"]
+            ),
+            .backendVersionUnreported(path: "/usr/local/bin/whisper-cli"),
+        ]
+
+        for failure in brokenBackendFailures {
+            let presentation = TranscriptionEngine.presentation(for: failure)
+            XCTAssertEqual(presentation.state, .failed)
+            XCTAssertEqual(presentation.whisperRecovery, .reinstall)
+            XCTAssertEqual(
+                presentation.whisperRecovery?.command,
+                "brew reinstall whisper-cpp"
+            )
+        }
+    }
+
+    func testUnsupportedVersionDoesNotOfferAReinstallThatChangesNothing() {
+        let presentation = TranscriptionEngine.presentation(
+            for: .unsupportedBackendVersion(
+                path: "/opt/homebrew/bin/whisper-cli",
+                version: "9.9.9",
+                supported: WhisperBackendContract.supportedVersions
+            )
+        )
+
+        XCTAssertEqual(presentation.state, .failed)
+        XCTAssertNil(presentation.whisperRecovery)
+        XCTAssertTrue(presentation.statusText.contains("1.9.2"))
+    }
+
+    func testModelFailureDoesNotSuggestReinstallingWhisper() {
+        let presentation = TranscriptionEngine.presentation(
+            for: .missingModel(searchedPaths: [])
+        )
+
+        XCTAssertNil(presentation.whisperRecovery)
+    }
+
     func testEveryTranscriptionOutcomeMapsToDistinctActionablePresentation() {
         let exitFailure = ProcessDiagnostic(
             terminationStatus: 12,

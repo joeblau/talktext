@@ -10,7 +10,7 @@ enum WhisperBackendContract {
     static let modelFileName = "ggml-base.en.bin"
     static let modelSizeBytes: UInt64 = 147_964_211
     static let modelMagic = Data([0x6c, 0x6d, 0x67, 0x67])
-    static let supportedVersions = ["1.8.4", "1.9.1"]
+    static let supportedVersions = ["1.8.4", "1.9.1", "1.9.2"]
     static let requiredOptions = ["--model", "--file", "--no-timestamps", "--threads"]
 
     static func productionArguments(
@@ -78,7 +78,7 @@ enum TalkTextDependencyPreflightFailure: Error, Equatable, Sendable {
         case let .invalidOverride(variable, path, requirement):
             "\(variable) points to \(path), which is not \(requirement). Fix or unset \(variable)."
         case .missingBinary:
-            "whisper-cli was not found. Run ./setup.sh or set TALKTEXT_WHISPER_CLI to a supported executable."
+            "whisper-cli was not found."
         case .missingModel:
             "The verified base.en model was not found. Run ./setup.sh or set TALKTEXT_MODEL_PATH."
         case let .invalidModel(path, reason):
@@ -139,12 +139,19 @@ protocol DependencyProbeRunning: Sendable {
 }
 
 struct FoundationDependencyProbeRunner: DependencyProbeRunning {
+    /// `whisper-cli` loads every ggml backend before it parses arguments, so even
+    /// `--help` pays a one-time Metal shader-library compile after the formula is
+    /// installed or upgraded. That cold start was measured at 8.5s on an M3 Max;
+    /// warm runs finish in 0.16s. The budget covers the cold path with headroom on
+    /// slower machines so a healthy backend is never reported as broken.
+    static let defaultTimeout: TimeInterval = 30
+
     private let timeout: TimeInterval
     private let terminationGracePeriod: TimeInterval
     private let maximumOutputBytes: Int
 
     init(
-        timeout: TimeInterval = 5,
+        timeout: TimeInterval = Self.defaultTimeout,
         terminationGracePeriod: TimeInterval = 0.25,
         maximumOutputBytes: Int = 64 * 1_024
     ) {

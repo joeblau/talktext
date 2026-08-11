@@ -51,7 +51,8 @@ final class TranscriptionEngineStateTests: XCTestCase {
         engine.toggleRecording()
         await waitUntil { engine.state == .failed }
 
-        XCTAssertTrue(engine.statusText.contains("setup.sh"))
+        XCTAssertTrue(engine.statusText.contains("whisper-cli"))
+        XCTAssertEqual(engine.whisperRecovery, .install)
         XCTAssertEqual(permission.statusCallCount, 0)
         XCTAssertEqual(factory.creationCount, 0)
         XCTAssertEqual(store.allocatedURLs.count, 0)

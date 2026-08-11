@@ -25,10 +25,40 @@ final class TranscriptionEngine: ObservableObject {
     struct Presentation: Equatable, Sendable {
         let state: State
         let statusText: String
+        let whisperRecovery: WhisperRecovery?
+
+        init(
+            state: State,
+            statusText: String,
+            whisperRecovery: WhisperRecovery? = nil
+        ) {
+            self.state = state
+            self.statusText = statusText
+            self.whisperRecovery = whisperRecovery
+        }
+    }
+
+    struct WhisperRecovery: Equatable, Sendable {
+        let message: String
+        let command: String
+        let copyButtonTitle: String
+
+        static let install = WhisperRecovery(
+            message: "Whisper isn’t installed. Run this command in Terminal:",
+            command: "brew install whisper-cpp",
+            copyButtonTitle: "Copy Install Command"
+        )
+
+        static let reinstall = WhisperRecovery(
+            message: "Whisper appears to be broken. Reinstall it in Terminal:",
+            command: "brew reinstall whisper-cpp",
+            copyButtonTitle: "Copy Reinstall Command"
+        )
     }
 
     @Published private(set) var state: State
     @Published private(set) var statusText: String
+    @Published private(set) var whisperRecovery: WhisperRecovery?
 
     var isInteractive: Bool {
         state == .idle || state == .failed
@@ -101,6 +131,7 @@ final class TranscriptionEngine: ObservableObject {
         self.maximumDuration = maximumDuration
         state = startupPresentation?.state ?? .idle
         statusText = startupPresentation?.statusText ?? "Press Ctrl+Space to record"
+        whisperRecovery = startupPresentation?.whisperRecovery
 
         if performStartupCleanup {
             do {
@@ -163,9 +194,7 @@ final class TranscriptionEngine: ObservableObject {
                     )
                 )
             case let .failure(failure):
-                self.transition(
-                    to: Presentation(state: .failed, statusText: failure.userMessage)
-                )
+                self.transition(to: Self.presentation(for: failure))
             }
         }
     }
@@ -240,7 +269,7 @@ final class TranscriptionEngine: ObservableObject {
             case .ready:
                 self.continueRecordingAfterPreflight(sessionIdentifier: sessionIdentifier)
             case let .failure(failure):
-                self.finishFailure(failure.userMessage)
+                self.finishFailure(Self.presentation(for: failure))
             }
         }
     }
@@ -461,6 +490,10 @@ final class TranscriptionEngine: ObservableObject {
     }
 
     private func finishFailure(_ message: String) {
+        finishFailure(Presentation(state: .failed, statusText: message))
+    }
+
+    private func finishFailure(_ presentation: Presentation) {
         activeTask?.cancel()
         activeTask = nil
         currentRecorder?.cancel()
@@ -468,7 +501,7 @@ final class TranscriptionEngine: ObservableObject {
         removeCurrentRecording()
         currentSessionIdentifier = nil
         currentSessionTarget = nil
-        transition(to: Presentation(state: .failed, statusText: message))
+        transition(to: presentation)
     }
 
     private func finishSessionKeepingPresentation() {
@@ -494,6 +527,7 @@ final class TranscriptionEngine: ObservableObject {
     private func transition(to presentation: Presentation) {
         state = presentation.state
         statusText = presentation.statusText
+        whisperRecovery = presentation.whisperRecovery
     }
 
     private func logTemporaryFileError(operation: StaticString, error: any Error) {

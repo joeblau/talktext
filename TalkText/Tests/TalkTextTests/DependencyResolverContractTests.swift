@@ -204,7 +204,7 @@ final class DependencyResolverContractTests: XCTestCase {
             return XCTFail("Expected unsupported backend version failure")
         }
         XCTAssertEqual(version, "2.0.0")
-        XCTAssertEqual(supported, ["1.8.4", "1.9.1"])
+        XCTAssertEqual(supported, ["1.8.4", "1.9.1", "1.9.2"])
     }
 
     func testMissingProductionOptionFailsClosed() throws {
@@ -354,6 +354,29 @@ final class DependencyResolverContractTests: XCTestCase {
 
         XCTAssertNil(result)
         XCTAssertLessThan(Date().timeIntervalSince(start), 1)
+    }
+
+    /// `whisper-cli --help` loads every ggml backend before parsing arguments, so
+    /// the first run after installing or upgrading `whisper-cpp` compiles the Metal
+    /// shader library. That took 8.5s on an M3 Max, which the previous 5s budget
+    /// misreported as a broken backend. Keep real headroom over that measurement.
+    func testDefaultProbeTimeoutToleratesColdBackendStart() {
+        XCTAssertGreaterThanOrEqual(FoundationDependencyProbeRunner.defaultTimeout, 20)
+    }
+
+    func testFoundationProbeWaitsForABackendSlowerThanTheOldFiveSecondBudget() throws {
+        let executable = try makeExecutable(
+            at: fixtureDirectory.appendingPathComponent("cold-start"),
+            body: "/bin/sleep 6; printf '%s\\n' '--model --file --no-timestamps --threads'"
+        )
+        let runner = FoundationDependencyProbeRunner()
+
+        let result = try XCTUnwrap(runner.run(executableURL: executable, arguments: ["--help"]))
+
+        XCTAssertEqual(result.terminationStatus, 0)
+        for option in WhisperBackendContract.requiredOptions {
+            XCTAssertTrue(result.output.contains(option))
+        }
     }
 
     private func makeResolver(
