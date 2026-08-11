@@ -51,6 +51,14 @@ targets:
       - name: Inject version from VERSION
         script: "\"$SRCROOT/scripts/inject-build-version.sh\""
         basedOnDependencyAnalysis: false
+        # Declaring the built plist as an input is what orders this phase after
+        # ProcessInfoPlistFile. Xcode fuses build phases and schedules a script
+        # phase with no declared inputs whenever it likes, which intermittently
+        # ran this before the plist was copied and failed the build with
+        # "built Info.plist is missing".
+        inputFiles:
+          - $(TARGET_BUILD_DIR)/$(INFOPLIST_PATH)
+          - $(SRCROOT)/VERSION
 
   TalkTextTests:
     type: bundle.unit-test

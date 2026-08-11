@@ -1,0 +1,7 @@
+{
+  "name": "talktext",
+  "private": true,
+  "scripts": {
+    "macos": "bun run scripts/macos.ts"
+  }
+}
