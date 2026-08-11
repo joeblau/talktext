@@ -5,7 +5,7 @@ TalkText is a macOS menu bar app for recording speech, transcribing it with `whi
 ## Requirements
 
 - macOS 14+ on Apple Silicon or Intel (the app is Universal 2)
-- A supported `whisper-cli`: `whisper-cpp` 1.8.4 or 1.9.1
+- A supported `whisper-cli`: `whisper-cpp` 1.8.4, 1.9.1, or 1.9.2
 - Accessibility access for auto-insert and synthetic paste fallback
 - Microphone access
 
@@ -157,6 +157,7 @@ range:
 | --- | --- |
 | 1.8.4 | `9386f239401074690479731c1e41683fbbeac557` |
 | 1.9.1 | `f049fff95a089aa9969deb009cdd4892b3e74916` |
+| 1.9.2 | `306c88f4d1286aec1bf96e544632897886af5501` |
 
 The repository URL, exact version list, revisions, and required flags are
 canonical in `dependencies.env`. Production invokes:

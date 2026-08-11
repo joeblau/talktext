@@ -1,6 +1,33 @@
 import Foundation
 
 extension TranscriptionEngine {
+    static func presentation(
+        for failure: TalkTextDependencyPreflightFailure
+    ) -> Presentation {
+        // An unsupported version offers no command, because reinstalling the
+        // formula reproduces the same version; the status text naming every
+        // supported version is the only actionable guidance there.
+        let recovery: WhisperRecovery? = switch failure {
+        case .missingBinary:
+            .install
+        case .backendProbeFailed,
+             .backendMissingOptions,
+             .backendVersionUnreported:
+            .reinstall
+        case .unsupportedBackendVersion,
+             .invalidOverride,
+             .missingModel,
+             .invalidModel:
+            nil
+        }
+
+        return Presentation(
+            state: .failed,
+            statusText: failure.userMessage,
+            whisperRecovery: recovery
+        )
+    }
+
     static func preflightFailureCategory(
         _ failure: TalkTextDependencyPreflightFailure
     ) -> String {
@@ -30,7 +57,8 @@ extension TranscriptionEngine {
             case .binary:
                 Presentation(
                     state: .failed,
-                    statusText: "whisper-cli is missing. Run setup.sh, then try again."
+                    statusText: "whisper-cli is missing.",
+                    whisperRecovery: .install
                 )
             case .model:
                 Presentation(
