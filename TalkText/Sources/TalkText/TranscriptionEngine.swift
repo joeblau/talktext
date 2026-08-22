@@ -72,6 +72,8 @@ final class TranscriptionEngine: ObservableObject {
     private let textDelivery: any TextDelivering
     private let applicationBundleIdentifier: String?
     private let maximumDuration: TimeInterval
+    private let livePreviewInterval: TimeInterval
+    private let livePreview: LiveTranscriptionPreview
 
     private var currentSessionIdentifier: UUID?
     private var currentSessionTarget: PasteTarget?
@@ -101,6 +103,7 @@ final class TranscriptionEngine: ObservableObject {
             permissionProvider: SystemMicrophonePermissionProvider(),
             recorderFactory: SystemAudioRecorderFactory(),
             recordingFileStore: recordingFileStore,
+            recordingSnapshotter: ActiveWAVRecordingSnapshotter(),
             dependencyPreflight: dependencyResolver,
             transcriber: WhisperTranscriber(dependencyResolver: dependencyResolver),
             textDelivery: TextDeliveryService(),
@@ -113,11 +116,13 @@ final class TranscriptionEngine: ObservableObject {
         permissionProvider: any MicrophonePermissionProviding,
         recorderFactory: any AudioRecorderCreating,
         recordingFileStore: any RecordingFileStoring,
+        recordingSnapshotter: any ActiveRecordingSnapshotting = ActiveWAVRecordingSnapshotter(),
         dependencyPreflight: any WhisperDependencyPreflighting,
         transcriber: any WhisperTranscribing,
         textDelivery: any TextDelivering,
         applicationBundleIdentifier: String? = AppIdentity.bundleIdentifier,
         maximumDuration: TimeInterval = TranscriptionEngine.maximumRecordingDuration,
+        livePreviewInterval: TimeInterval = 1.5,
         performStartupCleanup: Bool = true,
         startupPresentation: Presentation? = nil
     ) {
@@ -129,6 +134,12 @@ final class TranscriptionEngine: ObservableObject {
         self.textDelivery = textDelivery
         self.applicationBundleIdentifier = applicationBundleIdentifier
         self.maximumDuration = maximumDuration
+        self.livePreviewInterval = max(0.1, livePreviewInterval)
+        livePreview = LiveTranscriptionPreview(
+            recordingFileStore: recordingFileStore,
+            recordingSnapshotter: recordingSnapshotter,
+            transcriber: transcriber
+        )
         state = startupPresentation?.state ?? .idle
         statusText = startupPresentation?.statusText ?? "Press Ctrl+Space to record"
         whisperRecovery = startupPresentation?.whisperRecovery
@@ -359,6 +370,21 @@ final class TranscriptionEngine: ObservableObject {
                     statusText: "Recording… Press Ctrl+Space to stop"
                 )
             )
+            _ = textDelivery.updateLiveTranscript("", in: currentSessionTarget)
+            livePreview.start(
+                recordingURL: recordingURL,
+                interval: livePreviewInterval
+            ) { [weak self] text in
+                guard let self,
+                      self.currentSessionIdentifier == sessionIdentifier,
+                      self.state == .recording else {
+                    return
+                }
+                _ = self.textDelivery.updateLiveTranscript(
+                    text,
+                    in: self.currentSessionTarget
+                )
+            }
             logger.notice("Recording started")
         } catch {
             currentRecorder = nil
@@ -376,7 +402,9 @@ final class TranscriptionEngine: ObservableObject {
         }
 
         transition(to: Presentation(state: .stopping, statusText: "Finalizing recording…"))
+        let previewTask = livePreview.stop()
         activeTask = Task { @MainActor [weak self, recorder] in
+            await previewTask?.value
             let outcome = await recorder.stop()
             guard let self,
                   self.currentSessionIdentifier == sessionIdentifier,
@@ -415,7 +443,17 @@ final class TranscriptionEngine: ObservableObject {
                     statusText: "Maximum recording length reached. Finalizing…"
                 )
             )
-            beginTranscription(sessionIdentifier: sessionIdentifier)
+            let previewTask = livePreview.stop()
+            activeTask = Task { @MainActor [weak self] in
+                await previewTask?.value
+                guard let self,
+                      self.currentSessionIdentifier == sessionIdentifier,
+                      self.state == .stopping else {
+                    return
+                }
+                self.activeTask = nil
+                self.beginTranscription(sessionIdentifier: sessionIdentifier)
+            }
         case .interrupted:
             currentRecorder = nil
             finishFailure("Recording was interrupted. Check the input device and try again.")
@@ -465,12 +503,13 @@ final class TranscriptionEngine: ObservableObject {
         transition(to: outcomePresentation)
 
         guard case let .success(text) = outcome else {
+            textDelivery.cancelLiveTranscript()
             finishSessionKeepingPresentation()
             return
         }
 
         let target = currentSessionTarget
-        let deliveryOutcome = await textDelivery.deliver(text, to: target)
+        let deliveryOutcome = await textDelivery.finalizeLiveTranscript(text, in: target)
         guard currentSessionIdentifier == sessionIdentifier else {
             return
         }
@@ -482,6 +521,8 @@ final class TranscriptionEngine: ObservableObject {
     private func invalidateCurrentSession() {
         currentSessionIdentifier = nil
         currentSessionTarget = nil
+        livePreview.cleanup()
+        textDelivery.cancelLiveTranscript()
         activeTask?.cancel()
         activeTask = nil
         currentRecorder?.cancel()
@@ -494,6 +535,8 @@ final class TranscriptionEngine: ObservableObject {
     }
 
     private func finishFailure(_ presentation: Presentation) {
+        livePreview.cleanup()
+        textDelivery.cancelLiveTranscript()
         activeTask?.cancel()
         activeTask = nil
         currentRecorder?.cancel()
@@ -506,6 +549,7 @@ final class TranscriptionEngine: ObservableObject {
 
     private func finishSessionKeepingPresentation() {
         activeTask = nil
+        livePreview.cleanup()
         currentRecorder = nil
         currentRecordingURL = nil
         currentSessionIdentifier = nil

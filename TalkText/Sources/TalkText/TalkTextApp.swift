@@ -32,8 +32,8 @@ struct MenuBarIcon: View {
                 Image(systemName: "exclamationmark.triangle")
             }
         case .recording:
-            Image(systemName: "record.circle")
-                .symbolRenderingMode(.multicolor)
+            Image(systemName: "mic.fill")
+                .accessibilityLabel("Microphone on")
         case .requestingPermission, .starting, .stopping, .transcribing, .delivering:
             Image(systemName: "ellipsis.circle")
         }

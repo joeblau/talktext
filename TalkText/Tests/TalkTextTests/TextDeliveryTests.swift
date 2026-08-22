@@ -5,6 +5,47 @@ import XCTest
 
 @MainActor
 final class TextDeliveryTests: XCTestCase {
+    func testLiveDraftAndFinalTranscriptReplaceCapturedCursorText() async {
+        let target = makeTarget(pid: 91)
+        let workspace = DeliveryFakeWorkspace(capturedTarget: target, frontmost: target)
+        let accessibility = DeliveryFakeAccessibility(insertionOutcome: .inserted)
+        let pasteboard = DeliveryFakePasteboard()
+        let liveTextEditor = DeliveryFakeLiveTextEditor()
+        let service = makeService(
+            workspace: workspace,
+            accessibility: accessibility,
+            pasteboard: pasteboard,
+            eventPoster: DeliveryFakeEventPoster(),
+            liveTextEditor: liveTextEditor
+        )
+
+        XCTAssertTrue(service.updateLiveTranscript("draft", in: target))
+        let outcome = await service.finalizeLiveTranscript("final text", in: target)
+
+        XCTAssertEqual(liveTextEditor.updatedTexts, ["draft"])
+        XCTAssertEqual(liveTextEditor.finalizedTexts, ["final text"])
+        XCTAssertEqual(outcome, .inserted)
+        XCTAssertEqual(accessibility.insertedTargets, [])
+        XCTAssertEqual(pasteboard.replaceTexts, [])
+    }
+
+    func testCancellingLiveTranscriptRestoresCursorSession() {
+        let target = makeTarget(pid: 92)
+        let liveTextEditor = DeliveryFakeLiveTextEditor()
+        let service = makeService(
+            workspace: DeliveryFakeWorkspace(capturedTarget: target, frontmost: target),
+            accessibility: DeliveryFakeAccessibility(insertionOutcome: .inserted),
+            pasteboard: DeliveryFakePasteboard(),
+            eventPoster: DeliveryFakeEventPoster(),
+            liveTextEditor: liveTextEditor
+        )
+
+        XCTAssertTrue(service.updateLiveTranscript("temporary", in: target))
+        service.cancelLiveTranscript()
+
+        XCTAssertEqual(liveTextEditor.cancelCount, 1)
+    }
+
     func testDirectInsertionUsesCapturedTargetWithoutTouchingClipboard() async {
         let target = makeTarget(pid: 101)
         let workspace = DeliveryFakeWorkspace(capturedTarget: target, frontmost: target)
@@ -398,6 +439,7 @@ final class TextDeliveryTests: XCTestCase {
         accessibility: DeliveryFakeAccessibility,
         pasteboard: DeliveryFakePasteboard,
         eventPoster: DeliveryFakeEventPoster,
+        liveTextEditor: any LiveTextEditing = DeliveryFakeLiveTextEditor(),
         sleeper: any DeliverySleeping = DeliveryImmediateSleeper(),
         activationAttempts: Int = 3
     ) -> TextDeliveryService {
@@ -406,6 +448,7 @@ final class TextDeliveryTests: XCTestCase {
             accessibility: accessibility,
             pasteboard: pasteboard,
             eventPoster: eventPoster,
+            liveTextEditor: liveTextEditor,
             sleeper: sleeper,
             activationAttempts: activationAttempts,
             activationRetryDelay: 0,
@@ -440,6 +483,29 @@ final class TextDeliveryTests: XCTestCase {
         for _ in 0..<10 {
             await Task.yield()
         }
+    }
+}
+
+@MainActor
+private final class DeliveryFakeLiveTextEditor: LiveTextEditing {
+    var updateOutcome: LiveTextUpdateOutcome = .updated
+    var finalizationOutcome: LiveTextFinalizationOutcome = .finalized
+    private(set) var updatedTexts: [String] = []
+    private(set) var finalizedTexts: [String] = []
+    private(set) var cancelCount = 0
+
+    func update(_ text: String, in target: PasteTarget) -> LiveTextUpdateOutcome {
+        updatedTexts.append(text)
+        return updateOutcome
+    }
+
+    func finalize(_ text: String, in target: PasteTarget) -> LiveTextFinalizationOutcome {
+        finalizedTexts.append(text)
+        return finalizationOutcome
+    }
+
+    func cancel() {
+        cancelCount += 1
     }
 }
 

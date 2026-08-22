@@ -270,6 +270,40 @@ final class TranscriptionEngineStateTests: XCTestCase {
         XCTAssertEqual(store.removedURLs.count, 1)
     }
 
+    func testRecordingReplacesTextAtCursorButOnlyFinalizesCompleteTranscript() async {
+        let snapshotter = EngineSnapshotterFake(result: true)
+        let transcriber = EngineSequencedTranscriberFake(
+            outcomes: [.success("A live draft"), .success("The final transcript")]
+        )
+        let store = EngineFileStoreFake()
+        let delivery = EngineDeliveryFake()
+        let engine = makeEngine(
+            store: store,
+            snapshotter: snapshotter,
+            transcriber: transcriber,
+            delivery: delivery,
+            livePreviewInterval: 0.01
+        )
+
+        engine.toggleRecording()
+        await waitUntilWithDelay { delivery.liveUpdatedTexts == ["", "A live draft"] }
+
+        XCTAssertEqual(engine.state, .recording)
+        XCTAssertEqual(snapshotter.requests.count, 1)
+        XCTAssertEqual(delivery.deliveredTexts, [], "A draft must not run final delivery")
+        XCTAssertEqual(store.removedURLs, [snapshotter.requests[0].destination])
+
+        engine.toggleRecording()
+        await waitUntilWithDelay { engine.state == .idle }
+
+        XCTAssertEqual(transcriber.audioURLs.count, 2)
+        XCTAssertEqual(transcriber.audioURLs[0], snapshotter.requests[0].destination)
+        XCTAssertEqual(transcriber.audioURLs[1], snapshotter.requests[0].source)
+        XCTAssertEqual(delivery.finalizedTexts, ["The final transcript"])
+        XCTAssertEqual(delivery.deliveredTexts, ["The final transcript"])
+        XCTAssertEqual(Set(store.removedURLs), Set(store.allocatedURLs))
+    }
+
     func testRapidTogglesCannotStartAnotherSessionWhileDeliveryIsPending() async {
         let store = EngineFileStoreFake()
         let delivery = EngineDeliveryFake(outcome: nil)
@@ -440,16 +474,20 @@ final class TranscriptionEngineStateTests: XCTestCase {
         permission: EnginePermissionFake = EnginePermissionFake(),
         factory: EngineRecorderFactoryFake = EngineRecorderFactoryFake(),
         store: EngineFileStoreFake = EngineFileStoreFake(),
+        snapshotter: any ActiveRecordingSnapshotting = EngineSnapshotterFake(),
         transcriber: any WhisperTranscribing = EngineTranscriberFake(),
-        delivery: EngineDeliveryFake = EngineDeliveryFake()
+        delivery: EngineDeliveryFake = EngineDeliveryFake(),
+        livePreviewInterval: TimeInterval = 1.5
     ) -> TranscriptionEngine {
         TranscriptionEngine(
             permissionProvider: permission,
             recorderFactory: factory,
             recordingFileStore: store,
+            recordingSnapshotter: snapshotter,
             dependencyPreflight: preflight,
             transcriber: transcriber,
             textDelivery: delivery,
+            livePreviewInterval: livePreviewInterval,
             performStartupCleanup: false
         )
     }
@@ -596,6 +634,20 @@ final class TranscriptionEngineStateTests: XCTestCase {
         for _ in 0..<20 {
             await Task.yield()
         }
+    }
+
+    private func waitUntilWithDelay(
+        _ condition: @MainActor () -> Bool,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        for _ in 0..<200 {
+            if condition() {
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTFail("Condition was not reached", file: file, line: line)
     }
 }
 
