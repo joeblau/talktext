@@ -157,6 +157,62 @@ final class TranscriptionCoreTests: XCTestCase {
         }
     }
 
+    func testActiveWAVSnapshotRepairsStaleHeaderAndDropsIncompleteFrame() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TalkText-LiveSnapshotTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let sourceURL = root.appendingPathComponent("active.wav")
+        let snapshotURL = root.appendingPathComponent("snapshot.wav")
+        try writeSilentWAV(to: sourceURL, duration: 0.12)
+
+        var activeData = try Data(contentsOf: sourceURL)
+        let completeFileSize = activeData.count
+        overwriteLittleEndian(UInt32(0), in: &activeData, at: 4)
+        overwriteLittleEndian(UInt32(0), in: &activeData, at: 40)
+        activeData.append(0x7f)
+        try activeData.write(to: sourceURL)
+
+        let created = await ActiveWAVRecordingSnapshotter().createSnapshot(
+            from: sourceURL,
+            at: snapshotURL
+        )
+
+        XCTAssertTrue(created)
+        let snapshotData = try Data(contentsOf: snapshotURL)
+        XCTAssertEqual(snapshotData.count, completeFileSize)
+        XCTAssertEqual(readLittleEndianUInt32(in: snapshotData, at: 4), UInt32(completeFileSize - 8))
+        XCTAssertEqual(readLittleEndianUInt32(in: snapshotData, at: 40), UInt32(completeFileSize - 44))
+        guard case let .valid(duration) = RecordedAudioValidator().validateAudio(at: snapshotURL) else {
+            return XCTFail("Expected the repaired preview to be readable audio")
+        }
+        XCTAssertEqual(duration, 0.12, accuracy: 0.01)
+
+        let unchangedSource = try Data(contentsOf: sourceURL)
+        XCTAssertEqual(readLittleEndianUInt32(in: unchangedSource, at: 4), 0)
+        XCTAssertEqual(readLittleEndianUInt32(in: unchangedSource, at: 40), 0)
+    }
+
+    func testActiveWAVSnapshotRejectsIncompleteOrNonWAVInput() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TalkText-InvalidLiveSnapshotTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let sourceURL = root.appendingPathComponent("active.wav")
+        let snapshotURL = root.appendingPathComponent("snapshot.wav")
+        try Data("not an active wave file".utf8).write(to: sourceURL)
+
+        let created = await ActiveWAVRecordingSnapshotter().createSnapshot(
+            from: sourceURL,
+            at: snapshotURL
+        )
+
+        XCTAssertFalse(created)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: snapshotURL.path))
+    }
+
     func testTranscriptClassifierTreatsBlankMarkersCaseInsensitively() {
         XCTAssertEqual(
             TranscriptOutputClassifier.clean(" [blank_audio] (BLANK AUDIO) "),
@@ -222,6 +278,20 @@ final class TranscriptionCoreTests: XCTestCase {
         withUnsafeBytes(of: &littleEndian) { bytes in
             data.append(contentsOf: bytes)
         }
+    }
+
+    private func overwriteLittleEndian(_ value: UInt32, in data: inout Data, at offset: Int) {
+        data[offset] = UInt8(truncatingIfNeeded: value)
+        data[offset + 1] = UInt8(truncatingIfNeeded: value >> 8)
+        data[offset + 2] = UInt8(truncatingIfNeeded: value >> 16)
+        data[offset + 3] = UInt8(truncatingIfNeeded: value >> 24)
+    }
+
+    private func readLittleEndianUInt32(in data: Data, at offset: Int) -> UInt32 {
+        UInt32(data[offset])
+            | (UInt32(data[offset + 1]) << 8)
+            | (UInt32(data[offset + 2]) << 16)
+            | (UInt32(data[offset + 3]) << 24)
     }
 }
 

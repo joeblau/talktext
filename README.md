@@ -1,6 +1,12 @@
 # TalkText
 
-TalkText is a macOS menu bar app for recording speech, transcribing it with `whisper-cli`, and inserting the transcription into the focused text field.
+TalkText is a macOS menu bar app for recording speech, transcribing it live at the cursor with Whisper, and inserting the final transcription into the focused text field.
+
+While recording, TalkText replaces Whisper's latest draft directly at the
+captured cursor and shows an active microphone in the menu bar. Drafts are
+generated from finalized copies of audio already flushed to disk, so previewing
+never pauses the microphone. When recording stops, TalkText replaces the draft
+with one final transcription of the complete recording.
 
 ## Requirements
 

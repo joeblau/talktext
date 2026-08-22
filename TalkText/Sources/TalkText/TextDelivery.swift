@@ -24,7 +24,6 @@ enum TargetProcessAvailability: Equatable, Sendable {
     case exited
     case identityChanged
 }
-
 enum TargetActivationOutcome: Equatable, Sendable {
     case requested
     case targetExited
@@ -448,42 +447,13 @@ final class SystemDeliverySleeper: DeliverySleeping {
     }
 }
 
-enum ManualPasteReason: Equatable, Sendable {
-    case noSessionTarget
-    case targetExited
-    case targetIdentityChanged
-    case targetHasNoWindow
-    case targetCouldNotBeVerified
-    case eventPermissionDenied
-    case activationFailed
-    case eventPostFailed
-}
-
-enum DeliveryFailure: Equatable, Sendable {
-    case pasteboardSnapshotFailed(PasteboardSnapshotFailure)
-    case pasteboardWriteFailed(PasteboardMutationFailure, restoration: ClipboardRestorationOutcome)
-}
-
-enum DeliveryOutcome: Equatable, Sendable {
-    case inserted
-    case pasted(restoration: ClipboardRestorationOutcome)
-    case copiedForManualPaste(ManualPasteReason)
-    case failed(DeliveryFailure)
-    case cancelled(restoration: ClipboardRestorationOutcome?)
-}
-
-@MainActor
-protocol TextDelivering: AnyObject {
-    func captureCurrentTarget(excludingBundleIdentifier: String?) -> PasteTarget?
-    func deliver(_ text: String, to target: PasteTarget?) async -> DeliveryOutcome
-}
-
 @MainActor
 final class TextDeliveryService: TextDelivering {
     private let workspace: any WorkspaceServing
     private let accessibility: any AccessibilityServing
     private let pasteboard: any PasteboardServing
     private let eventPoster: any PasteEventPosting
+    private let liveTextEditor: any LiveTextEditing
     private let sleeper: any DeliverySleeping
     private let activationAttempts: Int
     private let activationRetryDelay: TimeInterval
@@ -502,6 +472,7 @@ final class TextDeliveryService: TextDelivering {
         accessibility: any AccessibilityServing = SystemAccessibilityService(),
         pasteboard: any PasteboardServing = SystemPasteboardService(),
         eventPoster: any PasteEventPosting = SystemPasteEventPoster(),
+        liveTextEditor: any LiveTextEditing = SystemLiveTextEditor(),
         sleeper: any DeliverySleeping = SystemDeliverySleeper(),
         activationAttempts: Int = 7,
         activationRetryDelay: TimeInterval = 0.15,
@@ -511,6 +482,7 @@ final class TextDeliveryService: TextDelivering {
         self.accessibility = accessibility
         self.pasteboard = pasteboard
         self.eventPoster = eventPoster
+        self.liveTextEditor = liveTextEditor
         self.sleeper = sleeper
         self.activationAttempts = max(1, activationAttempts)
         self.activationRetryDelay = max(0, activationRetryDelay)
@@ -519,6 +491,34 @@ final class TextDeliveryService: TextDelivering {
 
     func captureCurrentTarget(excludingBundleIdentifier: String?) -> PasteTarget? {
         workspace.currentExternalTarget(excludingBundleIdentifier: excludingBundleIdentifier)
+    }
+
+    func updateLiveTranscript(_ text: String, in target: PasteTarget?) -> Bool {
+        guard let target,
+              workspace.availability(of: target) == .available,
+              accessibility.ensurePermission(prompt: true) else {
+            return false
+        }
+        return liveTextEditor.update(text, in: target) == .updated
+    }
+
+    func finalizeLiveTranscript(_ text: String, in target: PasteTarget?) async -> DeliveryOutcome {
+        if let target,
+           workspace.availability(of: target) == .available,
+           accessibility.ensurePermission(prompt: true) {
+            switch liveTextEditor.finalize(text, in: target) {
+            case .finalized:
+                return .inserted
+            case .noActiveDraft, .unavailable:
+                break
+            }
+        }
+        liveTextEditor.cancel()
+        return await deliver(text, to: target)
+    }
+
+    func cancelLiveTranscript() {
+        liveTextEditor.cancel()
     }
 
     func deliver(_ text: String, to target: PasteTarget?) async -> DeliveryOutcome {

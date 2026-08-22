@@ -184,6 +184,27 @@ final class EngineFileStoreFake: RecordingFileStoring {
     }
 }
 
+final class EngineSnapshotterFake: ActiveRecordingSnapshotting, @unchecked Sendable {
+    private let lock = NSLock()
+    var result: Bool
+    private var _requests: [(source: URL, destination: URL)] = []
+
+    init(result: Bool = false) {
+        self.result = result
+    }
+
+    var requests: [(source: URL, destination: URL)] {
+        lock.withLock { _requests }
+    }
+
+    func createSnapshot(from sourceURL: URL, at destinationURL: URL) async -> Bool {
+        lock.withLock {
+            _requests.append((sourceURL, destinationURL))
+        }
+        return result
+    }
+}
+
 final class EngineTranscriberFake: WhisperTranscribing, @unchecked Sendable {
     private let lock = NSLock()
     private var outcome: TranscriptionOutcome?
@@ -252,11 +273,39 @@ final class EngineTranscriberFake: WhisperTranscribing, @unchecked Sendable {
     }
 }
 
+final class EngineSequencedTranscriberFake: WhisperTranscribing, @unchecked Sendable {
+    private let lock = NSLock()
+    private var outcomes: [TranscriptionOutcome]
+    private var _audioURLs: [URL] = []
+
+    init(outcomes: [TranscriptionOutcome]) {
+        self.outcomes = outcomes
+    }
+
+    var audioURLs: [URL] {
+        lock.withLock { _audioURLs }
+    }
+
+    func transcribe(audioURL: URL) async -> TranscriptionOutcome {
+        lock.withLock {
+            _audioURLs.append(audioURL)
+            guard !outcomes.isEmpty else {
+                return .noSpeech
+            }
+            return outcomes.removeFirst()
+        }
+    }
+}
+
 @MainActor
 final class EngineDeliveryFake: TextDelivering {
     var capturedTarget: PasteTarget?
     var outcome: DeliveryOutcome?
+    var liveUpdateResult = true
     private(set) var captureCount = 0
+    private(set) var liveUpdatedTexts: [String] = []
+    private(set) var finalizedTexts: [String] = []
+    private(set) var liveCancellationCount = 0
     private(set) var deliveredTexts: [String] = []
     private(set) var deliveredTargets: [PasteTarget?] = []
     private var continuation: CheckedContinuation<DeliveryOutcome, Never>?
@@ -268,6 +317,20 @@ final class EngineDeliveryFake: TextDelivering {
     func captureCurrentTarget(excludingBundleIdentifier: String?) -> PasteTarget? {
         captureCount += 1
         return capturedTarget
+    }
+
+    func updateLiveTranscript(_ text: String, in target: PasteTarget?) -> Bool {
+        liveUpdatedTexts.append(text)
+        return liveUpdateResult
+    }
+
+    func finalizeLiveTranscript(_ text: String, in target: PasteTarget?) async -> DeliveryOutcome {
+        finalizedTexts.append(text)
+        return await deliver(text, to: target)
+    }
+
+    func cancelLiveTranscript() {
+        liveCancellationCount += 1
     }
 
     func deliver(_ text: String, to target: PasteTarget?) async -> DeliveryOutcome {
