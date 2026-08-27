@@ -147,6 +147,12 @@ case "$EXPECTED_SIGNATURE" in
         grep -Fq 'Signature=adhoc' <<< "$SIGNATURE_DETAILS" || fail "CI bundle is not ad hoc signed"
         grep -Fq 'TeamIdentifier=not set' <<< "$SIGNATURE_DETAILS" || fail "unexpected team identifier on ad hoc bundle"
         ;;
+    apple-development)
+        grep -Fq 'Authority=Apple Development:' <<< "$SIGNATURE_DETAILS" || fail "Apple Development authority is missing"
+        EXPECTED_TEAM_ID="${TALKTEXT_EXPECTED_TEAM_ID:-}"
+        [[ -n "$EXPECTED_TEAM_ID" ]] || fail "TALKTEXT_EXPECTED_TEAM_ID is required for development verification"
+        grep -Fq "TeamIdentifier=$EXPECTED_TEAM_ID" <<< "$SIGNATURE_DETAILS" || fail "signature TeamIdentifier does not match"
+        ;;
     developer-id)
         grep -Fq 'Authority=Developer ID Application:' <<< "$SIGNATURE_DETAILS" || fail "Developer ID authority is missing"
         grep -Eq '^Timestamp=' <<< "$SIGNATURE_DETAILS" || fail "secure signing timestamp is missing"
@@ -155,7 +161,7 @@ case "$EXPECTED_SIGNATURE" in
         grep -Fq "TeamIdentifier=$EXPECTED_TEAM_ID" <<< "$SIGNATURE_DETAILS" || fail "signature TeamIdentifier does not match"
         ;;
     *)
-        fail "TALKTEXT_EXPECTED_SIGNATURE must be 'adhoc' or 'developer-id'"
+        fail "TALKTEXT_EXPECTED_SIGNATURE must be 'adhoc', 'apple-development', or 'developer-id'"
         ;;
 esac
 

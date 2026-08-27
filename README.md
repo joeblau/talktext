@@ -8,6 +8,25 @@ generated from finalized copies of audio already flushed to disk, so previewing
 never pauses the microphone. When recording stops, TalkText replaces the draft
 with one final transcription of the complete recording.
 
+Hold the right Option key to record and release it to stop, or double-tap it to
+lock recording on until the next right-Option press stops it. A single tap does
+nothing, so right Option stays usable as an ordinary modifier. TalkText opens
+and verifies the microphone silently, discards that warm-up audio, then plays a
+light ready chime; speech after the chime is what enters the recording.
+
+TalkText records from the input chosen under **Input** in the menu bar. The
+default follows System Settings, which is rarely what you want if you speak into
+an audio interface while the Mac's default input is still the built-in
+microphone — pick the interface once and TalkText remembers it, falling back to
+the system default whenever that device is unplugged. A recording that never
+rises above silence is reported by name instead of transcribed, because Whisper
+answers silence with confident inventions such as "you".
+
+TalkText does not call a recording ready until microphone buffers have actually
+reached its WAV file. If macOS changes an input route during startup or capture
+— common when Bluetooth headphones switch profiles — TalkText resolves a fresh
+CoreAudio device ID, rebuilds the audio graph, and retries within a fixed bound.
+
 ## Requirements
 
 - macOS 14+ on Apple Silicon or Intel (the app is Universal 2)
@@ -30,6 +49,28 @@ uses the same stable local signing configuration described below, so macOS
 permission grants survive rebuilds when an Apple Development certificate is
 available. The one-time project generator dependencies are `xcodegen` and
 `jq` (`brew install xcodegen jq`).
+
+The launcher identifies the running app by bundle identifier, waits for normal
+AppKit cleanup and LaunchServices deregistration, and retries transient macOS
+handoff failures such as error `-609`. It only reports success after the exact
+new executable has remained running, so a successful command means the menu-bar
+app actually started rather than merely that `open` accepted the request.
+
+To build the self-contained Universal 2 app and deploy it to
+`/Applications/TalkText.app`, run from either directory:
+
+```sh
+bun talktext
+```
+
+This command bundles and verifies the pinned model, signs with the first Apple
+Development identity in the local keychain when one is available, and stages
+the new bundle before replacing the installed app. If TalkText is running, the
+command quits it before deployment and restarts the installed build afterward
+through the same verified macOS launch lifecycle.
+
+Without an Apple Development identity it falls back to ad-hoc signing, which
+can require renewed Accessibility and microphone grants after deployment.
 
 From a clean checkout, run:
 

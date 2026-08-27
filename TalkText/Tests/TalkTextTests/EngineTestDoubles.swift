@@ -1,6 +1,54 @@
 import Foundation
 @testable import TalkText
 
+@MainActor
+final class EngineHotKeyServiceFake: GlobalHotKeyService {
+    private(set) var uninstallCount = 0
+
+    func install(
+        action: @escaping @MainActor @Sendable (RightOptionKeyPhase) -> Void
+    ) -> Result<Void, HotKeyInstallationError> {
+        .success(())
+    }
+
+    func uninstall() {
+        uninstallCount += 1
+    }
+}
+
+@MainActor
+final class EngineReadyCueFake: RecordingReadyCuePlaying {
+    private let completesImmediately: Bool
+    private var continuation: CheckedContinuation<Void, Never>?
+    private(set) var playCount = 0
+    private(set) var stopCount = 0
+
+    init(completesImmediately: Bool = true) {
+        self.completesImmediately = completesImmediately
+    }
+
+    func play() async {
+        playCount += 1
+        guard !completesImmediately else {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+
+    func complete() {
+        let continuation = continuation
+        self.continuation = nil
+        continuation?.resume()
+    }
+
+    func stop() {
+        stopCount += 1
+        complete()
+    }
+}
+
 final class EnginePreflightFake: WhisperDependencyPreflighting, @unchecked Sendable {
     private let lock = NSLock()
     private var result: TalkTextDependencyPreflightResult?
@@ -76,19 +124,63 @@ final class EnginePermissionFake: MicrophonePermissionProviding {
 @MainActor
 final class EngineRecorderFake: AudioRecording {
     var isRecording = false
+    /// Loud by default so tests exercise the transcription path rather than the
+    /// silence guard.
+    var peakLevel: Float = -12
+    var inputDeviceName = "Fake Microphone"
+    var preparationResult = true
+    var completesPreparationImmediately = true
     var startResult = true
+    var completesStartImmediately = true
     var immediateStopOutcome: RecorderStopOutcome? = .finished
     var onStart: (() -> Void)?
     private(set) var maximumDurations: [TimeInterval] = []
+    private(set) var preparationCount = 0
+    private(set) var startCount = 0
     private(set) var stopCount = 0
     private(set) var cancelCount = 0
+    private var preparationContinuation: CheckedContinuation<Bool, Never>?
+    private var startContinuation: CheckedContinuation<Bool, Never>?
     private var stopContinuation: CheckedContinuation<RecorderStopOutcome, Never>?
 
-    func start(maximumDuration: TimeInterval) -> Bool {
+    func prepare() async -> Bool {
+        preparationCount += 1
+        guard !completesPreparationImmediately else {
+            return preparationResult
+        }
+        return await withCheckedContinuation { continuation in
+            preparationContinuation = continuation
+        }
+    }
+
+    func completePreparation(with result: Bool? = nil) {
+        let result = result ?? preparationResult
+        let continuation = preparationContinuation
+        preparationContinuation = nil
+        continuation?.resume(returning: result)
+    }
+
+    func start(maximumDuration: TimeInterval) async -> Bool {
+        startCount += 1
         maximumDurations.append(maximumDuration)
-        isRecording = startResult
+        if completesStartImmediately {
+            isRecording = startResult
+        }
         onStart?()
-        return startResult
+        guard !completesStartImmediately else {
+            return startResult
+        }
+        return await withCheckedContinuation { continuation in
+            startContinuation = continuation
+        }
+    }
+
+    func completeStart(with result: Bool? = nil) {
+        let result = result ?? startResult
+        isRecording = result
+        let continuation = startContinuation
+        startContinuation = nil
+        continuation?.resume(returning: result)
     }
 
     func stop() async -> RecorderStopOutcome {
@@ -111,6 +203,12 @@ final class EngineRecorderFake: AudioRecording {
     func cancel() {
         cancelCount += 1
         isRecording = false
+        let preparationContinuation = preparationContinuation
+        self.preparationContinuation = nil
+        preparationContinuation?.resume(returning: false)
+        let startContinuation = startContinuation
+        self.startContinuation = nil
+        startContinuation?.resume(returning: false)
         completeStop(with: .cancelled)
     }
 }

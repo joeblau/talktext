@@ -50,7 +50,7 @@ extension TranscriptionEngine {
         case .noSpeech:
             Presentation(
                 state: .idle,
-                statusText: "No speech detected. Press Ctrl+Space to record"
+                statusText: "No speech detected. Hold Right Option to record, double-tap to lock"
             )
         case let .missingDependency(dependency):
             switch dependency {
@@ -114,7 +114,7 @@ extension TranscriptionEngine {
         case .cancelled:
             Presentation(
                 state: .failed,
-                statusText: "Transcription was cancelled. Press Ctrl+Space to try again."
+                statusText: "Transcription was cancelled. Hold Right Option to try again."
             )
         }
     }
@@ -122,11 +122,11 @@ extension TranscriptionEngine {
     static func presentation(for outcome: DeliveryOutcome) -> Presentation {
         switch outcome {
         case .inserted:
-            Presentation(state: .idle, statusText: "Inserted! Press Ctrl+Space to record")
+            Presentation(state: .idle, statusText: "Inserted! Hold Right Option to record, double-tap to lock")
         case let .pasted(restoration):
             switch restoration {
             case .restored:
-                Presentation(state: .idle, statusText: "Pasted! Press Ctrl+Space to record")
+                Presentation(state: .idle, statusText: "Pasted! Hold Right Option to record, double-tap to lock")
             case .skippedBecauseClipboardChanged:
                 Presentation(
                     state: .idle,
@@ -184,7 +184,7 @@ extension TranscriptionEngine {
         case .cancelled:
             Presentation(
                 state: .failed,
-                statusText: "Delivery was cancelled. Press Ctrl+Space to try again."
+                statusText: "Delivery was cancelled. Hold Right Option to try again."
             )
         }
     }

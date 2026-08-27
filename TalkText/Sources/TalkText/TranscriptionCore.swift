@@ -68,9 +68,26 @@ enum RecorderStopOutcome: Equatable, Sendable {
 @MainActor
 protocol AudioRecording: AnyObject {
     var isRecording: Bool { get }
-    func start(maximumDuration: TimeInterval) -> Bool
+    /// Loudest sample captured so far in dBFS, or `-.infinity` before any audio
+    /// arrives. The engine uses this to tell silence apart from speech instead
+    /// of trusting Whisper, which hallucinates words for silent input.
+    var peakLevel: Float { get }
+    /// The input the session actually opened, for status text and logging.
+    var inputDeviceName: String { get }
+    /// Opens the selected microphone and returns only after input buffers arrive.
+    /// Warm-up audio is discarded so a ready cue can play after a slow Bluetooth
+    /// route has settled without becoming part of the recording.
+    func prepare() async -> Bool
+    /// Enables file capture and returns only after a post-cue buffer reaches the
+    /// WAV. `AVAudioEngine.start()` alone is not a readiness guarantee on macOS.
+    func start(maximumDuration: TimeInterval) async -> Bool
     func stop() async -> RecorderStopOutcome
     func cancel()
+}
+
+enum AudioRecorderCreationError: Error, Equatable, Sendable {
+    case noInputDevice
+    case inputDeviceUnusable
 }
 
 @MainActor
@@ -83,225 +100,21 @@ protocol AudioRecorderCreating: AnyObject {
 
 @MainActor
 final class SystemAudioRecorderFactory: AudioRecorderCreating {
+    private let inputResolver: any AudioInputResolving
+
+    init(inputResolver: any AudioInputResolving) {
+        self.inputResolver = inputResolver
+    }
+
     func makeRecorder(
         at url: URL,
         eventHandler: @escaping @MainActor (RecorderEvent) -> Void
     ) throws -> any AudioRecording {
-        try SystemAudioRecorder(url: url, eventHandler: eventHandler)
-    }
-}
-
-/// AVAudioRecorder adapter that turns delegate callbacks and system interruptions
-/// into explicit events. TalkText limits a recording to five minutes by default;
-/// the engine supplies that documented limit to `start(maximumDuration:)`.
-@MainActor
-private final class SystemAudioRecorder: NSObject, AudioRecording, AVAudioRecorderDelegate, @unchecked Sendable {
-    private enum AutomaticStopReason {
-        case maximumDuration
-        case interruption
-        case deviceUnavailable
-    }
-
-    private let recorder: AVAudioRecorder
-    private let eventHandler: @MainActor (RecorderEvent) -> Void
-    private var maximumDurationTask: Task<Void, Never>?
-    private var stopContinuation: CheckedContinuation<RecorderStopOutcome, Never>?
-    private var automaticStopReason: AutomaticStopReason?
-    private var notificationObservers: [NSObjectProtocol] = []
-
-    var isRecording: Bool {
-        recorder.isRecording
-    }
-
-    init(
-        url: URL,
-        eventHandler: @escaping @MainActor (RecorderEvent) -> Void
-    ) throws {
-        let settings: [String: Any] = [
-            AVFormatIDKey: Int(kAudioFormatLinearPCM),
-            AVSampleRateKey: 16_000,
-            AVNumberOfChannelsKey: 1,
-            AVLinearPCMBitDepthKey: 16,
-            AVLinearPCMIsFloatKey: false,
-            AVLinearPCMIsBigEndianKey: false,
-        ]
-
-        recorder = try AVAudioRecorder(url: url, settings: settings)
-        self.eventHandler = eventHandler
-        super.init()
-        recorder.delegate = self
-        recorder.isMeteringEnabled = true
-        installInterruptionObservers()
-    }
-
-    deinit {
-        maximumDurationTask?.cancel()
-        for observer in notificationObservers {
-            NotificationCenter.default.removeObserver(observer)
-            NSWorkspace.shared.notificationCenter.removeObserver(observer)
-        }
-    }
-
-    func start(maximumDuration: TimeInterval) -> Bool {
-        guard !recorder.isRecording, stopContinuation == nil else {
-            return false
-        }
-
-        automaticStopReason = nil
-        let started = recorder.record()
-        guard started else {
-            return false
-        }
-
-        let duration = max(0.1, maximumDuration)
-        maximumDurationTask = Task { @MainActor [weak self] in
-            do {
-                try await Task.sleep(for: .seconds(duration))
-            } catch {
-                return
-            }
-
-            guard let self, self.recorder.isRecording else {
-                return
-            }
-            self.automaticStopReason = .maximumDuration
-            self.recorder.stop()
-        }
-        return true
-    }
-
-    func stop() async -> RecorderStopOutcome {
-        guard recorder.isRecording else {
-            return .notRecording
-        }
-
-        maximumDurationTask?.cancel()
-        maximumDurationTask = nil
-        automaticStopReason = nil
-
-        return await withCheckedContinuation { continuation in
-            stopContinuation = continuation
-            recorder.stop()
-
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
-                guard let self, self.stopContinuation != nil else {
-                    return
-                }
-                self.completeRequestedStop(with: .finalizationTimedOut)
-            }
-        }
-    }
-
-    func cancel() {
-        maximumDurationTask?.cancel()
-        maximumDurationTask = nil
-        automaticStopReason = nil
-        if recorder.isRecording {
-            recorder.stop()
-        }
-        completeRequestedStop(with: .cancelled)
-    }
-
-    nonisolated func audioRecorderDidFinishRecording(
-        _ recorder: AVAudioRecorder,
-        successfully flag: Bool
-    ) {
-        Task { @MainActor [weak self] in
-            self?.handleFinishedRecording(successfully: flag)
-        }
-    }
-
-    nonisolated func audioRecorderEncodeErrorDidOccur(
-        _ recorder: AVAudioRecorder,
-        error: (any Error)?
-    ) {
-        let nsError = error as NSError?
-        let diagnostic = RecorderErrorDiagnostic(
-            domain: nsError?.domain ?? "AVAudioRecorder",
-            code: nsError?.code ?? -1
+        try SystemAudioRecorder(
+            url: url,
+            inputResolver: inputResolver,
+            eventHandler: eventHandler
         )
-        Task { @MainActor [weak self] in
-            self?.handleEncodeError(diagnostic)
-        }
-    }
-
-    private func handleFinishedRecording(successfully: Bool) {
-        maximumDurationTask?.cancel()
-        maximumDurationTask = nil
-
-        if stopContinuation != nil {
-            completeRequestedStop(with: successfully ? .finished : .unsuccessfulCompletion)
-            return
-        }
-
-        let reason = automaticStopReason
-        automaticStopReason = nil
-        switch reason {
-        case .maximumDuration where successfully:
-            eventHandler(.maximumDurationReached)
-        case .interruption:
-            eventHandler(.interrupted)
-        case .deviceUnavailable:
-            eventHandler(.deviceUnavailable)
-        default:
-            eventHandler(.unexpectedCompletion)
-        }
-    }
-
-    private func handleEncodeError(_ diagnostic: RecorderErrorDiagnostic) {
-        maximumDurationTask?.cancel()
-        maximumDurationTask = nil
-        automaticStopReason = nil
-        if stopContinuation != nil {
-            completeRequestedStop(with: .encodeError(diagnostic))
-        } else {
-            eventHandler(.encodeError(diagnostic))
-        }
-    }
-
-    private func completeRequestedStop(with outcome: RecorderStopOutcome) {
-        guard let continuation = stopContinuation else {
-            return
-        }
-        stopContinuation = nil
-        continuation.resume(returning: outcome)
-    }
-
-    private func installInterruptionObservers() {
-        let sleepObserver = NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.willSleepNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.stopAutomatically(for: .interruption)
-            }
-        }
-        notificationObservers.append(sleepObserver)
-
-        let deviceObserver = NotificationCenter.default.addObserver(
-            forName: AVCaptureDevice.wasDisconnectedNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] notification in
-            guard let device = notification.object as? AVCaptureDevice, device.hasMediaType(.audio) else {
-                return
-            }
-            Task { @MainActor [weak self] in
-                self?.stopAutomatically(for: .deviceUnavailable)
-            }
-        }
-        notificationObservers.append(deviceObserver)
-    }
-
-    private func stopAutomatically(for reason: AutomaticStopReason) {
-        guard recorder.isRecording, stopContinuation == nil else {
-            return
-        }
-        maximumDurationTask?.cancel()
-        maximumDurationTask = nil
-        automaticStopReason = reason
-        recorder.stop()
     }
 }
 

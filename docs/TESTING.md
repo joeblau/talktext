@@ -13,8 +13,9 @@ line-percentage target. A change must keep deterministic tests for:
   timeout, and task cancellation in the process runner;
 - dependency preflight before recording, output cleanup, and the distinction
   between successful no-speech output and every transcription failure;
-- permission/start/stop/recorder callback races, maximum duration, explicit
-  state transitions, cancellation, and failure presentation;
+- permission/start/stop/recorder callback races, verified input readiness,
+  cancellation while audio is still opening, maximum duration, explicit state
+  transitions, and failure presentation;
 - unique session recordings plus cleanup after success, failure, cancellation,
   startup stale-file pruning, and application termination;
 - captured-target identity, PID reuse/relaunch, closed windows, target switches,

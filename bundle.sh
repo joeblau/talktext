@@ -66,13 +66,20 @@ case "$SIGNING_MODE" in
         SIGNING_IDENTITY='-'
         TIMESTAMP_ARGUMENT='--timestamp=none'
         ;;
+    apple-development)
+        SIGNING_IDENTITY="${TALKTEXT_SIGNING_IDENTITY:-}"
+        [[ -n "$SIGNING_IDENTITY" ]] || fail "TALKTEXT_SIGNING_IDENTITY is required for Apple Development signing"
+        [[ -n "${TALKTEXT_EXPECTED_TEAM_ID:-}" ]] || \
+            fail "TALKTEXT_EXPECTED_TEAM_ID is required for Apple Development signing"
+        TIMESTAMP_ARGUMENT='--timestamp=none'
+        ;;
     developer-id)
         SIGNING_IDENTITY="${TALKTEXT_SIGNING_IDENTITY:-}"
         [[ -n "$SIGNING_IDENTITY" ]] || fail "TALKTEXT_SIGNING_IDENTITY is required for Developer ID signing"
         TIMESTAMP_ARGUMENT='--timestamp'
         ;;
     *)
-        fail "TALKTEXT_SIGNING_MODE must be 'adhoc' or 'developer-id'"
+        fail "TALKTEXT_SIGNING_MODE must be 'adhoc', 'apple-development', or 'developer-id'"
         ;;
 esac
 

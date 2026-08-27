@@ -66,8 +66,9 @@ final class TranscriptionEngine: ObservableObject {
 
     private let permissionProvider: any MicrophonePermissionProviding
     private let recorderFactory: any AudioRecorderCreating
+    private let recordingReadyCue: any RecordingReadyCuePlaying
     private let recordingFileStore: any RecordingFileStoring
-    private let dependencyPreflight: any WhisperDependencyPreflighting
+    let dependencyPreflight: any WhisperDependencyPreflighting
     private let transcriber: any WhisperTranscribing
     private let textDelivery: any TextDelivering
     private let applicationBundleIdentifier: String?
@@ -75,16 +76,22 @@ final class TranscriptionEngine: ObservableObject {
     private let livePreviewInterval: TimeInterval
     private let livePreview: LiveTranscriptionPreview
 
-    private var currentSessionIdentifier: UUID?
+    /// Peak level below which a recording holds no speech. Real speech peaks far
+    /// above this even from across a room; digital silence sits at -infinity.
+    /// Whisper answers silence with confident hallucinations such as "you", so
+    /// TalkText refuses to transcribe below the floor.
+    static let silenceFloor: Float = -55
+
+    var currentSessionIdentifier: UUID?
     private var currentSessionTarget: PasteTarget?
     private var currentRecordingURL: URL?
     private var currentRecorder: (any AudioRecording)?
     private var activeTask: Task<Void, Never>?
-    private var dependencyPreparationTask: Task<TalkTextDependencyPreflightResult, Never>?
+    var dependencyPreparationTask: Task<TalkTextDependencyPreflightResult, Never>?
     private var dependencyPresentationTask: Task<Void, Never>?
-    private var cachedDependencyPreflight: TalkTextDependencyPreflightResult?
+    var cachedDependencyPreflight: TalkTextDependencyPreflightResult?
 
-    convenience init() {
+    convenience init(inputSelection: AudioInputSelection) {
         let recordingFileStore: any RecordingFileStoring
         let startupPresentation: Presentation?
         do {
@@ -101,7 +108,7 @@ final class TranscriptionEngine: ObservableObject {
         let dependencyResolver = TalkTextDependencyResolver()
         self.init(
             permissionProvider: SystemMicrophonePermissionProvider(),
-            recorderFactory: SystemAudioRecorderFactory(),
+            recorderFactory: SystemAudioRecorderFactory(inputResolver: inputSelection),
             recordingFileStore: recordingFileStore,
             recordingSnapshotter: ActiveWAVRecordingSnapshotter(),
             dependencyPreflight: dependencyResolver,
@@ -115,6 +122,7 @@ final class TranscriptionEngine: ObservableObject {
     init(
         permissionProvider: any MicrophonePermissionProviding,
         recorderFactory: any AudioRecorderCreating,
+        recordingReadyCue: any RecordingReadyCuePlaying = SystemRecordingReadyCuePlayer(),
         recordingFileStore: any RecordingFileStoring,
         recordingSnapshotter: any ActiveRecordingSnapshotting = ActiveWAVRecordingSnapshotter(),
         dependencyPreflight: any WhisperDependencyPreflighting,
@@ -128,6 +136,7 @@ final class TranscriptionEngine: ObservableObject {
     ) {
         self.permissionProvider = permissionProvider
         self.recorderFactory = recorderFactory
+        self.recordingReadyCue = recordingReadyCue
         self.recordingFileStore = recordingFileStore
         self.dependencyPreflight = dependencyPreflight
         self.transcriber = transcriber
@@ -141,7 +150,7 @@ final class TranscriptionEngine: ObservableObject {
             transcriber: transcriber
         )
         state = startupPresentation?.state ?? .idle
-        statusText = startupPresentation?.statusText ?? "Press Ctrl+Space to record"
+        statusText = startupPresentation?.statusText ?? "Hold Right Option to record, double-tap to lock"
         whisperRecovery = startupPresentation?.whisperRecovery
 
         if performStartupCleanup {
@@ -152,21 +161,6 @@ final class TranscriptionEngine: ObservableObject {
             } catch {
                 logTemporaryFileError(operation: "stale cleanup", error: error)
             }
-        }
-    }
-
-    func toggleRecording() {
-        switch state {
-        case .idle, .failed:
-            startRecordingFlow()
-        case .starting where currentSessionIdentifier == nil:
-            // A launch-time dependency check is in flight. Preserve the user's
-            // intent and await the same cached task instead of dropping input.
-            startRecordingFlow()
-        case .recording:
-            stopRecordingFlow()
-        case .requestingPermission, .starting, .stopping, .transcribing, .delivering:
-            logger.debug("Ignored recording toggle while engine is busy")
         }
     }
 
@@ -201,7 +195,7 @@ final class TranscriptionEngine: ObservableObject {
                 self.transition(
                     to: Presentation(
                         state: .idle,
-                        statusText: "Ready. Press Ctrl+Space to record"
+                        statusText: "Ready. Hold Right Option to record, double-tap to lock"
                     )
                 )
             case let .failure(failure):
@@ -221,7 +215,7 @@ final class TranscriptionEngine: ObservableObject {
         transition(
             to: Presentation(
                 state: .failed,
-                statusText: "Operation cancelled. Press Ctrl+Space to try again."
+                statusText: "Operation cancelled. Hold Right Option to try again."
             )
         )
         logger.notice("Engine operation cancelled")
@@ -244,7 +238,7 @@ final class TranscriptionEngine: ObservableObject {
         }
     }
 
-    private func startRecordingFlow() {
+    func startRecordingFlow() {
         activeTask?.cancel()
         activeTask = nil
         dependencyPresentationTask?.cancel()
@@ -283,6 +277,17 @@ final class TranscriptionEngine: ObservableObject {
                 self.finishFailure(Self.presentation(for: failure))
             }
         }
+    }
+
+    func cancelPendingRecordingStart() {
+        invalidateCurrentSession()
+        transition(
+            to: Presentation(
+                state: .idle,
+                statusText: "Ready. Hold Right Option to record, double-tap to lock"
+            )
+        )
+        logger.notice("Recording start cancelled when right Option was released")
     }
 
     private func continueRecordingAfterPreflight(sessionIdentifier: UUID) {
@@ -334,7 +339,7 @@ final class TranscriptionEngine: ObservableObject {
         guard currentSessionIdentifier == sessionIdentifier else {
             return
         }
-        transition(to: Presentation(state: .starting, statusText: "Starting recording…"))
+        transition(to: Presentation(state: .starting, statusText: "Connecting to microphone…"))
 
         let recordingURL: URL
         do {
@@ -351,41 +356,81 @@ final class TranscriptionEngine: ObservableObject {
                 self?.handleRecorderEvent(event, sessionIdentifier: sessionIdentifier)
             }
             currentRecorder = recorder
-            let started = recorder.start(maximumDuration: maximumDuration)
-            guard started, recorder.isRecording else {
-                currentRecorder = nil
-                if currentSessionIdentifier == sessionIdentifier {
-                    finishFailure("The microphone recorder could not start. Check the selected input device.")
-                }
-                return
-            }
-
-            guard currentSessionIdentifier == sessionIdentifier, state == .starting else {
-                recorder.cancel()
-                return
-            }
-            transition(
-                to: Presentation(
-                    state: .recording,
-                    statusText: "Recording… Press Ctrl+Space to stop"
-                )
-            )
-            _ = textDelivery.updateLiveTranscript("", in: currentSessionTarget)
-            livePreview.start(
-                recordingURL: recordingURL,
-                interval: livePreviewInterval
-            ) { [weak self] text in
-                guard let self,
-                      self.currentSessionIdentifier == sessionIdentifier,
-                      self.state == .recording else {
+            activeTask = Task { @MainActor [weak self, recorder] in
+                let prepared = await recorder.prepare()
+                guard let self else {
+                    recorder.cancel()
                     return
                 }
-                _ = self.textDelivery.updateLiveTranscript(
-                    text,
-                    in: self.currentSessionTarget
+                guard !Task.isCancelled,
+                      self.currentSessionIdentifier == sessionIdentifier,
+                      self.state == .starting else {
+                    recorder.cancel()
+                    return
+                }
+                guard prepared else {
+                    self.activeTask = nil
+                    self.finishFailure(
+                        "The microphone could not become ready. TalkText retried the selected input; check Input and try again."
+                    )
+                    return
+                }
+
+                self.transition(to: Presentation(state: .starting, statusText: "Ready to record…"))
+                await self.recordingReadyCue.play()
+                guard !Task.isCancelled,
+                      self.currentSessionIdentifier == sessionIdentifier,
+                      self.state == .starting else {
+                    recorder.cancel()
+                    return
+                }
+                self.transition(to: Presentation(state: .starting, statusText: "Starting recording…"))
+                let started = await recorder.start(maximumDuration: self.maximumDuration)
+                guard !Task.isCancelled,
+                      self.currentSessionIdentifier == sessionIdentifier,
+                      self.state == .starting else {
+                    recorder.cancel()
+                    return
+                }
+                self.activeTask = nil
+                guard started, recorder.isRecording else {
+                    self.finishFailure(
+                        "The microphone recorder could not start because no audio arrived. TalkText retried the selected input; check Input and try again."
+                    )
+                    return
+                }
+
+                self.transition(
+                    to: Presentation(
+                        state: .recording,
+                        statusText: "Recording… Release or tap Right Option to stop"
+                    )
+                )
+                _ = self.textDelivery.updateLiveTranscript("", in: self.currentSessionTarget)
+                self.livePreview.start(
+                    recordingURL: recordingURL,
+                    interval: self.livePreviewInterval
+                ) { [weak self] text in
+                    guard let self,
+                          self.currentSessionIdentifier == sessionIdentifier,
+                          self.state == .recording,
+                          self.currentRecorderHasAudio else {
+                        return
+                    }
+                    _ = self.textDelivery.updateLiveTranscript(
+                        text,
+                        in: self.currentSessionTarget
+                    )
+                }
+                logger.notice(
+                    "Recording started with verified input; device: \(recorder.inputDeviceName, privacy: .public)"
                 )
             }
-            logger.notice("Recording started")
+        } catch AudioRecorderCreationError.noInputDevice {
+            currentRecorder = nil
+            removeCurrentRecording()
+            finishFailure("No microphone is available. Connect one, then pick it under Input in the TalkText menu.")
+            logger.error("Audio recorder creation found no input device")
         } catch {
             currentRecorder = nil
             removeCurrentRecording()
@@ -394,7 +439,7 @@ final class TranscriptionEngine: ObservableObject {
         }
     }
 
-    private func stopRecordingFlow() {
+    func stopRecordingFlow() {
         guard let sessionIdentifier = currentSessionIdentifier,
               let recorder = currentRecorder else {
             finishFailure("No active recorder was available. Please try again.")
@@ -416,6 +461,9 @@ final class TranscriptionEngine: ObservableObject {
 
             switch outcome {
             case .finished:
+                guard self.confirmCapturedAudio(from: recorder) else {
+                    return
+                }
                 self.beginTranscription(sessionIdentifier: sessionIdentifier)
             case .notRecording, .unsuccessfulCompletion:
                 self.finishFailure("Recording ended unexpectedly. Check the input device and try again.")
@@ -424,7 +472,7 @@ final class TranscriptionEngine: ObservableObject {
             case .encodeError:
                 self.finishFailure("The recording could not be encoded. Check disk space and the input device.")
             case .cancelled:
-                self.finishFailure("Recording was cancelled. Press Ctrl+Space to try again.")
+                self.finishFailure("Recording was cancelled. Hold Right Option to try again.")
             }
         }
     }
@@ -456,20 +504,55 @@ final class TranscriptionEngine: ObservableObject {
             }
         case .interrupted:
             currentRecorder = nil
+            logger.error("Recording was interrupted")
             finishFailure("Recording was interrupted. Check the input device and try again.")
         case .deviceUnavailable:
             currentRecorder = nil
+            logger.error("Recorder reported the input device as unavailable")
             finishFailure("The microphone became unavailable. Reconnect it and try again.")
         case .encodeError:
             currentRecorder = nil
+            logger.error("Recorder reported an encode error")
             finishFailure("The recording could not be encoded. Check disk space and the input device.")
         case .unexpectedCompletion:
             currentRecorder = nil
+            logger.error("Recorder completed unexpectedly")
             finishFailure("Recording ended unexpectedly. Check the input device and try again.")
         default:
             // A stale or duplicate completion cannot advance another transition.
             break
         }
+    }
+
+    private var currentRecorderHasAudio: Bool {
+        guard let currentRecorder else {
+            return false
+        }
+        return currentRecorder.peakLevel > Self.silenceFloor
+    }
+
+    /// A recording that never rose above the silence floor means the wrong input
+    /// was open — usually the built-in microphone while the user speaks into an
+    /// interface. Say so instead of inserting whatever Whisper invents.
+    private func confirmCapturedAudio(from recorder: any AudioRecording) -> Bool {
+        let peak = recorder.peakLevel
+        logger.notice(
+            """
+            Recording finished; device: \(recorder.inputDeviceName, privacy: .public); \
+            peak: \(peak, privacy: .public) dBFS
+            """
+        )
+        guard peak <= Self.silenceFloor else {
+            return true
+        }
+
+        finishFailure(
+            """
+            No sound reached TalkText from \(recorder.inputDeviceName). \
+            Pick the microphone you speak into under Input in the TalkText menu.
+            """
+        )
+        return false
     }
 
     private func beginTranscription(sessionIdentifier: UUID) {
@@ -519,6 +602,7 @@ final class TranscriptionEngine: ObservableObject {
     }
 
     private func invalidateCurrentSession() {
+        recordingReadyCue.stop()
         currentSessionIdentifier = nil
         currentSessionTarget = nil
         livePreview.cleanup()
@@ -535,6 +619,7 @@ final class TranscriptionEngine: ObservableObject {
     }
 
     private func finishFailure(_ presentation: Presentation) {
+        recordingReadyCue.stop()
         livePreview.cleanup()
         textDelivery.cancelLiveTranscript()
         activeTask?.cancel()
@@ -572,79 +657,6 @@ final class TranscriptionEngine: ObservableObject {
         state = presentation.state
         statusText = presentation.statusText
         whisperRecovery = presentation.whisperRecovery
-    }
-
-    private func logTemporaryFileError(operation: StaticString, error: any Error) {
-        let errorType = String(describing: type(of: error))
-        logger.error(
-            "Temporary recording \(operation, privacy: .public) failed; error type: \(errorType, privacy: .public)"
-        )
-    }
-
-    private func logTranscriptionOutcome(_ outcome: TranscriptionOutcome) {
-        switch outcome {
-        case let .success(text):
-            logger.notice("Transcription succeeded; characters: \(text.count, privacy: .public)")
-        case .noSpeech:
-            logger.notice("Transcription succeeded with no speech")
-        case let .missingDependency(dependency):
-            logger.error(
-                "Transcription dependency missing; kind: \(String(describing: dependency), privacy: .public)"
-            )
-        case let .invalidAudio(reason):
-            logger.error(
-                "Transcription rejected invalid audio; reason: \(String(describing: reason), privacy: .public)"
-            )
-        case let .launchFailed(diagnostic):
-            logger.error(
-                "Transcription process launch failed; domain: \(diagnostic.launchErrorDomain ?? "unknown", privacy: .private), code: \(diagnostic.launchErrorCode ?? -1, privacy: .public)"
-            )
-        case let .processFailed(diagnostic):
-            logProcessDiagnostic("failed", diagnostic: diagnostic)
-        case let .timedOut(diagnostic):
-            logProcessDiagnostic("timed out", diagnostic: diagnostic)
-        case let .cancelled(diagnostic):
-            logProcessDiagnostic("cancelled", diagnostic: diagnostic)
-        }
-    }
-
-    private func logProcessDiagnostic(_ outcome: StaticString, diagnostic: ProcessDiagnostic) {
-        logger.error(
-            "Transcription process \(outcome, privacy: .public); reason: \(String(describing: diagnostic.terminationReason), privacy: .public), status: \(diagnostic.terminationStatus ?? -1, privacy: .public), stdout bytes: \(diagnostic.standardOutput.count, privacy: .public), stderr bytes: \(diagnostic.standardError.count, privacy: .public)"
-        )
-    }
-
-    private func dependencyPreflightResult() async -> TalkTextDependencyPreflightResult {
-        if let cachedDependencyPreflight {
-            return cachedDependencyPreflight
-        }
-        if let dependencyPreparationTask {
-            return await dependencyPreparationTask.value
-        }
-
-        let preflight = dependencyPreflight
-        let task = Task {
-            await preflight.preflightDependencies()
-        }
-        dependencyPreparationTask = task
-        let result = await task.value
-        dependencyPreparationTask = nil
-        cachedDependencyPreflight = result
-        logDependencyPreflight(result)
-        return result
-    }
-
-    private func logDependencyPreflight(_ result: TalkTextDependencyPreflightResult) {
-        switch result {
-        case let .ready(preflight):
-            logger.notice(
-                "Dependency preflight ready; \(preflight.diagnosticSummary, privacy: .public); binary: \(preflight.backend.executable.url.path, privacy: .private(mask: .hash)); model: \(preflight.model.url.path, privacy: .private(mask: .hash))"
-            )
-        case let .failure(failure):
-            logger.error(
-                "Dependency preflight failed; category: \(Self.preflightFailureCategory(failure), privacy: .public)"
-            )
-        }
     }
 }
 

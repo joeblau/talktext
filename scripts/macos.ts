@@ -1,4 +1,8 @@
 import { join, resolve } from "node:path";
+import {
+  launchMacApplication,
+  stopMacApplication,
+} from "./macos-app-lifecycle";
 
 const repositoryRoot = resolve(import.meta.dir, "..");
 const packageRoot = join(repositoryRoot, "TalkText");
@@ -24,42 +28,6 @@ async function run(command: string[]) {
   if (exitCode !== 0) {
     throw new Error(`Command failed (${exitCode}): ${command.join(" ")}`);
   }
-}
-
-async function isTalkTextRunning() {
-  const process = Bun.spawn(["/usr/bin/pgrep", "-x", "TalkText"], {
-    stdout: "ignore",
-    stderr: "ignore",
-  });
-  return (await process.exited) === 0;
-}
-
-async function stopRunningApp() {
-  if (!(await isTalkTextRunning())) {
-    return;
-  }
-
-  console.log("==> Stopping the running TalkText app...");
-  const quit = Bun.spawn(
-    [
-      "/usr/bin/osascript",
-      "-e",
-      'tell application id "com.joeblau.talktext" to quit',
-    ],
-    { stdout: "ignore", stderr: "ignore" },
-  );
-  await quit.exited;
-
-  for (let attempt = 0; attempt < 50; attempt += 1) {
-    if (!(await isTalkTextRunning())) {
-      return;
-    }
-    await Bun.sleep(100);
-  }
-
-  throw new Error(
-    "TalkText did not quit. Stop it from the menu bar, then run `bun macos` again.",
-  );
 }
 
 if (process.platform !== "darwin") {
@@ -90,12 +58,18 @@ if (!(await Bun.file(executablePath).exists())) {
   throw new Error(`The build succeeded but TalkText is missing at ${appPath}.`);
 }
 
-await stopRunningApp();
+await stopMacApplication({
+  bundleIdentifier: "com.joeblau.talktext",
+  displayName: "TalkText",
+});
 
 console.log(`==> Launching ${appPath}`);
-await run([
-  "/usr/bin/open",
-  "--env",
-  `TALKTEXT_DEVELOPMENT_ROOT=${repositoryRoot}`,
+await launchMacApplication({
   appPath,
-]);
+  executablePath,
+  executableName: "TalkText",
+  displayName: "TalkText",
+  environment: {
+    TALKTEXT_DEVELOPMENT_ROOT: repositoryRoot,
+  },
+});

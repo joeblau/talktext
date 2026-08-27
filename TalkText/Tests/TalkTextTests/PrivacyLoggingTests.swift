@@ -15,10 +15,10 @@ final class PrivacyLoggingTests: XCTestCase {
         XCTAssertFalse(source.contains("Inserted transcription:"))
     }
 
+    /// Captured process output and clipboard contents may be read and returned,
+    /// but never rendered into a string: interpolation is the only way they can
+    /// reach a log line, a status message, or any other rendered text.
     func testLogsNeverRenderCapturedProcessOrClipboardBodies() throws {
-        let loggerSources = try productionSourceFiles()
-            .map { try String(contentsOf: $0, encoding: .utf8) }
-            .filter { $0.contains("Logger(") }
         let forbiddenLoggerInputs = [
             "standardOutputString",
             "standardErrorString",
@@ -26,9 +26,16 @@ final class PrivacyLoggingTests: XCTestCase {
             "clipboardContents",
         ]
 
-        for source in loggerSources {
+        for url in try productionSourceFiles() {
+            let source = try String(contentsOf: url, encoding: .utf8)
             for forbidden in forbiddenLoggerInputs {
-                XCTAssertFalse(source.contains(forbidden), "Forbidden logging input: \(forbidden)")
+                XCTAssertNil(
+                    source.range(
+                        of: #"\\\([^)]*"# + forbidden,
+                        options: .regularExpression
+                    ),
+                    "Forbidden rendered input in \(url.lastPathComponent): \(forbidden)"
+                )
             }
         }
 
@@ -40,7 +47,7 @@ final class PrivacyLoggingTests: XCTestCase {
     }
 
     func testLoggedResolvedPathsUsePrivateHashMask() throws {
-        let engineSource = try source(named: "TranscriptionEngine.swift")
+        let engineSource = try source(named: "TranscriptionEngineDiagnostics.swift")
         let expression = try NSRegularExpression(pattern: #"\\\([^)]*\.url\.path[^)]*\)"#)
         let matches = expression.matches(
             in: engineSource,
