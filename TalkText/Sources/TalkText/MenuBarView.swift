@@ -4,6 +4,7 @@ import SwiftUI
 struct MenuBarView: View {
     @EnvironmentObject var engine: TranscriptionEngine
     @EnvironmentObject var hotKeyController: HotKeyController
+    @EnvironmentObject var audioInputSelection: AudioInputSelection
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -24,7 +25,7 @@ struct MenuBarView: View {
                     Text(recoveryMessage)
                         .font(.caption)
                 }
-                Button("Retry Ctrl+Space") {
+                Button("Retry Right Option Listener") {
                     hotKeyController.retry()
                 }
             }
@@ -49,10 +50,13 @@ struct MenuBarView: View {
 
             Divider()
 
+            inputDevicePicker
+
+            Divider()
+
             Button(recordButtonTitle) {
                 engine.toggleRecording()
             }
-            .keyboardShortcut(.space, modifiers: .control)
             .disabled(!recordButtonEnabled)
 
             Divider()
@@ -95,6 +99,43 @@ struct MenuBarView: View {
         case .requestingPermission, .starting, .stopping, .transcribing, .delivering:
             false
         }
+    }
+
+    private var inputDevicePicker: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Picker("Input", selection: inputSelectionBinding) {
+                Text(systemDefaultTitle).tag(AudioInputPreference.systemDefault)
+                ForEach(audioInputSelection.devices) { device in
+                    Text(device.name).tag(AudioInputPreference.device(uid: device.uid))
+                }
+            }
+            .pickerStyle(.menu)
+            .disabled(!engine.isInteractive)
+
+            if case let .device(uid) = audioInputSelection.preference,
+               !audioInputSelection.devices.contains(where: { $0.uid == uid }) {
+                Text("That input is disconnected. Recording uses the system default until it returns.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .onAppear {
+            audioInputSelection.refreshDevices()
+        }
+    }
+
+    private var systemDefaultTitle: String {
+        guard case .systemDefault = audioInputSelection.preference else {
+            return "System Default"
+        }
+        return audioInputSelection.selectionSummary
+    }
+
+    private var inputSelectionBinding: Binding<AudioInputPreference> {
+        Binding(
+            get: { audioInputSelection.preference },
+            set: { audioInputSelection.select($0) }
+        )
     }
 
     private func copyToPasteboard(_ text: String) {

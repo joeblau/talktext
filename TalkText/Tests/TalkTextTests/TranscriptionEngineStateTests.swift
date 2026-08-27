@@ -6,6 +6,23 @@ import XCTest
 
 @MainActor
 final class TranscriptionEngineStateTests: XCTestCase {
+    func testRightOptionReleaseDuringPreflightCancelsPendingRecordingStart() async {
+        let preflight = EnginePreflightFake(result: nil)
+        let factory = EngineRecorderFactoryFake()
+        let engine = makeEngine(preflight: preflight, factory: factory)
+
+        engine.startRecording()
+        XCTAssertEqual(engine.state, .starting)
+
+        engine.stopRecording()
+        XCTAssertEqual(engine.state, .idle)
+        XCTAssertEqual(engine.statusText, "Ready. Hold Right Option to record, double-tap to lock")
+
+        preflight.resolve(EngineFixtures.readyPreflightResult)
+        await spinMainActor()
+        XCTAssertEqual(factory.creationCount, 0)
+    }
+
     func testDependenciesArePreflightedBeforePermissionOrRecorderSideEffects() async {
         let preflight = EnginePreflightFake(result: nil)
         let permission = EnginePermissionFake()
@@ -335,7 +352,7 @@ final class TranscriptionEngineStateTests: XCTestCase {
 
         delivery.resolve(.inserted)
         await waitUntil { engine.state == .idle }
-        XCTAssertEqual(engine.statusText, "Inserted! Press Ctrl+Space to record")
+        XCTAssertEqual(engine.statusText, "Inserted! Hold Right Option to record, double-tap to lock")
 
         engine.toggleRecording()
         await waitUntil { engine.state == .recording }
@@ -472,6 +489,7 @@ final class TranscriptionEngineStateTests: XCTestCase {
     private func makeEngine(
         preflight: EnginePreflightFake = EnginePreflightFake(),
         permission: EnginePermissionFake = EnginePermissionFake(),
+        recordingReadyCue: any RecordingReadyCuePlaying = EngineReadyCueFake(),
         factory: EngineRecorderFactoryFake = EngineRecorderFactoryFake(),
         store: EngineFileStoreFake = EngineFileStoreFake(),
         snapshotter: any ActiveRecordingSnapshotting = EngineSnapshotterFake(),
@@ -482,6 +500,7 @@ final class TranscriptionEngineStateTests: XCTestCase {
         TranscriptionEngine(
             permissionProvider: permission,
             recorderFactory: factory,
+            recordingReadyCue: recordingReadyCue,
             recordingFileStore: store,
             recordingSnapshotter: snapshotter,
             dependencyPreflight: preflight,
@@ -664,21 +683,5 @@ private struct EngineAudioValidatorFake: AudioValidating {
 
     func validateAudio(at url: URL) -> AudioValidationResult {
         result
-    }
-}
-
-@MainActor
-private final class EngineHotKeyServiceFake: GlobalHotKeyService {
-    private(set) var uninstallCount = 0
-
-    func install(
-        action: @escaping @MainActor @Sendable () -> Void
-    ) -> Result<Void, HotKeyInstallationError> {
-        .success(())
-    }
-
-    func uninstall() -> Result<Void, HotKeyCleanupError> {
-        uninstallCount += 1
-        return .success(())
     }
 }

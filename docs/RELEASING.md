@@ -48,6 +48,13 @@ bundle and lets CI run strict signature, resource, metadata, entitlement, and
 architecture checks without access to release credentials. It is not a
 distributable or Gatekeeper-trusted signature.
 
+The local `bun talktext` deployment path uses the same bundle assembly and
+verification with `TALKTEXT_SIGNING_MODE=apple-development` when a suitable
+certificate is available. This keeps local TCC permission grants stable across
+rebuilds while remaining distinct from the Developer ID and notarization path
+used for public releases. It falls back to the default ad-hoc mode on machines
+without an Apple Development identity.
+
 `./release.sh` is a separate fail-closed path. It forces Developer ID signing
 with hardened runtime after all executable, plist, and resource changes. It
 then submits a transport zip to Apple's notary service, requires an `Accepted`

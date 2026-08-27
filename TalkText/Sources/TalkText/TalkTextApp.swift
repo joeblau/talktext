@@ -9,6 +9,7 @@ struct TalkTextApp: App {
             MenuBarView()
                 .environmentObject(appDelegate.transcriptionEngine)
                 .environmentObject(appDelegate.hotKeyController)
+                .environmentObject(appDelegate.audioInputSelection)
         } label: {
             MenuBarIcon()
                 .environmentObject(appDelegate.transcriptionEngine)
