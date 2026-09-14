@@ -303,6 +303,24 @@ final class EngineSnapshotterFake: ActiveRecordingSnapshotting, @unchecked Senda
     }
 }
 
+actor EngineGatedSnapshotter: ActiveRecordingSnapshotting {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private(set) var destination: URL?
+
+    func createSnapshot(from sourceURL: URL, at destinationURL: URL) async -> Bool {
+        destination = destinationURL
+        await withCheckedContinuation { continuation = $0 }
+        // Model an atomic write already in flight when cancellation arrives.
+        try? Data("snapshot".utf8).write(to: destinationURL)
+        return true
+    }
+
+    func complete() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
 final class EngineTranscriberFake: WhisperTranscribing, @unchecked Sendable {
     private let lock = NSLock()
     private var outcome: TranscriptionOutcome?

@@ -85,6 +85,8 @@ final class HotKeyController: ObservableObject {
     private let now: @MainActor @Sendable () -> TimeInterval
     private var action: (@MainActor @Sendable (RecordingIntent) -> Void)?
     private var state: GestureState = .idle
+    private var keyIsDown = false
+    private var registrationIdentifier = UUID()
 
     init() {
         service = SystemRightOptionKeyService()
@@ -127,8 +129,10 @@ final class HotKeyController: ObservableObject {
     }
 
     func unregister() {
+        registrationIdentifier = UUID()
         service.uninstall()
         resetGesture()
+        keyIsDown = false
         availability = .unregistered
         action = nil
     }
@@ -148,8 +152,12 @@ final class HotKeyController: ObservableObject {
 
         service.uninstall()
         resetGesture()
+        keyIsDown = false
+        let identifier = UUID()
+        registrationIdentifier = identifier
         switch service.install(action: { [weak self] phase in
-            self?.handle(phase, at: self?.now() ?? 0)
+            guard let self, self.registrationIdentifier == identifier else { return }
+            self.handle(phase, at: self.now())
         }) {
         case .success:
             availability = .registered
@@ -161,6 +169,9 @@ final class HotKeyController: ObservableObject {
     }
 
     private func handle(_ phase: RightOptionKeyPhase, at timestamp: TimeInterval) {
+        let isDown = phase == .pressed
+        guard isDown != keyIsDown else { return }
+        keyIsDown = isDown
         switch phase {
         case .pressed:
             handlePress(at: timestamp)
@@ -261,7 +272,7 @@ final class SystemRightOptionKeyService: GlobalHotKeyService {
         guard let globalMonitor = NSEvent.addGlobalMonitorForEvents(
             matching: .flagsChanged,
             handler: { event in
-                context.handle(modifierFlags: event.modifierFlags)
+                context.handle(keyCode: event.keyCode, modifierFlags: event.modifierFlags)
             }
         ) else {
             return .failure(.monitorRegistrationFailed)
@@ -270,7 +281,7 @@ final class SystemRightOptionKeyService: GlobalHotKeyService {
         guard let localMonitor = NSEvent.addLocalMonitorForEvents(
             matching: .flagsChanged,
             handler: { event in
-                context.handle(modifierFlags: event.modifierFlags)
+                context.handle(keyCode: event.keyCode, modifierFlags: event.modifierFlags)
                 return event
             }
         ) else {
@@ -297,7 +308,7 @@ final class SystemRightOptionKeyService: GlobalHotKeyService {
     }
 }
 
-private final class RightOptionKeyMonitorContext: @unchecked Sendable {
+final class RightOptionKeyMonitorContext: @unchecked Sendable {
     private let lock = NSLock()
     private let action: @MainActor @Sendable (RightOptionKeyPhase) -> Void
     private var rightOptionIsDown = false
@@ -306,7 +317,11 @@ private final class RightOptionKeyMonitorContext: @unchecked Sendable {
         self.action = action
     }
 
-    func handle(modifierFlags: NSEvent.ModifierFlags) {
+    func handle(keyCode: UInt16, modifierFlags: NSEvent.ModifierFlags) {
+        // Other modifier events (including synthetic Command events used for
+        // paste) need not preserve the device-dependent right Option bit.
+        // Only the physical right Option key can change this gesture.
+        guard keyCode == 0x3D else { return }
         let rightOptionIsDown = modifierFlags.rawValue & rightOptionModifierMask != 0
         let phase = lock.withLock { () -> RightOptionKeyPhase? in
             guard rightOptionIsDown != self.rightOptionIsDown else {

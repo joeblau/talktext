@@ -72,27 +72,31 @@ final class LiveTranscriptionPreview {
             return nil
         }
         currentPreviewURL = previewURL
+        // The snapshot writer may finish an atomic write after cleanup removed
+        // its destination. Each pass must clean its own URL on completion, even
+        // if a newer preview session now owns currentPreviewURL.
+        defer {
+            if currentPreviewURL == previewURL { currentPreviewURL = nil }
+            try? recordingFileStore.removeRecording(at: previewURL)
+        }
 
         let snapshotCreated = await recordingSnapshotter.createSnapshot(
             from: recordingURL,
             at: previewURL
         )
         guard !Task.isCancelled, snapshotCreated else {
-            removeCurrentPreview(ifMatching: previewURL)
             return nil
         }
 
         let outcome = await transcriber.transcribe(audioURL: previewURL)
-        removeCurrentPreview(ifMatching: previewURL)
         guard !Task.isCancelled, case let .success(text) = outcome else {
             return nil
         }
         return text
     }
 
-    private func removeCurrentPreview(ifMatching previewURL: URL? = nil) {
-        guard let currentPreviewURL,
-              previewURL == nil || previewURL == currentPreviewURL else {
+    private func removeCurrentPreview() {
+        guard let currentPreviewURL else {
             return
         }
         self.currentPreviewURL = nil

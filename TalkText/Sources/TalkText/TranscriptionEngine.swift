@@ -449,8 +449,10 @@ final class TranscriptionEngine: ObservableObject {
         transition(to: Presentation(state: .stopping, statusText: "Finalizing recording…"))
         let previewTask = livePreview.stop()
         activeTask = Task { @MainActor [weak self, recorder] in
-            await previewTask?.value
             let outcome = await recorder.stop()
+            // Close the microphone promptly on key-up, even when Whisper is
+            // still winding down the last preview subprocess.
+            await previewTask?.value
             guard let self,
                   self.currentSessionIdentifier == sessionIdentifier,
                   self.state == .stopping else {
@@ -478,12 +480,16 @@ final class TranscriptionEngine: ObservableObject {
     }
 
     private func handleRecorderEvent(_ event: RecorderEvent, sessionIdentifier: UUID) {
-        guard currentSessionIdentifier == sessionIdentifier else {
+        guard currentSessionIdentifier == sessionIdentifier,
+              currentRecorder != nil,
+              state == .starting || state == .recording || state == .stopping else {
             return
         }
 
         switch event {
         case .maximumDurationReached where state == .recording:
+            guard let recorder = currentRecorder,
+                  confirmCapturedAudio(from: recorder) else { return }
             currentRecorder = nil
             transition(
                 to: Presentation(
@@ -503,19 +509,15 @@ final class TranscriptionEngine: ObservableObject {
                 self.beginTranscription(sessionIdentifier: sessionIdentifier)
             }
         case .interrupted:
-            currentRecorder = nil
             logger.error("Recording was interrupted")
             finishFailure("Recording was interrupted. Check the input device and try again.")
         case .deviceUnavailable:
-            currentRecorder = nil
             logger.error("Recorder reported the input device as unavailable")
             finishFailure("The microphone became unavailable. Reconnect it and try again.")
         case .encodeError:
-            currentRecorder = nil
             logger.error("Recorder reported an encode error")
             finishFailure("The recording could not be encoded. Check disk space and the input device.")
         case .unexpectedCompletion:
-            currentRecorder = nil
             logger.error("Recorder completed unexpectedly")
             finishFailure("Recording ended unexpectedly. Check the input device and try again.")
         default:
@@ -542,7 +544,7 @@ final class TranscriptionEngine: ObservableObject {
             peak: \(peak, privacy: .public) dBFS
             """
         )
-        guard peak <= Self.silenceFloor else {
+        if peak.isFinite, peak > Self.silenceFloor {
             return true
         }
 

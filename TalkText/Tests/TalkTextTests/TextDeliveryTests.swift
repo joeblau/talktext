@@ -5,6 +5,27 @@ import XCTest
 
 @MainActor
 final class TextDeliveryTests: XCTestCase {
+    func testCancelledFinalizationDoesNotInsertOrTouchClipboard() async {
+        let target = makeTarget(pid: 90)
+        let editor = DeliveryFakeLiveTextEditor()
+        let pasteboard = DeliveryFakePasteboard()
+        let service = makeService(
+            workspace: DeliveryFakeWorkspace(capturedTarget: target, frontmost: target),
+            accessibility: DeliveryFakeAccessibility(insertionOutcome: .inserted),
+            pasteboard: pasteboard,
+            eventPoster: DeliveryFakeEventPoster(),
+            liveTextEditor: editor
+        )
+        let task = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return await service.finalizeLiveTranscript("cancelled", in: target)
+        }
+        let outcome = await task.value
+        XCTAssertEqual(outcome, .cancelled(restoration: nil))
+        XCTAssertTrue(editor.finalizedTexts.isEmpty)
+        XCTAssertTrue(pasteboard.replaceTexts.isEmpty)
+    }
+
     func testLiveDraftAndFinalTranscriptReplaceCapturedCursorText() async {
         let target = makeTarget(pid: 91)
         let workspace = DeliveryFakeWorkspace(capturedTarget: target, frontmost: target)
