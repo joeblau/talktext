@@ -304,7 +304,7 @@ final class SystemAudioRecorder: NSObject, AudioRecording {
         engineHasTap = false
 
         try freshEngine.inputNode.auAudioUnit.setDeviceID(device.deviceID)
-        let hardwareFormat = freshEngine.inputNode.outputFormat(forBus: 0)
+        let hardwareFormat = freshEngine.inputNode.inputFormat(forBus: 0)
         guard hardwareFormat.sampleRate > 0, hardwareFormat.channelCount > 0 else {
             throw AudioRecorderCreationError.inputDeviceUnusable
         }
@@ -331,48 +331,78 @@ final class SystemAudioRecorder: NSObject, AudioRecording {
         requiredBuffers: UInt64,
         timeout: Duration
     ) async -> Bool {
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: timeout)
-        while clock.now < deadline {
-            guard !cancelled, !Task.isCancelled,
-                  configurationGeneration == expectedGeneration,
-                  let engine, engine.isRunning,
-                  sink.pendingErrorDiagnostic == nil else {
-                return false
-            }
-            if sink.receivedBufferCount >= baselineBufferCount + requiredBuffers {
-                return true
-            }
-            do {
-                try await Task.sleep(for: Self.startupPollInterval)
-            } catch {
-                return false
-            }
-        }
-        return false
+        await waitForInput(
+            after: baselineBufferCount,
+            generation: expectedGeneration,
+            requiredBuffers: requiredBuffers,
+            timeout: timeout,
+            requireWrittenAudio: false
+        )
     }
 
     private func waitForWrittenInput(after baselineBufferCount: UInt64) async -> Bool {
-        let generation = configurationGeneration
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: Self.postCueReadinessTimeout)
-        while clock.now < deadline {
-            guard !cancelled, !Task.isCancelled,
-                  configurationGeneration == generation,
-                  let engine, engine.isRunning,
-                  sink.pendingErrorDiagnostic == nil else {
-                return false
-            }
-            if sink.writtenBufferCount > baselineBufferCount {
-                return true
-            }
-            do {
-                try await Task.sleep(for: Self.startupPollInterval)
-            } catch {
-                return false
-            }
+        await waitForInput(
+            after: baselineBufferCount,
+            generation: configurationGeneration,
+            requiredBuffers: 1,
+            timeout: Self.postCueReadinessTimeout,
+            requireWrittenAudio: true
+        )
+    }
+
+    private func waitForInput(
+        after baseline: UInt64,
+        generation: UInt64,
+        requiredBuffers: UInt64,
+        timeout: Duration,
+        requireWrittenAudio: Bool
+    ) async -> Bool {
+        await AudioInputReadiness.wait(
+            after: baseline,
+            generation: generation,
+            requiredBuffers: requiredBuffers,
+            timeout: timeout,
+            pollInterval: Self.startupPollInterval,
+            sample: {
+                AudioInputReadiness.Sample(
+                    generation: self.configurationGeneration,
+                    bufferCount: requireWrittenAudio ? self.sink.writtenBufferCount : self.sink.receivedBufferCount,
+                    isRunning: self.engine?.isRunning == true,
+                    hasError: self.cancelled || self.engine == nil || self.sink.pendingErrorDiagnostic != nil
+                )
+            },
+            restart: { self.restartSettledEngine() }
+        )
+    }
+
+    private func restartSettledEngine() -> Bool {
+        guard !cancelled, !Task.isCancelled,
+              let engine, let activeDevice,
+              inputResolver.resolveInputDevice()?.deviceID == activeDevice.deviceID else {
+            return false
         }
-        return false
+        let format = engine.inputNode.inputFormat(forBus: 0)
+        guard format.sampleRate > 0, format.channelCount > 0 else { return false }
+        // Reusing the I/O unit preserves the Bluetooth input profile. Destroying
+        // it on every notification switches back to playback and starts the
+        // same profile negotiation again on the next attempt.
+        if engineHasTap {
+            engine.inputNode.removeTap(onBus: 0)
+        }
+        let sink = sink
+        engine.inputNode.installTap(onBus: 0, bufferSize: 1024, format: nil) { buffer, _ in
+            sink.append(buffer)
+        }
+        engineHasTap = true
+        do {
+            engine.prepare()
+            try engine.start()
+            recorderLogger.notice("Restarted the existing audio engine after the input route settled")
+            return true
+        } catch {
+            recorderLogger.error("The settled audio engine could not restart")
+            return false
+        }
     }
 
     /// Returns true when another attempt remains and the wait was not cancelled.
@@ -505,7 +535,10 @@ final class SystemAudioRecorder: NSObject, AudioRecording {
             }
 
             self.recovering = true
-            let recovered = await self.openInputWithRetries()
+            var recovered = await self.waitForWrittenInput(after: bufferCountAtNotification)
+            if !recovered, !Task.isCancelled, self.running, !self.cancelled {
+                recovered = await self.openInputWithRetries()
+            }
             self.recovering = false
             self.recoveryTask = nil
             guard self.running, !self.cancelled else {

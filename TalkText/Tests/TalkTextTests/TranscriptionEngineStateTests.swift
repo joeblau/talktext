@@ -199,8 +199,9 @@ final class TranscriptionEngineStateTests: XCTestCase {
         ]
 
         for event in events {
+            let recorder = EngineRecorderFake()
             let store = EngineFileStoreFake()
-            let factory = EngineRecorderFactoryFake()
+            let factory = EngineRecorderFactoryFake(recorders: [recorder])
             let engine = makeEngine(factory: factory, store: store)
             engine.toggleRecording()
             await waitUntil { engine.state == .recording }
@@ -209,6 +210,8 @@ final class TranscriptionEngineStateTests: XCTestCase {
 
             XCTAssertEqual(engine.state, .failed)
             XCTAssertEqual(store.removedURLs.count, 1)
+            XCTAssertFalse(recorder.isRecording)
+            XCTAssertEqual(recorder.cancelCount, 1)
         }
     }
 

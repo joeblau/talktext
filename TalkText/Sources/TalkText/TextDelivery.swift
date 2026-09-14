@@ -431,23 +431,6 @@ final class SystemPasteboardService: PasteboardServing {
 }
 
 @MainActor
-protocol DeliverySleeping: AnyObject {
-    func sleep(for duration: TimeInterval) async -> Bool
-}
-
-@MainActor
-final class SystemDeliverySleeper: DeliverySleeping {
-    func sleep(for duration: TimeInterval) async -> Bool {
-        do {
-            try await Task.sleep(for: .seconds(max(0, duration)))
-            return true
-        } catch {
-            return false
-        }
-    }
-}
-
-@MainActor
 final class TextDeliveryService: TextDelivering {
     private let workspace: any WorkspaceServing
     private let accessibility: any AccessibilityServing
@@ -503,6 +486,9 @@ final class TextDeliveryService: TextDelivering {
     }
 
     func finalizeLiveTranscript(_ text: String, in target: PasteTarget?) async -> DeliveryOutcome {
+        guard !Task.isCancelled else {
+            return .cancelled(restoration: nil)
+        }
         if let target,
            workspace.availability(of: target) == .available,
            accessibility.ensurePermission(prompt: true) {

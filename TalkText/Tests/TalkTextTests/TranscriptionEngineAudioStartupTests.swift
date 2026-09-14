@@ -4,6 +4,41 @@ import XCTest
 
 @MainActor
 final class TranscriptionEngineAudioStartupTests: XCTestCase {
+    func testAutomaticStopRejectsSilentAndInvalidLevels() async {
+        for peak: Float in [-80, -.infinity, .nan, .infinity] {
+            let recorder = EngineRecorderFake()
+            recorder.peakLevel = peak
+            let factory = EngineRecorderFactoryFake(recorders: [recorder])
+            let store = EngineFileStoreFake()
+            let transcriber = EngineTranscriberFake(outcome: .success("hallucination"))
+            let engine = makeEngine(factory: factory, store: store, transcriber: transcriber)
+            engine.startRecording()
+            await waitUntil { engine.state == .recording }
+            factory.emit(.maximumDurationReached)
+            await spinMainActor()
+            XCTAssertEqual(engine.state, .failed)
+            XCTAssertEqual(transcriber.invocationCount, 0)
+            XCTAssertEqual(store.removedURLs, store.allocatedURLs)
+        }
+    }
+
+    func testLateRecorderErrorsCannotCancelFinalTranscription() async {
+        let factory = EngineRecorderFactoryFake()
+        let transcriber = EngineTranscriberFake(outcome: nil)
+        let delivery = EngineDeliveryFake()
+        let engine = makeEngine(factory: factory, transcriber: transcriber, delivery: delivery)
+        engine.startRecording()
+        await waitUntil { engine.state == .recording }
+        engine.stopRecording()
+        await waitUntil { engine.state == .transcribing && transcriber.invocationCount == 1 }
+        factory.emit(.deviceUnavailable)
+        factory.emit(.unexpectedCompletion)
+        XCTAssertEqual(engine.state, .transcribing)
+        transcriber.resolve(.success("Finished transcript"))
+        await waitUntil { engine.state == .idle }
+        XCTAssertEqual(delivery.finalizedTexts, ["Finished transcript"])
+    }
+
     func testRightOptionStartAndStopIntentsRecordAndTranscribe() async {
         let recorder = EngineRecorderFake()
         let engine = makeEngine(

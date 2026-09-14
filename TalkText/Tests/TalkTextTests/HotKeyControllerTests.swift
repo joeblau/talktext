@@ -1,8 +1,64 @@
+import AppKit
 import XCTest
 @testable import TalkText
 
 @MainActor
 final class HotKeyControllerTests: XCTestCase {
+    func testDuplicateSecondPressDoesNotStopLatchedRecording() {
+        let harness = Harness(start: 10)
+        harness.service.send(.pressed)
+        harness.service.send(.released)
+        harness.service.send(.pressed)
+        harness.service.send(.pressed)
+        harness.service.send(.released)
+        XCTAssertEqual(harness.intents, [.start])
+    }
+
+    func testSessionEndWhileHeldRequiresReleaseBeforeAnotherStart() {
+        let harness = Harness(start: 10)
+        harness.service.send(.pressed)
+        harness.timer.fire()
+        harness.controller.recordingSessionDidEnd()
+        harness.service.send(.pressed)
+        harness.timer.fire()
+        XCTAssertEqual(harness.intents, [.start])
+        harness.service.send(.released)
+        harness.service.send(.pressed)
+        harness.timer.fire()
+        XCTAssertEqual(harness.intents, [.start, .start])
+    }
+
+    func testUnrelatedModifierEventsCannotReleaseHeldRightOption() async {
+        var phases: [RightOptionKeyPhase] = []
+        let context = RightOptionKeyMonitorContext { phases.append($0) }
+        let rightOptionFlags = NSEvent.ModifierFlags(rawValue: NSEvent.ModifierFlags.option.rawValue | 0x40)
+        context.handle(keyCode: 0x3D, modifierFlags: rightOptionFlags)
+        context.handle(keyCode: 0x37, modifierFlags: .command)
+        context.handle(keyCode: 0x37, modifierFlags: [])
+        context.handle(keyCode: 0x38, modifierFlags: .shift)
+        context.handle(keyCode: 0x3A, modifierFlags: .option)
+        await drainMainQueue()
+        XCTAssertEqual(phases, [.pressed])
+        context.handle(keyCode: 0x3D, modifierFlags: [])
+        await drainMainQueue()
+        XCTAssertEqual(phases, [.pressed, .released])
+    }
+
+    func testRightOptionReleaseIsRecognizedWhileLeftOptionRemainsHeld() async {
+        var phases: [RightOptionKeyPhase] = []
+        let context = RightOptionKeyMonitorContext { phases.append($0) }
+        context.handle(keyCode: 0x3D, modifierFlags: NSEvent.ModifierFlags(rawValue: NSEvent.ModifierFlags.option.rawValue | 0x40))
+        context.handle(keyCode: 0x3D, modifierFlags: .option)
+        await drainMainQueue()
+        XCTAssertEqual(phases, [.pressed, .released])
+    }
+
+    private func drainMainQueue() async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+    }
+
     func testSingleTapDoesNothing() {
         let harness = Harness(start: 10)
 
