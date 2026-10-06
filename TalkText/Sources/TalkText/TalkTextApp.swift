@@ -13,30 +13,16 @@ struct TalkTextApp: App {
         } label: {
             MenuBarIcon()
                 .environmentObject(appDelegate.transcriptionEngine)
-                .environmentObject(appDelegate.hotKeyController)
         }
+        .menuBarExtraStyle(.menu)
     }
 }
 
 struct MenuBarIcon: View {
     @EnvironmentObject var engine: TranscriptionEngine
-    @EnvironmentObject var hotKeyController: HotKeyController
 
     var body: some View {
-        switch engine.state {
-        case .failed:
-            Image(systemName: "exclamationmark.triangle")
-        case .idle:
-            if hotKeyController.availability.isRegistered {
-                Image(systemName: "waveform")
-            } else {
-                Image(systemName: "exclamationmark.triangle")
-            }
-        case .recording:
-            Image(systemName: "mic.fill")
-                .accessibilityLabel("Microphone on")
-        case .requestingPermission, .starting, .stopping, .transcribing, .delivering:
-            Image(systemName: "ellipsis.circle")
-        }
+        Image(systemName: engine.state == .recording ? "mic.fill" : "waveform")
+            .accessibilityLabel(engine.state == .recording ? "Recording" : "TalkText")
     }
 }

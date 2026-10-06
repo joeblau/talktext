@@ -70,7 +70,7 @@ protocol AudioRecording: AnyObject {
     var isRecording: Bool { get }
     /// Loudest sample captured so far in dBFS, or `-.infinity` before any audio
     /// arrives. The engine uses this to tell silence apart from speech instead
-    /// of trusting Whisper, which hallucinates words for silent input.
+    /// of trusting a recognizer to classify silent input.
     var peakLevel: Float { get }
     /// The input the session actually opened, for status text and logging.
     var inputDeviceName: String { get }
@@ -79,7 +79,7 @@ protocol AudioRecording: AnyObject {
     /// route has settled without becoming part of the recording.
     func prepare() async -> Bool
     /// Enables file capture and returns only after a post-cue buffer reaches the
-    /// WAV. `AVAudioEngine.start()` alone is not a readiness guarantee on macOS.
+    /// WAV. Starting an audio unit alone is not a readiness guarantee on macOS.
     func start(maximumDuration: TimeInterval) async -> Bool
     func stop() async -> RecorderStopOutcome
     func cancel()
@@ -328,140 +328,53 @@ struct RecordedAudioValidator: AudioValidating, @unchecked Sendable {
     }
 }
 
-enum MissingWhisperDependency: Equatable, Sendable {
-    case binary
-    case model
-}
+struct TranscriptionDiagnostic: Equatable, Sendable {
+    let domain: String
+    let code: Int
 
-struct ResolvedWhisperDependencies: Equatable, Sendable {
-    let binaryURL: URL
-    let modelURL: URL
-}
+    init(error: any Error) {
+        let error = error as NSError
+        domain = error.domain
+        code = error.code
+    }
 
-enum WhisperDependencyResolution: Equatable, Sendable {
-    case resolved(ResolvedWhisperDependencies)
-    case missing(MissingWhisperDependency)
-}
-
-protocol WhisperDependencyResolving: Sendable {
-    func resolveDependencies() -> WhisperDependencyResolution
-}
-
-protocol WhisperDependencyPreflighting: Sendable {
-    func preflightDependencies() async -> TalkTextDependencyPreflightResult
-}
-
-extension TalkTextDependencyResolver: WhisperDependencyPreflighting {
-    func preflightDependencies() async -> TalkTextDependencyPreflightResult {
-        await Task.detached(priority: .utility) {
-            preflight()
-        }.value
+    init(domain: String, code: Int) {
+        self.domain = domain
+        self.code = code
     }
 }
 
 enum TranscriptionOutcome: Equatable, Sendable {
     case success(String)
     case noSpeech
-    case missingDependency(MissingWhisperDependency)
+    case modelUnavailable(TalkTextDependencyPreflightFailure)
     case invalidAudio(AudioValidationFailure)
-    case launchFailed(ProcessDiagnostic)
-    case processFailed(ProcessDiagnostic)
-    case timedOut(ProcessDiagnostic)
-    case cancelled(ProcessDiagnostic)
+    case inferenceFailed(TranscriptionDiagnostic)
+    case cancelled
 }
 
-protocol WhisperTranscribing: Sendable {
+protocol TranscriptionPreflighting: Sendable {
+    func preflightDependencies() async -> TalkTextDependencyPreflightResult
+}
+
+protocol LiveSpeechSession: Sendable {
+    func transcribeNewAudio(at snapshotURL: URL) async -> String?
+    func cancel() async
+}
+
+protocol SpeechTranscribing: Sendable {
     func transcribe(audioURL: URL) async -> TranscriptionOutcome
-    func terminateActiveTranscriptions()
+    func makeLiveSession() async -> (any LiveSpeechSession)?
+    func cancelActiveTranscriptions()
 }
 
-extension WhisperTranscribing {
-    /// Transcribers that own no external process have nothing to terminate.
-    func terminateActiveTranscriptions() {}
-}
-
-struct WhisperTranscriber: WhisperTranscribing {
-    let dependencyResolver: any WhisperDependencyResolving
-    let audioValidator: any AudioValidating
-    let processRunner: any AsyncProcessRunning
-    let timeout: TimeInterval
-
-    init(
-        dependencyResolver: any WhisperDependencyResolving = TalkTextDependencyResolver(),
-        audioValidator: any AudioValidating = RecordedAudioValidator(),
-        processRunner: any AsyncProcessRunning = FoundationProcessRunner(),
-        timeout: TimeInterval = 180
-    ) {
-        self.dependencyResolver = dependencyResolver
-        self.audioValidator = audioValidator
-        self.processRunner = processRunner
-        self.timeout = timeout
-    }
-
-    func transcribe(audioURL: URL) async -> TranscriptionOutcome {
-        let audioValidator = audioValidator
-        let dependencyResolver = dependencyResolver
-        async let audioValidation = Task.detached(priority: .utility) {
-            audioValidator.validateAudio(at: audioURL)
-        }.value
-        async let dependencyResolution = Task.detached(priority: .utility) {
-            dependencyResolver.resolveDependencies()
-        }.value
-
-        switch await audioValidation {
-        case let .invalid(failure):
-            return .invalidAudio(failure)
-        case .valid:
-            break
-        }
-
-        let dependencies: ResolvedWhisperDependencies
-        switch await dependencyResolution {
-        case let .missing(dependency):
-            return .missingDependency(dependency)
-        case let .resolved(resolvedDependencies):
-            dependencies = resolvedDependencies
-        }
-
-        let command = ProcessCommand(
-            executableURL: dependencies.binaryURL,
-            arguments: WhisperBackendContract.productionArguments(
-                modelURL: dependencies.modelURL,
-                audioURL: audioURL
-            )
-        )
-
-        let result = await processRunner.run(command, timeout: timeout)
-        switch result {
-        case let .launchFailed(diagnostic):
-            return .launchFailed(diagnostic)
-        case let .timedOut(diagnostic):
-            return .timedOut(diagnostic)
-        case let .cancelled(diagnostic):
-            return .cancelled(diagnostic)
-        case let .completed(diagnostic):
-            guard diagnostic.exitedSuccessfully else {
-                return .processFailed(diagnostic)
-            }
-            guard let output = diagnostic.standardOutputString else {
-                return .processFailed(diagnostic)
-            }
-
-            let cleaned = TranscriptOutputClassifier.clean(output)
-            return cleaned.isEmpty ? .noSpeech : .success(cleaned)
-        }
-    }
-
-    func terminateActiveTranscriptions() {
-        processRunner.terminateActiveProcesses()
-    }
+extension SpeechTranscribing {
+    func makeLiveSession() async -> (any LiveSpeechSession)? { nil }
+    func cancelActiveTranscriptions() {}
 }
 
 enum TranscriptOutputClassifier {
     static func clean(_ output: String) -> String {
-        output
-            .replacingOccurrences(of: "[BLANK_AUDIO]", with: "", options: .caseInsensitive)
-            .replacingOccurrences(of: "(blank audio)", with: "", options: .caseInsensitive)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        output.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

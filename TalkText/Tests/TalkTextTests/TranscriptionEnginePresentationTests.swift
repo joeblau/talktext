@@ -4,136 +4,40 @@ import XCTest
 
 @MainActor
 final class TranscriptionEnginePresentationTests: XCTestCase {
-    func testMissingWhisperOffersCopyableInstallCommand() {
-        let presentation = TranscriptionEngine.presentation(
-            for: .missingBinary(searchedPaths: [])
-        )
-
-        XCTAssertEqual(presentation.state, .failed)
-        XCTAssertEqual(
-            presentation.whisperRecovery,
-            .install
-        )
-        XCTAssertEqual(
-            presentation.whisperRecovery?.command,
-            "brew install whisper-cpp"
-        )
-    }
-
-    func testBrokenWhisperOffersCopyableReinstallCommand() {
-        let brokenBackendFailures: [TalkTextDependencyPreflightFailure] = [
-            .backendProbeFailed(path: "/usr/local/bin/whisper-cli"),
-            .backendMissingOptions(
-                path: "/usr/local/bin/whisper-cli",
-                options: ["--threads"]
-            ),
-            .backendVersionUnreported(path: "/usr/local/bin/whisper-cli"),
+    func testModelFailuresOfferSetupRecoveryWithoutAnExternalBackendInstall() {
+        let failures: [TalkTextDependencyPreflightFailure] = [
+            .missingModel(searchedPaths: []),
+            .invalidModel(path: "/fixture", reason: "incomplete"),
+            .modelLoadFailed(TranscriptionDiagnostic(domain: "CoreML", code: 1)),
         ]
-
-        for failure in brokenBackendFailures {
+        for failure in failures {
             let presentation = TranscriptionEngine.presentation(for: failure)
             XCTAssertEqual(presentation.state, .failed)
-            XCTAssertEqual(presentation.whisperRecovery, .reinstall)
-            XCTAssertEqual(
-                presentation.whisperRecovery?.command,
-                "brew reinstall whisper-cpp"
-            )
-        }
-    }
-
-    func testUnsupportedVersionDoesNotOfferAReinstallThatChangesNothing() {
-        let presentation = TranscriptionEngine.presentation(
-            for: .unsupportedBackendVersion(
-                path: "/opt/homebrew/bin/whisper-cli",
-                version: "9.9.9",
-                supported: WhisperBackendContract.supportedVersions
-            )
-        )
-
-        XCTAssertEqual(presentation.state, .failed)
-        XCTAssertNil(presentation.whisperRecovery)
-        XCTAssertTrue(presentation.statusText.contains("1.9.2"))
-    }
-
-    func testModelFailureDoesNotSuggestReinstallingWhisper() {
-        let presentation = TranscriptionEngine.presentation(
-            for: .missingModel(searchedPaths: [])
-        )
-
-        XCTAssertNil(presentation.whisperRecovery)
-    }
-
-    func testEveryTranscriptionOutcomeMapsToDistinctActionablePresentation() {
-        let exitFailure = ProcessDiagnostic(
-            terminationStatus: 12,
-            terminationReason: .exit,
-            standardError: Data("not user visible".utf8)
-        )
-        let signalFailure = ProcessDiagnostic(
-            terminationStatus: SIGTERM,
-            terminationReason: .uncaughtSignal
-        )
-        let cases: [(TranscriptionOutcome, TranscriptionEngine.State, String)] = [
-            (.success("text"), .delivering, "Delivering"),
-            (.noSpeech, .idle, "No speech detected"),
-            (.missingDependency(.binary), .failed, "whisper-cli is missing"),
-            (.missingDependency(.model), .failed, "model is missing"),
-            (.invalidAudio(.missing), .failed, "recording is empty"),
-            (.invalidAudio(.empty), .failed, "recording is empty"),
-            (.invalidAudio(.unreadableFormat), .failed, "recording is unreadable"),
-            (.invalidAudio(.tooShort(duration: 0.01)), .failed, "too short"),
-            (.invalidAudio(.tooLong(duration: 999)), .failed, "duration limit"),
-            (
-                .launchFailed(
-                    ProcessDiagnostic(
-                        launchErrorDomain: NSPOSIXErrorDomain,
-                        launchErrorCode: Int(ENOENT)
-                    )
-                ),
-                .failed,
-                "start whisper-cli"
-            ),
-            (.processFailed(exitFailure), .failed, "exit 12"),
-            (.processFailed(signalFailure), .failed, "interrupted"),
-            (.timedOut(signalFailure), .failed, "timed out"),
-            (.cancelled(signalFailure), .failed, "cancelled"),
-        ]
-
-        for (outcome, expectedState, expectedText) in cases {
-            let presentation = TranscriptionEngine.presentation(for: outcome)
-            XCTAssertEqual(presentation.state, expectedState)
-            XCTAssertTrue(
-                presentation.statusText.localizedCaseInsensitiveContains(expectedText),
-                "Missing \(expectedText) in \(presentation.statusText)"
-            )
+            XCTAssertEqual(presentation.modelRecovery, .setup)
+            XCTAssertEqual(presentation.modelRecovery?.command, "./setup.sh")
+            XCTAssertTrue(presentation.statusText.contains("Parakeet"))
         }
     }
 
     func testNoSpeechMessageIsReservedForSuccessfulEmptyOutput() {
-        let diagnostic = ProcessDiagnostic(
-            terminationStatus: 1,
-            terminationReason: .exit
-        )
         let failures: [TranscriptionOutcome] = [
-            .missingDependency(.binary),
-            .missingDependency(.model),
+            .modelUnavailable(.missingModel(searchedPaths: [])),
             .invalidAudio(.empty),
-            .launchFailed(ProcessDiagnostic(launchErrorDomain: NSPOSIXErrorDomain, launchErrorCode: 2)),
-            .processFailed(diagnostic),
-            .timedOut(diagnostic),
-            .cancelled(diagnostic),
+            .inferenceFailed(TranscriptionDiagnostic(domain: "CoreML", code: 1)),
+            .cancelled,
         ]
-
-        XCTAssertTrue(
-            TranscriptionEngine.presentation(for: .noSpeech)
-                .statusText.contains("No speech detected")
-        )
+        XCTAssertTrue(TranscriptionEngine.presentation(for: .noSpeech).statusText.contains("No speech detected"))
         for failure in failures {
-            XCTAssertFalse(
-                TranscriptionEngine.presentation(for: failure)
-                    .statusText.contains("No speech detected")
-            )
+            XCTAssertEqual(TranscriptionEngine.presentation(for: failure).state, .failed)
+            XCTAssertFalse(TranscriptionEngine.presentation(for: failure).statusText.contains("No speech detected"))
         }
+    }
+
+    func testUnsupportedHardwareExplainsRequirementWithoutOfferingModelSetup() {
+        let presentation = TranscriptionEngine.presentation(for: TalkTextDependencyPreflightFailure.unsupportedHardware)
+        XCTAssertEqual(presentation.state, .failed)
+        XCTAssertNil(presentation.modelRecovery)
+        XCTAssertTrue(presentation.statusText.contains("Apple Silicon"))
     }
 
     func testEveryDeliveryOutcomeMapsFinalResultRatherThanScheduledWork() {
@@ -146,6 +50,7 @@ final class TranscriptionEnginePresentationTests: XCTestCase {
             .eventPermissionDenied,
             .activationFailed,
             .eventPostFailed,
+            .liveDraftChanged,
         ]
 
         XCTAssertEqual(

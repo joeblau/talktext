@@ -51,8 +51,8 @@ final class TranscriptionEngineStateTests: XCTestCase {
     }
 
     func testPreflightFailureIsActionableAndFailsBeforeMicrophonePermission() async {
-        let failure = TalkTextDependencyPreflightFailure.missingBinary(
-            searchedPaths: ["/private/fixture/whisper-cli"]
+        let failure = TalkTextDependencyPreflightFailure.missingModel(
+            searchedPaths: ["/private/fixture/parakeet"]
         )
         let preflight = EnginePreflightFake(result: .failure(failure))
         let permission = EnginePermissionFake()
@@ -68,8 +68,8 @@ final class TranscriptionEngineStateTests: XCTestCase {
         engine.toggleRecording()
         await waitUntil { engine.state == .failed }
 
-        XCTAssertTrue(engine.statusText.contains("whisper-cli"))
-        XCTAssertEqual(engine.whisperRecovery, .install)
+        XCTAssertTrue(engine.statusText.contains("Parakeet"))
+        XCTAssertEqual(engine.modelRecovery, .setup)
         XCTAssertEqual(permission.statusCallCount, 0)
         XCTAssertEqual(factory.creationCount, 0)
         XCTAssertEqual(store.allocatedURLs.count, 0)
@@ -297,6 +297,7 @@ final class TranscriptionEngineStateTests: XCTestCase {
         )
         let store = EngineFileStoreFake()
         let delivery = EngineDeliveryFake()
+        delivery.liveUpdateResult = false
         let engine = makeEngine(
             store: store,
             snapshotter: snapshotter,
@@ -366,19 +367,12 @@ final class TranscriptionEngineStateTests: XCTestCase {
     }
 
     func testEveryTranscriptionTerminalOutcomeCleansRecording() async {
-        let diagnostic = ProcessDiagnostic(
-            terminationStatus: 3,
-            terminationReason: .exit,
-            standardError: Data("diagnostic".utf8)
-        )
         let outcomes: [(TranscriptionOutcome, TranscriptionEngine.State)] = [
             (.noSpeech, .idle),
-            (.missingDependency(.binary), .failed),
+            (.modelUnavailable(.missingModel(searchedPaths: [])), .failed),
             (.invalidAudio(.empty), .failed),
-            (.launchFailed(ProcessDiagnostic(launchErrorDomain: NSPOSIXErrorDomain, launchErrorCode: 2)), .failed),
-            (.processFailed(diagnostic), .failed),
-            (.timedOut(diagnostic), .failed),
-            (.cancelled(diagnostic), .failed),
+            (.inferenceFailed(TranscriptionDiagnostic(domain: "test", code: 3)), .failed),
+            (.cancelled, .failed),
         ]
 
         for (outcome, expectedState) in outcomes {
@@ -440,53 +434,22 @@ final class TranscriptionEngineStateTests: XCTestCase {
         }
     }
 
-    func testApplicationTerminationDuringTranscriptionSynchronouslyKillsSIGTERMIgnoringChild() async throws {
-        let fixtureDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("TalkText-EngineTermination-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(
-            at: fixtureDirectory,
-            withIntermediateDirectories: true
-        )
-        defer { try? FileManager.default.removeItem(at: fixtureDirectory) }
-        let processPIDFile = fixtureDirectory.appendingPathComponent("whisper.pid")
-        let executable = try makeSIGTERMIgnoringExecutable(
-            in: fixtureDirectory,
-            processPIDFile: processPIDFile
-        )
-        let dependencies = ResolvedWhisperDependencies(
-            binaryURL: executable,
-            modelURL: fixtureDirectory.appendingPathComponent("model.bin")
-        )
-        let processRunner = FoundationProcessRunner(terminationGracePeriod: 30)
-        let transcriber = WhisperTranscriber(
-            dependencyResolver: EngineDependencyResolverFake(result: .resolved(dependencies)),
-            audioValidator: EngineAudioValidatorFake(result: .valid(duration: 1)),
-            processRunner: processRunner,
-            timeout: 30
-        )
+    func testApplicationTerminationCancelsNativeTranscriptionAndUninstallsHotkey() async {
+        let transcriber = EngineTranscriberFake(outcome: nil)
         let store = EngineFileStoreFake()
         let engine = makeEngine(store: store, transcriber: transcriber)
         let hotKeyService = EngineHotKeyServiceFake()
-        let hotKeyController = HotKeyController(service: hotKeyService)
-        let appDelegate = AppDelegate(
-            transcriptionEngine: engine,
-            hotKeyController: hotKeyController
-        )
+        let delegate = AppDelegate(transcriptionEngine: engine, hotKeyController: HotKeyController(service: hotKeyService))
         engine.toggleRecording()
         await waitUntil { engine.state == .recording }
         engine.toggleRecording()
         await waitUntil { engine.state == .transcribing }
-        let processIdentifier = try await waitForProcessIdentifier(from: processPIDFile)
-
-        appDelegate.applicationWillTerminate(
-            Notification(name: NSApplication.willTerminateNotification)
-        )
-
-        XCTAssertEqual(Darwin.kill(processIdentifier, 0), -1)
-        XCTAssertEqual(errno, ESRCH)
+        delegate.applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
+        XCTAssertEqual(transcriber.synchronousCancellationCount, 1)
         XCTAssertEqual(store.removedURLs, store.allocatedURLs)
-        XCTAssertEqual(store.instanceCleanupCount, 1)
         XCTAssertEqual(hotKeyService.uninstallCount, 1)
+        transcriber.resolve(.cancelled)
+        await spinMainActor()
     }
 
     private func makeEngine(
@@ -496,7 +459,7 @@ final class TranscriptionEngineStateTests: XCTestCase {
         factory: EngineRecorderFactoryFake = EngineRecorderFactoryFake(),
         store: EngineFileStoreFake = EngineFileStoreFake(),
         snapshotter: any ActiveRecordingSnapshotting = EngineSnapshotterFake(),
-        transcriber: any WhisperTranscribing = EngineTranscriberFake(),
+        transcriber: any SpeechTranscribing = EngineTranscriberFake(),
         delivery: EngineDeliveryFake = EngineDeliveryFake(),
         livePreviewInterval: TimeInterval = 1.5
     ) -> TranscriptionEngine {
@@ -504,6 +467,7 @@ final class TranscriptionEngineStateTests: XCTestCase {
             permissionProvider: permission,
             recorderFactory: factory,
             recordingReadyCue: recordingReadyCue,
+            recordingStoppedCue: EngineStoppedCueFake(),
             recordingFileStore: store,
             recordingSnapshotter: snapshotter,
             dependencyPreflight: preflight,
@@ -587,7 +551,7 @@ final class TranscriptionEngineStateTests: XCTestCase {
             line: line
         )
         XCTAssertEqual(
-            transcriber.synchronousTerminationCount,
+            transcriber.synchronousCancellationCount,
             action == .terminateApplication ? 1 : 0,
             file: file,
             line: line
@@ -597,45 +561,6 @@ final class TranscriptionEngineStateTests: XCTestCase {
             delivery.resolve(.inserted)
             await spinMainActor()
         }
-    }
-
-    private func makeSIGTERMIgnoringExecutable(
-        in directory: URL,
-        processPIDFile: URL
-    ) throws -> URL {
-        let executable = directory.appendingPathComponent("whisper-cli")
-        let script = """
-        #!/bin/sh
-        set -eu
-        trap '' TERM
-        printf '%s' "$$" > '\(processPIDFile.path)'
-        while :; do :; done
-        """
-        try script.write(to: executable, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: NSNumber(value: Int16(0o700))],
-            ofItemAtPath: executable.path
-        )
-        return executable
-    }
-
-    private func readProcessIdentifier(from url: URL) throws -> pid_t {
-        let value = try String(contentsOf: url, encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let processIdentifier = pid_t(value) else {
-            throw CocoaError(.fileReadCorruptFile)
-        }
-        return processIdentifier
-    }
-
-    private func waitForProcessIdentifier(from url: URL) async throws -> pid_t {
-        for _ in 0..<200 {
-            if let processIdentifier = try? readProcessIdentifier(from: url) {
-                return processIdentifier
-            }
-            try await Task.sleep(for: .milliseconds(10))
-        }
-        throw CocoaError(.fileReadNoSuchFile)
     }
 
     private func waitUntil(
@@ -670,21 +595,5 @@ final class TranscriptionEngineStateTests: XCTestCase {
             try? await Task.sleep(for: .milliseconds(10))
         }
         XCTFail("Condition was not reached", file: file, line: line)
-    }
-}
-
-private struct EngineDependencyResolverFake: WhisperDependencyResolving {
-    let result: WhisperDependencyResolution
-
-    func resolveDependencies() -> WhisperDependencyResolution {
-        result
-    }
-}
-
-private struct EngineAudioValidatorFake: AudioValidating {
-    let result: AudioValidationResult
-
-    func validateAudio(at url: URL) -> AudioValidationResult {
-        result
     }
 }

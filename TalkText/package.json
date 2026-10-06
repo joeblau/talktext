@@ -2,7 +2,6 @@
   "name": "talktext-swift-package",
   "private": true,
   "scripts": {
-    "macos": "bun run ../scripts/macos.ts",
     "talktext": "bun run ../scripts/talktext.ts"
   }
 }

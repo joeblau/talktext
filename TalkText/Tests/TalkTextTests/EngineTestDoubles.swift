@@ -49,7 +49,21 @@ final class EngineReadyCueFake: RecordingReadyCuePlaying {
     }
 }
 
-final class EnginePreflightFake: WhisperDependencyPreflighting, @unchecked Sendable {
+@MainActor
+final class EngineStoppedCueFake: RecordingStoppedCuePlaying {
+    private(set) var playCount = 0
+    private(set) var stopCount = 0
+    var onPlay: (() -> Void)?
+
+    func play() {
+        playCount += 1
+        onPlay?()
+    }
+
+    func stop() { stopCount += 1 }
+}
+
+final class EnginePreflightFake: TranscriptionPreflighting, @unchecked Sendable {
     private let lock = NSLock()
     private var result: TalkTextDependencyPreflightResult?
     private var continuation: CheckedContinuation<TalkTextDependencyPreflightResult, Never>?
@@ -321,13 +335,13 @@ actor EngineGatedSnapshotter: ActiveRecordingSnapshotting {
     }
 }
 
-final class EngineTranscriberFake: WhisperTranscribing, @unchecked Sendable {
+final class EngineTranscriberFake: SpeechTranscribing, @unchecked Sendable {
     private let lock = NSLock()
     private var outcome: TranscriptionOutcome?
     private var continuation: CheckedContinuation<TranscriptionOutcome, Never>?
     private var cancelled = false
     private(set) var invocationCount = 0
-    private(set) var synchronousTerminationCount = 0
+    private(set) var synchronousCancellationCount = 0
 
     init(outcome: TranscriptionOutcome? = .noSpeech) {
         self.outcome = outcome
@@ -350,7 +364,7 @@ final class EngineTranscriberFake: WhisperTranscribing, @unchecked Sendable {
                     continuation.resume(returning: outcome)
                 } else if cancelled || Task.isCancelled {
                     lock.unlock()
-                    continuation.resume(returning: .cancelled(EngineFixtures.emptyDiagnostic))
+                    continuation.resume(returning: .cancelled)
                 } else {
                     self.continuation = continuation
                     lock.unlock()
@@ -371,9 +385,9 @@ final class EngineTranscriberFake: WhisperTranscribing, @unchecked Sendable {
         continuation?.resume(returning: outcome)
     }
 
-    func terminateActiveTranscriptions() {
+    func cancelActiveTranscriptions() {
         lock.lock()
-        synchronousTerminationCount += 1
+        synchronousCancellationCount += 1
         lock.unlock()
         resolveCancellation()
     }
@@ -385,11 +399,11 @@ final class EngineTranscriberFake: WhisperTranscribing, @unchecked Sendable {
         continuation = self.continuation
         self.continuation = nil
         lock.unlock()
-        continuation?.resume(returning: .cancelled(EngineFixtures.emptyDiagnostic))
+        continuation?.resume(returning: .cancelled)
     }
 }
 
-final class EngineSequencedTranscriberFake: WhisperTranscribing, @unchecked Sendable {
+final class EngineSequencedTranscriberFake: SpeechTranscribing, @unchecked Sendable {
     private let lock = NSLock()
     private var outcomes: [TranscriptionOutcome]
     private var _audioURLs: [URL] = []
@@ -435,7 +449,7 @@ final class EngineDeliveryFake: TextDelivering {
         return capturedTarget
     }
 
-    func updateLiveTranscript(_ text: String, in target: PasteTarget?) -> Bool {
+    func updateLiveTranscript(_ text: String, in target: PasteTarget?) async -> Bool {
         liveUpdatedTexts.append(text)
         return liveUpdateResult
     }
@@ -469,24 +483,9 @@ final class EngineDeliveryFake: TextDelivering {
 }
 
 enum EngineFixtures {
-    static let emptyDiagnostic = ProcessDiagnostic(
-        terminationStatus: 0,
-        terminationReason: .exit
+    static let readyPreflightResult: TalkTextDependencyPreflightResult = .ready(
+        TalkTextDependencyPreflight(model: ResolvedDependencyPath(
+            url: URL(fileURLWithPath: "/fixture/parakeet-models"), source: .bundled
+        ))
     )
-
-    static let readyPreflightResult: TalkTextDependencyPreflightResult = {
-        let binary = URL(fileURLWithPath: "/fixture/whisper-cli")
-        let model = URL(fileURLWithPath: "/fixture/model.bin")
-        return .ready(
-            TalkTextDependencyPreflight(
-                dependencies: ResolvedWhisperDependencies(binaryURL: binary, modelURL: model),
-                backend: WhisperBackendDiagnostic(
-                    executable: ResolvedDependencyPath(url: binary, source: .bundled),
-                    version: WhisperBackendContract.supportedVersions[0],
-                    compatibility: "test-verified"
-                ),
-                model: ResolvedDependencyPath(url: model, source: .bundled)
-            )
-        )
-    }()
 }

@@ -3,74 +3,43 @@ import AppKit
 import Foundation
 import os
 
-private let recorderLogger = Logger(
-    subsystem: AppIdentity.bundleIdentifier,
-    category: "recorder"
-)
-/// Records from one explicitly chosen input device.
-///
-/// `AVAudioRecorder` always follows the system default input, which silently
-/// records the wrong microphone whenever a Mac has an audio interface and the
-/// user speaks into it. An `AVAudioEngine` input node can be bound to a specific
-/// `AudioDeviceID`, so TalkText drives the AUHAL directly, downmixes channel one
-/// to mono, resamples to the 16 kHz Whisper expects, and appends to the same
-/// growing WAV file the live preview snapshots.
+private let recorderLogger = Logger(subsystem: AppIdentity.bundleIdentifier, category: "recorder")
+
+/// Opens only the selected input, with bounded Bluetooth settling and recovery.
+/// CoreAudio setup and teardown run on MicrophoneInput, keeping key-up responsive.
 @MainActor
 final class SystemAudioRecorder: NSObject, AudioRecording {
-    private enum AutomaticStopReason {
-        case maximumDuration
-        case interruption
-        case deviceUnavailable
-    }
-
-    /// AirPods and other Bluetooth inputs can take several seconds to switch
-    /// from playback to their duplex profile. Each attempt gets enough time to
-    /// settle, but the total remains bounded.
     private static let startupAttemptCount = 3
-    private static let startupReadinessTimeout: Duration = .seconds(3)
-    private static let postCueReadinessTimeout: Duration = .seconds(1.5)
-    private static let startupPollInterval: Duration = .milliseconds(50)
-    private static let requiredReadyBuffers: UInt64 = 2
+    private static let readinessTimeout: Duration = .seconds(3)
+    private static let pollInterval: Duration = .milliseconds(20)
 
     private let inputResolver: any AudioInputResolving
     private let sink: CapturedAudioSink
+    private let input: any MicrophoneInputDriving
     private let eventHandler: @MainActor (RecorderEvent) -> Void
-    private var engine: AVAudioEngine?
-    private var engineHasTap = false
-    private var activeEngineIdentifier: UUID?
-    private var configurationObserver: NSObjectProtocol?
-    private var configurationGeneration: UInt64 = 0
     private var activeDevice: AudioInputDevice?
-    private var lastInputDeviceName = "Microphone"
     private var prepared = false
     private var running = false
     private var starting = false
-    private var recovering = false
     private var cancelled = false
     private var maximumDurationTask: Task<Void, Never>?
-    private var recoveryTask: Task<Void, Never>?
-    private var notificationObservers: [NSObjectProtocol] = []
+    private var healthTask: Task<Void, Never>?
+    private var completionTask: Task<RecorderStopOutcome, Never>?
+    private var sleepObserver: NSObjectProtocol?
 
-    var isRecording: Bool {
-        running
-    }
-
-    var peakLevel: Float {
-        sink.peakLevel
-    }
-
-    var inputDeviceName: String {
-        activeDevice?.name ?? lastInputDeviceName
-    }
+    var isRecording: Bool { running }
+    var peakLevel: Float { sink.peakLevel }
+    var inputDeviceName: String { activeDevice?.name ?? "Microphone" }
 
     init(
         url: URL,
         inputResolver: any AudioInputResolving,
+        input: any MicrophoneInputDriving = MicrophoneInput(),
         eventHandler: @escaping @MainActor (RecorderEvent) -> Void
     ) throws {
         self.inputResolver = inputResolver
+        self.input = input
         self.eventHandler = eventHandler
-
         let settings: [String: Any] = [
             AVFormatIDKey: Int(kAudioFormatLinearPCM),
             AVSampleRateKey: 16_000,
@@ -79,510 +48,199 @@ final class SystemAudioRecorder: NSObject, AudioRecording {
             AVLinearPCMIsFloatKey: false,
             AVLinearPCMIsBigEndianKey: false,
         ]
-        let file = try AVAudioFile(
-            forWriting: url,
-            settings: settings,
-            commonFormat: .pcmFormatFloat32,
-            interleaved: false
-        )
+        let file = try AVAudioFile(forWriting: url, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false)
         sink = CapturedAudioSink(file: file)
         super.init()
-
         sink.errorHandler = { [weak self] diagnostic in
-            Task { @MainActor [weak self] in
-                self?.handleWriteFailure(diagnostic)
-            }
+            Task { @MainActor [weak self] in self?.handleWriteFailure(diagnostic) }
         }
-        installInterruptionObservers()
+        sleepObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.willSleepNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.stopAutomatically(event: .interrupted) }
+        }
     }
 
     deinit {
         maximumDurationTask?.cancel()
-        recoveryTask?.cancel()
-        if let configurationObserver {
-            NotificationCenter.default.removeObserver(configurationObserver)
-        }
-        for observer in notificationObservers {
-            NotificationCenter.default.removeObserver(observer)
-            NSWorkspace.shared.notificationCenter.removeObserver(observer)
-        }
+        healthTask?.cancel()
+        input.cancel()
+        if let sleepObserver { NSWorkspace.shared.notificationCenter.removeObserver(sleepObserver) }
     }
 
     func prepare() async -> Bool {
-        guard !prepared, !running, !starting, !recovering else {
-            return false
-        }
-        cancelled = false
+        guard !prepared, !running, !starting, !cancelled else { return false }
         starting = true
         defer { starting = false }
-
-        guard await openInputWithRetries() else {
-            teardownCurrentEngine()
-            return false
-        }
-        guard !cancelled, !Task.isCancelled else {
-            teardownCurrentEngine()
-            return false
-        }
-        prepared = true
-        return true
+        prepared = await openInputWithRetries()
+        return prepared
     }
 
     func start(maximumDuration: TimeInterval) async -> Bool {
-        guard prepared, !running, !starting, !recovering else {
-            return false
-        }
+        guard prepared, !running, !starting, !cancelled else { return false }
         starting = true
         defer { starting = false }
-
-        // The ready cue runs while the warmed-up tap discards audio. Confirm a
-        // fresh buffer afterwards because output playback can itself provoke a
-        // Bluetooth configuration notification.
-        let postCueBaseline = sink.receivedBufferCount
-        let postCueGeneration = configurationGeneration
-        var inputReady = await waitForReadyInput(
-            after: postCueBaseline,
-            configurationGeneration: postCueGeneration,
-            requiredBuffers: 1,
-            timeout: Self.postCueReadinessTimeout
-        )
-        if !inputReady {
-            recorderLogger.notice("Input route changed during the ready cue; rebuilding it")
-            inputReady = await openInputWithRetries()
+        // One verified WAV write proves both the post-cue input and resampler
+        // are ready. A separate pre-write wait added an unnecessary buffer delay.
+        let baseline = sink.writtenBufferCount
+        guard sink.beginCapturing() else { return false }
+        var ready = await waitForInput(after: baseline, written: true)
+        if !ready, !cancelled, !Task.isCancelled, sink.pendingErrorDiagnostic == nil {
+            ready = await openInputWithRetries()
+            if ready { ready = await waitForInput(after: baseline, written: true) }
         }
-        guard inputReady, !cancelled, !Task.isCancelled else {
-            prepared = false
-            teardownCurrentEngine()
-            return false
-        }
-
-        let writeBaseline = sink.writtenBufferCount
-        guard sink.beginCapturing() else {
-            prepared = false
-            teardownCurrentEngine()
-            return false
-        }
-        var wroteAudio = await waitForWrittenInput(after: writeBaseline)
-        if !wroteAudio, sink.pendingErrorDiagnostic == nil {
-            recorderLogger.notice("Input stopped before the first WAV write; rebuilding it")
-            if await openInputWithRetries() {
-                wroteAudio = await waitForWrittenInput(after: writeBaseline)
-            }
-        }
-        guard wroteAudio, !cancelled, !Task.isCancelled else {
-            prepared = false
-            teardownCurrentEngine()
-            return false
-        }
-
         prepared = false
+        guard ready, !cancelled, !Task.isCancelled else {
+            await input.close()
+            return false
+        }
         running = true
-        scheduleMaximumDuration(maximumDuration)
+        maximumDurationTask = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .seconds(max(0.1, maximumDuration))) } catch { return }
+            self?.stopAutomatically(event: .maximumDurationReached)
+        }
+        monitorInputHealth()
         return true
     }
 
     func stop() async -> RecorderStopOutcome {
-        guard running else {
-            return .notRecording
-        }
-
-        maximumDurationTask?.cancel()
-        maximumDurationTask = nil
-        recoveryTask?.cancel()
-        recoveryTask = nil
+        // Key-up can coincide with the time limit or a device-loss stop. Share
+        // finalization instead of reporting a spurious "not recording" error.
+        if let completionTask { return await completionTask.value }
+        guard running else { return .notRecording }
         running = false
-        teardownCurrentEngine()
+        cancelTimers()
+        let completion = Task { @MainActor [self] in await finalizeCapture() }
+        completionTask = completion
+        return await completion.value
+    }
+
+    private func finalizeCapture() async -> RecorderStopOutcome {
+        // Stops callbacks and drains the audio writer before finalizing the file.
+        await input.close()
+        guard !cancelled else { return .cancelled }
+        let closed = sink.close()
         if let diagnostic = sink.pendingErrorDiagnostic {
-            _ = sink.close()
             return .encodeError(diagnostic)
         }
-        return sink.close() ? .finished : .unsuccessfulCompletion
+        return closed ? .finished : .unsuccessfulCompletion
     }
 
     func cancel() {
         cancelled = true
         prepared = false
-        maximumDurationTask?.cancel()
-        maximumDurationTask = nil
-        recoveryTask?.cancel()
-        recoveryTask = nil
         running = false
-        teardownCurrentEngine()
+        cancelTimers()
+        completionTask?.cancel()
+        completionTask = nil
+        input.cancel()
         _ = sink.close()
     }
 
-    private func handleWriteFailure(_ diagnostic: RecorderErrorDiagnostic) {
-        guard running else {
-            return
-        }
+    private func cancelTimers() {
         maximumDurationTask?.cancel()
         maximumDurationTask = nil
-        recoveryTask?.cancel()
-        recoveryTask = nil
+        healthTask?.cancel()
+        healthTask = nil
+    }
+
+    private func handleWriteFailure(_ diagnostic: RecorderErrorDiagnostic) {
+        guard running else { return }
         running = false
-        teardownCurrentEngine()
+        cancelTimers()
+        input.cancel()
         _ = sink.close()
         eventHandler(.encodeError(diagnostic))
     }
 
-    private func scheduleMaximumDuration(_ maximumDuration: TimeInterval) {
-        let duration = max(0.1, maximumDuration)
-        maximumDurationTask = Task { @MainActor [weak self] in
-            do {
-                try await Task.sleep(for: .seconds(duration))
-            } catch {
-                return
-            }
-            self?.stopAutomatically(for: .maximumDuration)
-        }
-    }
-
-    /// Opens a brand-new graph for every attempt. CoreAudio device IDs are
-    /// ephemeral during route churn, so the stable preference is resolved back
-    /// to a current ID immediately before each bind.
     private func openInputWithRetries() async -> Bool {
-        for attempt in 1 ... Self.startupAttemptCount {
-            guard !cancelled, !Task.isCancelled else {
-                return false
-            }
-
-            teardownCurrentEngine()
-            guard let device = inputResolver.resolveInputDevice() else {
-                recorderLogger.error(
-                    "No input device while opening recorder; attempt: \(attempt, privacy: .public)"
-                )
-                if await waitBeforeRetry(after: attempt) {
-                    continue
+        for attempt in 1...Self.startupAttemptCount {
+            guard !cancelled, !Task.isCancelled else { return false }
+            if let device = inputResolver.resolveInputDevice() {
+                activeDevice = device
+                let baseline = sink.receivedBufferCount
+                do {
+                    try await input.open(deviceID: device.deviceID, sink: sink)
+                    if await waitForInput(after: baseline, written: false) {
+                        recorderLogger.notice("Audio input ready; device: \(device.name, privacy: .public); attempt: \(attempt, privacy: .public)")
+                        return true
+                    }
+                } catch {
+                    let diagnostic = error as NSError
+                    recorderLogger
+                        .error(
+                            "Audio input start failed; attempt: \(attempt, privacy: .public); domain: \(diagnostic.domain, privacy: .public); code: \(diagnostic.code, privacy: .public)"
+                        )
                 }
-                return false
             }
-
-            activeDevice = device
-            lastInputDeviceName = device.name
-            let baselineBufferCount = sink.receivedBufferCount
-            do {
-                try configureAndStartFreshEngine(for: device)
-            } catch {
-                let nsError = error as NSError
-                recorderLogger.error(
-                    "Audio input start failed; device: \(device.name, privacy: .public); attempt: \(attempt, privacy: .public); domain: \(nsError.domain, privacy: .public); code: \(nsError.code, privacy: .public)"
-                )
-                if await waitBeforeRetry(after: attempt) {
-                    continue
-                }
-                return false
-            }
-
-            let generationAtStart = configurationGeneration
-            if await waitForReadyInput(
-                after: baselineBufferCount,
-                configurationGeneration: generationAtStart,
-                requiredBuffers: Self.requiredReadyBuffers,
-                timeout: Self.startupReadinessTimeout
-            ) {
-                recorderLogger.notice(
-                    "Audio input ready; device: \(device.name, privacy: .public); attempt: \(attempt, privacy: .public)"
-                )
-                return true
-            }
-
-            recorderLogger.error(
-                "Audio input produced no stable buffers; device: \(device.name, privacy: .public); attempt: \(attempt, privacy: .public)"
-            )
-            if await !waitBeforeRetry(after: attempt) {
-                return false
-            }
+            await input.close()
+            guard attempt < Self.startupAttemptCount, !cancelled, !Task.isCancelled else { return false }
+            do { try await Task.sleep(for: .milliseconds(100 * attempt)) } catch { return false }
         }
         return false
     }
 
-    private func configureAndStartFreshEngine(for device: AudioInputDevice) throws {
-        let freshEngine = AVAudioEngine()
-        let identifier = UUID()
-        engine = freshEngine
-        activeEngineIdentifier = identifier
-        engineHasTap = false
-
-        try freshEngine.inputNode.auAudioUnit.setDeviceID(device.deviceID)
-        let hardwareFormat = freshEngine.inputNode.inputFormat(forBus: 0)
-        guard hardwareFormat.sampleRate > 0, hardwareFormat.channelCount > 0 else {
-            throw AudioRecorderCreationError.inputDeviceUnusable
-        }
-
-        let sink = sink
-        // A nil format means "whatever this node produces", which survives
-        // sample-rate and channel-layout changes better than a captured format.
-        freshEngine.inputNode.installTap(
-            onBus: 0,
-            bufferSize: 1024,
-            format: nil
-        ) { buffer, _ in
-            sink.append(buffer)
-        }
-        engineHasTap = true
-        installConfigurationObserver(for: freshEngine, identifier: identifier)
-        freshEngine.prepare()
-        try freshEngine.start()
-    }
-
-    private func waitForReadyInput(
-        after baselineBufferCount: UInt64,
-        configurationGeneration expectedGeneration: UInt64,
-        requiredBuffers: UInt64,
-        timeout: Duration
-    ) async -> Bool {
-        await waitForInput(
-            after: baselineBufferCount,
-            generation: expectedGeneration,
-            requiredBuffers: requiredBuffers,
-            timeout: timeout,
-            requireWrittenAudio: false
-        )
-    }
-
-    private func waitForWrittenInput(after baselineBufferCount: UInt64) async -> Bool {
-        await waitForInput(
-            after: baselineBufferCount,
-            generation: configurationGeneration,
-            requiredBuffers: 1,
-            timeout: Self.postCueReadinessTimeout,
-            requireWrittenAudio: true
-        )
-    }
-
-    private func waitForInput(
-        after baseline: UInt64,
-        generation: UInt64,
-        requiredBuffers: UInt64,
-        timeout: Duration,
-        requireWrittenAudio: Bool
-    ) async -> Bool {
+    private func waitForInput(after baseline: UInt64, written: Bool) async -> Bool {
         await AudioInputReadiness.wait(
-            after: baseline,
-            generation: generation,
-            requiredBuffers: requiredBuffers,
-            timeout: timeout,
-            pollInterval: Self.startupPollInterval,
+            after: baseline, generation: 0, requiredBuffers: written ? 1 : 2,
+            timeout: Self.readinessTimeout, pollInterval: Self.pollInterval,
             sample: {
-                AudioInputReadiness.Sample(
-                    generation: self.configurationGeneration,
-                    bufferCount: requireWrittenAudio ? self.sink.writtenBufferCount : self.sink.receivedBufferCount,
-                    isRunning: self.engine?.isRunning == true,
-                    hasError: self.cancelled || self.engine == nil || self.sink.pendingErrorDiagnostic != nil
-                )
+                .init(generation: 0, bufferCount: written ? self.sink.writtenBufferCount : self.sink.receivedBufferCount,
+                      isRunning: self.input.health.isRunning,
+                      hasError: self.cancelled || self.sink.pendingErrorDiagnostic != nil)
             },
-            restart: { self.restartSettledEngine() }
+            restart: {
+                guard !self.cancelled, !Task.isCancelled, let device = self.inputResolver.resolveInputDevice() else { return false }
+                self.activeDevice = device
+                do {
+                    try await self.input.open(deviceID: device.deviceID, sink: self.sink)
+                    return true
+                } catch { return false }
+            }
         )
     }
 
-    private func restartSettledEngine() -> Bool {
-        guard !cancelled, !Task.isCancelled,
-              let engine, let activeDevice,
-              inputResolver.resolveInputDevice()?.deviceID == activeDevice.deviceID else {
-            return false
-        }
-        let format = engine.inputNode.inputFormat(forBus: 0)
-        guard format.sampleRate > 0, format.channelCount > 0 else { return false }
-        // Reusing the I/O unit preserves the Bluetooth input profile. Destroying
-        // it on every notification switches back to playback and starts the
-        // same profile negotiation again on the next attempt.
-        if engineHasTap {
-            engine.inputNode.removeTap(onBus: 0)
-        }
-        let sink = sink
-        engine.inputNode.installTap(onBus: 0, bufferSize: 1024, format: nil) { buffer, _ in
-            sink.append(buffer)
-        }
-        engineHasTap = true
-        do {
-            engine.prepare()
-            try engine.start()
-            recorderLogger.notice("Restarted the existing audio engine after the input route settled")
-            return true
-        } catch {
-            recorderLogger.error("The settled audio engine could not restart")
-            return false
-        }
-    }
-
-    /// Returns true when another attempt remains and the wait was not cancelled.
-    private func waitBeforeRetry(after attempt: Int) async -> Bool {
-        guard attempt < Self.startupAttemptCount,
-              !cancelled,
-              !Task.isCancelled else {
-            return false
-        }
-        teardownCurrentEngine()
-        let backoff = Duration.milliseconds(150 * attempt)
-        do {
-            try await Task.sleep(for: backoff)
-            return !cancelled && !Task.isCancelled
-        } catch {
-            return false
-        }
-    }
-
-    private func installConfigurationObserver(
-        for engine: AVAudioEngine,
-        identifier: UUID
-    ) {
-        if let configurationObserver {
-            NotificationCenter.default.removeObserver(configurationObserver)
-        }
-        configurationObserver = NotificationCenter.default.addObserver(
-            forName: .AVAudioEngineConfigurationChange,
-            object: engine,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.handleConfigurationChange(for: identifier)
+    /// Detect a stalled capture even without a configuration notification. Silent
+    /// samples still count as a healthy route; speech detection uses the peak level.
+    private func monitorInputHealth() {
+        healthTask = Task { @MainActor [weak self] in
+            var previousCount: UInt64 = 0
+            var stalledChecks = 0
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
+                guard let self, self.running, !self.cancelled else { return }
+                let count = self.sink.writtenBufferCount
+                stalledChecks = count == previousCount ? stalledChecks + 1 : 0
+                previousCount = count
+                let selected = self.inputResolver.resolveInputDevice()
+                let routeChanged = selected?.deviceID != self.activeDevice?.deviceID
+                guard routeChanged || !self.input.health.isRunning || stalledChecks >= 3 else { continue }
+                recorderLogger.notice("Recovering a stalled or changed microphone input")
+                guard await self.openInputWithRetries() else {
+                    guard !Task.isCancelled, self.running, !self.cancelled else { return }
+                    self.stopAutomatically(event: .deviceUnavailable)
+                    return
+                }
+                stalledChecks = 0
+                previousCount = self.sink.writtenBufferCount
             }
         }
     }
 
-    private func teardownCurrentEngine() {
-        if let configurationObserver {
-            NotificationCenter.default.removeObserver(configurationObserver)
-            self.configurationObserver = nil
-        }
-        activeEngineIdentifier = nil
-        guard let engine else {
-            engineHasTap = false
-            return
-        }
-        if engineHasTap {
-            engine.inputNode.removeTap(onBus: 0)
-            engineHasTap = false
-        }
-        engine.stop()
-        engine.reset()
-        self.engine = nil
-    }
-
-    private func installInterruptionObservers() {
-        let sleepObserver = NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.willSleepNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.stopAutomatically(for: .interruption)
-            }
-        }
-        notificationObservers.append(sleepObserver)
-
-        let deviceObserver = NotificationCenter.default.addObserver(
-            forName: AVCaptureDevice.wasDisconnectedNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] notification in
-            guard let device = notification.object as? AVCaptureDevice, device.hasMediaType(.audio) else {
-                return
-            }
-            Task { @MainActor [weak self] in
-                self?.handlePossibleDeviceChange()
-            }
-        }
-        notificationObservers.append(deviceObserver)
-    }
-
-    /// Route churn can stop and uninitialize the graph. During startup the new
-    /// generation invalidates readiness; during recording it schedules a health
-    /// check and a fresh-device rebuild if buffers do not continue.
-    private func handleConfigurationChange(for engineIdentifier: UUID) {
-        guard activeEngineIdentifier == engineIdentifier else {
-            return
-        }
-        configurationGeneration &+= 1
-        guard running, !starting, !recovering else {
-            return
-        }
-        scheduleRouteRecovery()
-    }
-
-    private func handlePossibleDeviceChange() {
-        configurationGeneration &+= 1
-        guard running, !starting, !recovering else {
-            return
-        }
-        scheduleRouteRecovery()
-    }
-
-    /// A route notification can be followed by a brief period in which the old
-    /// graph keeps rendering. Give it one buffer interval before rebuilding;
-    /// this avoids interrupting benign notifications while still recovering a
-    /// stopped or silent engine automatically.
-    private func scheduleRouteRecovery() {
-        guard recoveryTask == nil else {
-            return
-        }
-        let bufferCountAtNotification = sink.writtenBufferCount
-        recoveryTask = Task { @MainActor [weak self] in
-            do {
-                try await Task.sleep(for: .milliseconds(200))
-            } catch {
-                return
-            }
-            guard let self, self.running, !self.cancelled else {
-                return
-            }
-            if let engine = self.engine,
-               engine.isRunning,
-               self.sink.writtenBufferCount > bufferCountAtNotification {
-                self.recoveryTask = nil
-                recorderLogger.debug("Audio input remained healthy after a configuration change")
-                return
-            }
-
-            self.recovering = true
-            var recovered = await self.waitForWrittenInput(after: bufferCountAtNotification)
-            if !recovered, !Task.isCancelled, self.running, !self.cancelled {
-                recovered = await self.openInputWithRetries()
-            }
-            self.recovering = false
-            self.recoveryTask = nil
-            guard self.running, !self.cancelled else {
-                return
-            }
-            if recovered {
-                recorderLogger.notice(
-                    "Recovered recording after an audio route change; device: \(self.inputDeviceName, privacy: .public)"
-                )
-                return
-            }
-
-            self.running = false
-            self.teardownCurrentEngine()
-            _ = self.sink.close()
-            recorderLogger.error("Could not recover recording after an audio route change")
-            self.eventHandler(.deviceUnavailable)
-        }
-    }
-
-    private func stopAutomatically(for reason: AutomaticStopReason) {
-        guard running else {
-            return
-        }
-        recorderLogger.notice(
-            "Recording stopped automatically; device: \(self.inputDeviceName, privacy: .public)"
-        )
-        maximumDurationTask?.cancel()
-        maximumDurationTask = nil
-        recoveryTask?.cancel()
-        recoveryTask = nil
+    private func stopAutomatically(event: RecorderEvent) {
+        guard running else { return }
         running = false
-        teardownCurrentEngine()
-        let closed = sink.close()
-
-        switch reason {
-        case .maximumDuration where closed:
-            eventHandler(.maximumDurationReached)
-        case .maximumDuration:
-            eventHandler(.unexpectedCompletion)
-        case .interruption:
-            eventHandler(.interrupted)
-        case .deviceUnavailable:
-            eventHandler(.deviceUnavailable)
+        cancelTimers()
+        let completion = Task { @MainActor [self] in await finalizeCapture() }
+        completionTask = completion
+        Task { @MainActor [weak self] in
+            let outcome = await completion.value
+            guard let self, !self.cancelled else { return }
+            switch outcome {
+            case .finished: self.eventHandler(event)
+            case let .encodeError(diagnostic): self.eventHandler(.encodeError(diagnostic))
+            default: self.eventHandler(.unexpectedCompletion)
+            }
         }
     }
 }

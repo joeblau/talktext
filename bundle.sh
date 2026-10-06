@@ -34,7 +34,7 @@ validate_path_component() {
     esac
 }
 
-for command_name in swift lipo plutil codesign xattr; do
+for command_name in swift lipo plutil codesign xattr python3; do
     command -v "$command_name" >/dev/null 2>&1 || fail "required command is unavailable: $command_name"
 done
 [[ -x /usr/libexec/PlistBuddy ]] || fail "/usr/libexec/PlistBuddy is unavailable"
@@ -56,10 +56,17 @@ BUNDLE_PATH="$SCRIPT_DIR/$BUNDLE_NAME.app"
 
 # shellcheck source=/dev/null
 source "$DEPENDENCY_MANIFEST"
-[[ -n "${MODEL_FILE_NAME:-}" ]] || fail "dependency manifest does not define MODEL_FILE_NAME"
+[[ -n "${MODEL_DIRECTORY_NAME:-}" ]] || fail "dependency manifest does not define MODEL_DIRECTORY_NAME"
+validate_path_component MODEL_DIRECTORY_NAME "$MODEL_DIRECTORY_NAME"
+CANONICAL_MODEL_MANIFEST="$SCRIPT_DIR/$MODEL_MANIFEST_RELATIVE_PATH"
+MODEL_MANIFEST="${TALKTEXT_MODEL_MANIFEST:-$CANONICAL_MODEL_MANIFEST}"
+if [[ "$SIGNING_MODE" == 'developer-id' && "$MODEL_MANIFEST" != "$CANONICAL_MODEL_MANIFEST" ]]; then
+    fail "Developer ID bundling does not accept a model manifest override"
+fi
+export TALKTEXT_MODEL_MANIFEST="$MODEL_MANIFEST"
 
 VERSION="$("$SCRIPT_DIR/scripts/read-version.sh")"
-MODEL_PATH="${TALKTEXT_MODEL_PATH:-$SCRIPT_DIR/models/$MODEL_FILE_NAME}"
+MODEL_PATH="${TALKTEXT_MODEL_PATH:-$SCRIPT_DIR/models/$MODEL_DIRECTORY_NAME}"
 
 case "$SIGNING_MODE" in
     adhoc)
@@ -135,9 +142,24 @@ mkdir -p "$MACOS" "$RESOURCES/models"
 echo "==> Assembling canonical bundle metadata and resources..."
 lipo -create "$ARM64_PRODUCT" "$X86_64_PRODUCT" -output "$MACOS/$EXECUTABLE_NAME"
 chmod 755 "$MACOS/$EXECUTABLE_NAME"
-cp -- "$MODEL_PATH" "$RESOURCES/models/$MODEL_FILE_NAME"
+cp -R -- "$MODEL_PATH" "$RESOURCES/models/$MODEL_DIRECTORY_NAME"
+# SwiftPM resource bundles are required by Bundle.module in TalkText and FluidAudio.
+cp -- "$CANONICAL_MODEL_MANIFEST" "$RESOURCES/parakeet-model.json"
+PRODUCT_DIRECTORY="$(dirname -- "$ARM64_PRODUCT")"
+for resource_bundle in "$PRODUCT_DIRECTORY"/*.bundle; do
+    [[ -d "$resource_bundle" ]] || continue
+    cp -R -- "$resource_bundle" "$RESOURCES/"
+done
+mkdir -p "$RESOURCES/Licenses"
+SDK_SOURCE="$PACKAGE_DIR/.build/release-arm64/checkouts/FluidAudio"
+[[ -r "$SDK_SOURCE/LICENSE" ]] || fail "reviewed FluidAudio license is missing"
+cp -- "$SDK_SOURCE/LICENSE" "$RESOURCES/Licenses/FluidAudio-Apache-2.0.txt"
+cp -R -- "$SDK_SOURCE/ThirdPartyLicenses" "$RESOURCES/Licenses/FluidAudio-ThirdParty"
+cp -- "$PACKAGE_DIR/Sources/TalkText/Resources/ParakeetNOTICE.txt" "$RESOURCES/Licenses/ParakeetNOTICE.txt"
+# SwiftPM checkouts are read-only; the copied notices must permit xattr cleanup.
+chmod -R u+w "$RESOURCES/Licenses"
 TALKTEXT_DEPENDENCY_MANIFEST="$DEPENDENCY_MANIFEST" \
-    "$SCRIPT_DIR/scripts/dependency-tool.sh" verify-model "$RESOURCES/models/$MODEL_FILE_NAME"
+    "$SCRIPT_DIR/scripts/dependency-tool.sh" verify-model "$RESOURCES/models/$MODEL_DIRECTORY_NAME"
 
 cp -- "$INFO_TEMPLATE" "$CONTENTS/Info.plist"
 if /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$CONTENTS/Info.plist" >/dev/null 2>&1 || \
@@ -152,6 +174,10 @@ plutil -lint "$CONTENTS/Info.plist" >/dev/null
 # all present before the code directory and resource seal are created.
 echo "==> Signing finalized bundle ($SIGNING_MODE, hardened runtime)..."
 xattr -cr "$WORK_BUNDLE"
+for resource_bundle in "$RESOURCES"/*.bundle; do
+    [[ -d "$resource_bundle" ]] || continue
+    codesign --force --options runtime "$TIMESTAMP_ARGUMENT" --sign "$SIGNING_IDENTITY" "$resource_bundle"
+done
 codesign \
     --force \
     --verbose \

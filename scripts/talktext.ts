@@ -58,10 +58,21 @@ async function localSigningConfiguration(): Promise<SigningConfiguration> {
     "-p",
     "codesigning",
   ]);
-  const match = identities.output.match(/"(Apple Development: [^"]+)"/);
+  const candidates =
+    identities.exitCode === 0
+      ? [...identities.output.matchAll(/"(Apple Development: [^"]+)"/g)].map(
+          (match) => match[1],
+        )
+      : [];
 
-  if (identities.exitCode === 0 && match) {
-    const identity = match[1];
+  // A keychain can hold Apple Development identities for several teams, so
+  // prefer the project's team and fall back to the first one for other
+  // checkouts.
+  const preferredTeamID =
+    process.env.TALKTEXT_DEVELOPMENT_TEAM || "K78G42H4U2";
+  let selected: { identity: string; teamID: string } | undefined;
+
+  for (const identity of candidates) {
     const certificate = await capture([
       "/usr/bin/security",
       "find-certificate",
@@ -77,17 +88,28 @@ async function localSigningConfiguration(): Promise<SigningConfiguration> {
       /(?:^|[,/])\s*OU\s*=\s*([A-Z0-9]+)/,
     )?.[1];
 
-    if (certificate.exitCode === 0 && subject.exitCode === 0 && teamID) {
-      return {
-        mode: "apple-development",
-        environment: {
-          TALKTEXT_SIGNING_MODE: "apple-development",
-          TALKTEXT_SIGNING_IDENTITY: identity,
-          TALKTEXT_EXPECTED_TEAM_ID: teamID,
-        },
-        summary: `${identity} (team ${teamID})`,
-      };
+    if (certificate.exitCode !== 0 || subject.exitCode !== 0 || !teamID) {
+      continue;
     }
+    if (!selected || teamID === preferredTeamID) {
+      selected = { identity, teamID };
+    }
+    if (teamID === preferredTeamID) {
+      break;
+    }
+  }
+
+  if (selected) {
+    const { identity, teamID } = selected;
+    return {
+      mode: "apple-development",
+      environment: {
+        TALKTEXT_SIGNING_MODE: "apple-development",
+        TALKTEXT_SIGNING_IDENTITY: identity,
+        TALKTEXT_EXPECTED_TEAM_ID: teamID,
+      },
+      summary: `${identity} (team ${teamID})`,
+    };
   }
 
   console.warn(

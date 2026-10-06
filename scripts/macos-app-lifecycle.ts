@@ -400,7 +400,9 @@ export async function launchMacApplication(
   for (const [name, value] of Object.entries(options.environment ?? {})) {
     openCommand.push("--env", `${name}=${value}`);
   }
-  openCommand.push(options.appPath);
+  // Select the exact app bundle instead of opening it as a document through
+  // the user's default file handler. No document paths are passed to the app.
+  openCommand.push("-a", options.appPath);
 
   const maximumAttempts = timings.launchRetryDelaysMs.length + 1;
   let lastResult: CapturedCommand | undefined;

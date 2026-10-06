@@ -12,25 +12,14 @@ export TALKTEXT_DEPENDENCY_MANIFEST="$DEPENDENCY_MANIFEST"
 # shellcheck source=dependencies.env
 source "$DEPENDENCY_MANIFEST"
 
-echo "==> Resolving the supported whisper.cpp backend..."
-if ! BACKEND_PATH="$("$DEPENDENCY_TOOL" resolve-backend)"; then
-    if [[ -n "${TALKTEXT_WHISPER_CLI:-}" ]]; then
-        echo "error: fix or unset TALKTEXT_WHISPER_CLI before running setup" >&2
-        exit 1
-    fi
-    command -v brew >/dev/null 2>&1 || {
-        echo "error: Homebrew is required to install $BACKEND_FORMULA" >&2
-        exit 1
-    }
-    echo "    Installing $BACKEND_FORMULA via Homebrew..."
-    brew install "$BACKEND_FORMULA"
-    hash -r
-    BACKEND_PATH="$("$DEPENDENCY_TOOL" resolve-backend)"
+MODEL_MANIFEST="$REPOSITORY_ROOT/$MODEL_MANIFEST_RELATIVE_PATH"
+if [[ -n "${TALKTEXT_MODEL_MANIFEST:-}" && "$TALKTEXT_MODEL_MANIFEST" != "$MODEL_MANIFEST" ]]; then
+    echo "error: setup does not accept a model manifest override" >&2
+    exit 1
 fi
-"$DEPENDENCY_TOOL" probe-backend "$BACKEND_PATH" | sed 's/^/    /'
-
-echo "==> Installing the pinned base.en model..."
-MODEL_PATH="$REPOSITORY_ROOT/models/$MODEL_FILE_NAME"
+export TALKTEXT_MODEL_MANIFEST="$MODEL_MANIFEST"
+echo "==> Installing the pinned English Parakeet v2 models..."
+MODEL_PATH="${TALKTEXT_MODEL_PATH:-$REPOSITORY_ROOT/models/$MODEL_DIRECTORY_NAME}"
 "$DEPENDENCY_TOOL" install-model "$MODEL_PATH"
 
 echo "==> Building app..."
@@ -62,11 +51,13 @@ APP_PATH="$REPOSITORY_ROOT/TalkText/.build/release/$EXECUTABLE_NAME"
 }
 
 echo ""
-echo "==> Done! Run with:"
+echo "==> Done! Built executable:"
 printf '   %q\n' "$APP_PATH"
 echo ""
+echo "Build and deploy the app with bun talktext, or build a local bundle with ./bundle.sh."
+echo ""
 echo "Resolved dependencies:"
-echo "   whisper-cli: $BACKEND_PATH"
+echo "   backend:     FluidAudio $BACKEND_VERSION (built into TalkText)"
 echo "   model:       $MODEL_PATH"
 echo ""
 echo "NOTE: You'll need to grant Accessibility permissions in"

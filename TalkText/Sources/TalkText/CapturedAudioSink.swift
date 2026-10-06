@@ -1,9 +1,8 @@
 @preconcurrency import AVFoundation
 import Foundation
 
-/// Owns everything the audio thread touches: the open file, the resampler, and
-/// the running peak. Buffers arrive on a render thread, so every field lives
-/// behind one lock instead of on the main actor.
+/// Owns the serial audio writer's file, resampler, and peak level. A lock lets the
+/// main actor inspect capture health and close cancelled recordings safely.
 final class CapturedAudioSink: @unchecked Sendable {
     var errorHandler: (@Sendable (RecorderErrorDiagnostic) -> Void)?
 
@@ -61,6 +60,7 @@ final class CapturedAudioSink: @unchecked Sendable {
         if let monoInputFormat, let converter, monoInputFormat.sampleRate == sampleRate {
             return (monoInputFormat, converter)
         }
+        guard flushConverter() else { return nil }
 
         guard let monoInputFormat = AVAudioFormat(
             standardFormatWithSampleRate: sampleRate,
@@ -74,7 +74,7 @@ final class CapturedAudioSink: @unchecked Sendable {
         return (monoInputFormat, converter)
     }
 
-    /// Runs on the audio thread: take channel one, resample to 16 kHz, append.
+    /// Runs on the writer queue: take channel one, resample to 16 kHz, append.
     /// Level tracking happens here because silent capture is the one failure the
     /// finished file cannot report on its own.
     func append(_ buffer: AVAudioPCMBuffer) {
@@ -94,7 +94,7 @@ final class CapturedAudioSink: @unchecked Sendable {
                   ),
                   let destination = monoBuffer.floatChannelData?[0],
                   copyFirstChannel(of: buffer, into: destination, frameCount: frameCount) else {
-                return nil
+                return errorDiagnostic
             }
             monoBuffer.frameLength = AVAudioFrameCount(frameCount)
 
@@ -155,11 +155,40 @@ final class CapturedAudioSink: @unchecked Sendable {
             guard file != nil else {
                 return false
             }
+            let flushed = flushConverter()
             file = nil
             converter = nil
             acceptingAudio = false
-            return true
+            return flushed
         }
+    }
+
+    /// Sample-rate converters retain trailing input. Flush it on stop and before
+    /// a format change so the last syllable isn't lost when releasing Option.
+    private func flushConverter() -> Bool {
+        guard let converter, let file else { return true }
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: processingFormat, frameCapacity: 4096) else { return false }
+        for _ in 0..<8 {
+            var error: NSError?
+            let status = converter.convert(to: buffer, error: &error) { _, inputStatus in
+                inputStatus.pointee = .endOfStream
+                return nil
+            }
+            if status == .error {
+                _ = record(failure: .init(domain: error?.domain ?? "AVAudioConverter", code: error?.code ?? -1))
+                return false
+            }
+            do {
+                if buffer.frameLength > 0 { try file.write(from: buffer) }
+            } catch {
+                let diagnostic = error as NSError
+                _ = record(failure: .init(domain: diagnostic.domain, code: diagnostic.code))
+                return false
+            }
+            if status == .endOfStream || buffer.frameLength == 0 { return true }
+        }
+        _ = record(failure: .init(domain: "AVAudioConverter", code: -1))
+        return false
     }
 
     /// Caller already holds the lock.

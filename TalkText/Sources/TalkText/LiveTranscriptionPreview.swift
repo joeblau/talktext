@@ -6,7 +6,7 @@ import Foundation
 final class LiveTranscriptionPreview {
     private let recordingFileStore: any RecordingFileStoring
     private let recordingSnapshotter: any ActiveRecordingSnapshotting
-    private let transcriber: any WhisperTranscribing
+    private let transcriber: any SpeechTranscribing
 
     private var currentPreviewURL: URL?
     private var task: Task<Void, Never>?
@@ -14,7 +14,7 @@ final class LiveTranscriptionPreview {
     init(
         recordingFileStore: any RecordingFileStoring,
         recordingSnapshotter: any ActiveRecordingSnapshotting,
-        transcriber: any WhisperTranscribing
+        transcriber: any SpeechTranscribing
     ) {
         self.recordingFileStore = recordingFileStore
         self.recordingSnapshotter = recordingSnapshotter
@@ -24,29 +24,33 @@ final class LiveTranscriptionPreview {
     func start(
         recordingURL: URL,
         interval: TimeInterval,
-        receiveTranscript: @escaping @MainActor (String) -> Void
+        receiveTranscript: @escaping @MainActor (String) async -> Void
     ) {
         cleanup()
         let boundedInterval = max(0.1, interval)
+        let transcriber = transcriber
         task = Task { @MainActor [weak self] in
+            let session = await transcriber.makeLiveSession()
+            var lastTranscript: String?
             while !Task.isCancelled {
                 do {
                     try await Task.sleep(for: .seconds(boundedInterval))
                 } catch {
-                    return
+                    break
                 }
                 guard let self else {
-                    return
+                    break
                 }
-                if let transcript = await self.refresh(recordingURL: recordingURL) {
-                    receiveTranscript(transcript)
+                if let transcript = await self.refresh(recordingURL: recordingURL, session: session), transcript != lastTranscript {
+                    lastTranscript = transcript
+                    await receiveTranscript(transcript)
                 }
             }
+            await session?.cancel()
         }
     }
 
-    /// Cancels the current Whisper pass and returns the task so the final flow
-    /// can wait until its subprocess and snapshot have been cleaned up.
+    /// Cancels the draft pass so the final flow can wait for session cleanup.
     func stop() -> Task<Void, Never>? {
         let currentTask = task
         task = nil
@@ -60,7 +64,7 @@ final class LiveTranscriptionPreview {
         removeCurrentPreview()
     }
 
-    private func refresh(recordingURL: URL) async -> String? {
+    private func refresh(recordingURL: URL, session: (any LiveSpeechSession)?) async -> String? {
         guard !Task.isCancelled else {
             return nil
         }
@@ -88,6 +92,10 @@ final class LiveTranscriptionPreview {
             return nil
         }
 
+        if let session {
+            let text = await session.transcribeNewAudio(at: previewURL)
+            return Task.isCancelled ? nil : text
+        }
         let outcome = await transcriber.transcribe(audioURL: previewURL)
         guard !Task.isCancelled, case let .success(text) = outcome else {
             return nil

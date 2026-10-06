@@ -55,7 +55,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         engineStateObservation = nil
         hotKeyController.unregister()
         // This call is intentionally synchronous: it does not return until an
-        // active whisper-cli child has been reaped.
+        // active transcription has been cancelled.
         transcriptionEngine.cleanup()
     }
 }

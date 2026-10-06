@@ -18,5 +18,8 @@ dist/
 # machine-specific development team.
 /Local.xcconfig
 
-# Downloaded Whisper model
+# Downloaded Parakeet models
 models/
+
+# Python fixture bytecode
+__pycache__/

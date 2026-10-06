@@ -19,7 +19,7 @@ enum AudioInputReadiness {
         pollInterval: Duration = .milliseconds(50),
         settlingInterval: Duration = .milliseconds(200),
         sample: () -> Sample,
-        restart: () -> Bool
+        restart: () async -> Bool
     ) async -> Bool {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: timeout)
@@ -44,7 +44,7 @@ enum AudioInputReadiness {
                 }
             } else if let stoppedAt = stoppedSince {
                 if clock.now - stoppedAt >= settlingInterval {
-                    guard !Task.isCancelled, restart() else { return false }
+                    guard !Task.isCancelled, await restart() else { return false }
                     baseline = sample().bufferCount
                     stoppedSince = nil
                 }

@@ -25,40 +25,34 @@ final class TranscriptionEngine: ObservableObject {
     struct Presentation: Equatable, Sendable {
         let state: State
         let statusText: String
-        let whisperRecovery: WhisperRecovery?
+        let modelRecovery: ModelRecovery?
 
         init(
             state: State,
             statusText: String,
-            whisperRecovery: WhisperRecovery? = nil
+            modelRecovery: ModelRecovery? = nil
         ) {
             self.state = state
             self.statusText = statusText
-            self.whisperRecovery = whisperRecovery
+            self.modelRecovery = modelRecovery
         }
     }
 
-    struct WhisperRecovery: Equatable, Sendable {
+    struct ModelRecovery: Equatable, Sendable {
         let message: String
         let command: String
         let copyButtonTitle: String
 
-        static let install = WhisperRecovery(
-            message: "Whisper isn’t installed. Run this command in Terminal:",
-            command: "brew install whisper-cpp",
-            copyButtonTitle: "Copy Install Command"
-        )
-
-        static let reinstall = WhisperRecovery(
-            message: "Whisper appears to be broken. Reinstall it in Terminal:",
-            command: "brew reinstall whisper-cpp",
-            copyButtonTitle: "Copy Reinstall Command"
+        static let setup = ModelRecovery(
+            message: "Parakeet models are unavailable. Run setup from the TalkText checkout, or reinstall the app:",
+            command: "./setup.sh",
+            copyButtonTitle: "Copy Setup Command"
         )
     }
 
     @Published private(set) var state: State
     @Published private(set) var statusText: String
-    @Published private(set) var whisperRecovery: WhisperRecovery?
+    @Published private(set) var modelRecovery: ModelRecovery?
 
     var isInteractive: Bool {
         state == .idle || state == .failed
@@ -67,9 +61,10 @@ final class TranscriptionEngine: ObservableObject {
     private let permissionProvider: any MicrophonePermissionProviding
     private let recorderFactory: any AudioRecorderCreating
     private let recordingReadyCue: any RecordingReadyCuePlaying
+    private let recordingStoppedCue: any RecordingStoppedCuePlaying
     private let recordingFileStore: any RecordingFileStoring
-    let dependencyPreflight: any WhisperDependencyPreflighting
-    private let transcriber: any WhisperTranscribing
+    let dependencyPreflight: any TranscriptionPreflighting
+    private let transcriber: any SpeechTranscribing
     private let textDelivery: any TextDelivering
     private let applicationBundleIdentifier: String?
     private let maximumDuration: TimeInterval
@@ -78,8 +73,7 @@ final class TranscriptionEngine: ObservableObject {
 
     /// Peak level below which a recording holds no speech. Real speech peaks far
     /// above this even from across a room; digital silence sits at -infinity.
-    /// Whisper answers silence with confident hallucinations such as "you", so
-    /// TalkText refuses to transcribe below the floor.
+    /// Reject recordings below the input floor before invoking a recognizer.
     static let silenceFloor: Float = -55
 
     var currentSessionIdentifier: UUID?
@@ -91,52 +85,26 @@ final class TranscriptionEngine: ObservableObject {
     private var dependencyPresentationTask: Task<Void, Never>?
     var cachedDependencyPreflight: TalkTextDependencyPreflightResult?
 
-    convenience init(inputSelection: AudioInputSelection) {
-        let recordingFileStore: any RecordingFileStoring
-        let startupPresentation: Presentation?
-        do {
-            recordingFileStore = try TemporaryRecordingFileStore()
-            startupPresentation = nil
-        } catch {
-            recordingFileStore = UnavailableRecordingFileStore()
-            startupPresentation = Presentation(
-                state: .failed,
-                statusText: "Temporary recording storage is unavailable. Restart TalkText."
-            )
-        }
-
-        let dependencyResolver = TalkTextDependencyResolver()
-        self.init(
-            permissionProvider: SystemMicrophonePermissionProvider(),
-            recorderFactory: SystemAudioRecorderFactory(inputResolver: inputSelection),
-            recordingFileStore: recordingFileStore,
-            recordingSnapshotter: ActiveWAVRecordingSnapshotter(),
-            dependencyPreflight: dependencyResolver,
-            transcriber: WhisperTranscriber(dependencyResolver: dependencyResolver),
-            textDelivery: TextDeliveryService(),
-            applicationBundleIdentifier: Bundle.main.bundleIdentifier,
-            startupPresentation: startupPresentation
-        )
-    }
-
     init(
         permissionProvider: any MicrophonePermissionProviding,
         recorderFactory: any AudioRecorderCreating,
         recordingReadyCue: any RecordingReadyCuePlaying = SystemRecordingReadyCuePlayer(),
+        recordingStoppedCue: any RecordingStoppedCuePlaying = SystemRecordingStoppedCuePlayer(),
         recordingFileStore: any RecordingFileStoring,
         recordingSnapshotter: any ActiveRecordingSnapshotting = ActiveWAVRecordingSnapshotter(),
-        dependencyPreflight: any WhisperDependencyPreflighting,
-        transcriber: any WhisperTranscribing,
+        dependencyPreflight: any TranscriptionPreflighting,
+        transcriber: any SpeechTranscribing,
         textDelivery: any TextDelivering,
         applicationBundleIdentifier: String? = AppIdentity.bundleIdentifier,
         maximumDuration: TimeInterval = TranscriptionEngine.maximumRecordingDuration,
-        livePreviewInterval: TimeInterval = 1.5,
+        livePreviewInterval: TimeInterval = 0.5,
         performStartupCleanup: Bool = true,
         startupPresentation: Presentation? = nil
     ) {
         self.permissionProvider = permissionProvider
         self.recorderFactory = recorderFactory
         self.recordingReadyCue = recordingReadyCue
+        self.recordingStoppedCue = recordingStoppedCue
         self.recordingFileStore = recordingFileStore
         self.dependencyPreflight = dependencyPreflight
         self.transcriber = transcriber
@@ -151,7 +119,7 @@ final class TranscriptionEngine: ObservableObject {
         )
         state = startupPresentation?.state ?? .idle
         statusText = startupPresentation?.statusText ?? "Hold Right Option to record, double-tap to lock"
-        whisperRecovery = startupPresentation?.whisperRecovery
+        modelRecovery = startupPresentation?.modelRecovery
 
         if performStartupCleanup {
             do {
@@ -165,8 +133,8 @@ final class TranscriptionEngine: ObservableObject {
     }
 
     /// Runs the canonical dependency preflight at launch and caches its typed
-    /// result. Recording reuses this task/result and still re-resolves immediately
-    /// before invoking Whisper, so removed or replaced files fail closed.
+    /// result. Recording reuses this task/result; transcription also rechecks
+    /// the local asset layout before invoking Parakeet.
     func prepareDependencies(forceRefresh: Bool = false) {
         guard currentSessionIdentifier == nil else {
             return
@@ -180,7 +148,7 @@ final class TranscriptionEngine: ObservableObject {
         transition(
             to: Presentation(
                 state: .starting,
-                statusText: "Checking Whisper setup…"
+                statusText: "Loading Parakeet…"
             )
         )
         dependencyPresentationTask?.cancel()
@@ -221,12 +189,13 @@ final class TranscriptionEngine: ObservableObject {
         logger.notice("Engine operation cancelled")
     }
 
-    /// Synchronous lifecycle hook for normal application termination. Active
-    /// subprocesses are force-killed and confirmed terminated, and audio files
-    /// are removed before this method returns.
+    /// Synchronous lifecycle hook for normal application termination. Pending
+    /// native work is cancelled and session audio is removed before returning.
+    /// An in-flight Core ML prediction may finish its current call; its result
+    /// is discarded by the cancelled task and invalidated session.
     func cleanup() {
         invalidateCurrentSession()
-        transcriber.terminateActiveTranscriptions()
+        transcriber.cancelActiveTranscriptions()
         dependencyPresentationTask?.cancel()
         dependencyPresentationTask = nil
         dependencyPreparationTask?.cancel()
@@ -259,7 +228,7 @@ final class TranscriptionEngine: ObservableObject {
         transition(
             to: Presentation(
                 state: .starting,
-                statusText: "Checking Whisper setup…"
+                statusText: "Loading Parakeet…"
             )
         )
         activeTask = Task { @MainActor [weak self] in
@@ -339,6 +308,7 @@ final class TranscriptionEngine: ObservableObject {
         guard currentSessionIdentifier == sessionIdentifier else {
             return
         }
+        recordingStoppedCue.stop()
         transition(to: Presentation(state: .starting, statusText: "Connecting to microphone…"))
 
         let recordingURL: URL
@@ -357,6 +327,11 @@ final class TranscriptionEngine: ObservableObject {
             }
             currentRecorder = recorder
             activeTask = Task { @MainActor [weak self, recorder] in
+                // Capture the cursor before connecting a Bluetooth input or playing the cue.
+                if let self {
+                    _ = await self.textDelivery.updateLiveTranscript("", in: self.currentSessionTarget)
+                }
+                guard !Task.isCancelled else { recorder.cancel(); return }
                 let prepared = await recorder.prepare()
                 guard let self else {
                     recorder.cancel()
@@ -406,7 +381,6 @@ final class TranscriptionEngine: ObservableObject {
                         statusText: "Recording… Release or tap Right Option to stop"
                     )
                 )
-                _ = self.textDelivery.updateLiveTranscript("", in: self.currentSessionTarget)
                 self.livePreview.start(
                     recordingURL: recordingURL,
                     interval: self.livePreviewInterval
@@ -417,7 +391,7 @@ final class TranscriptionEngine: ObservableObject {
                           self.currentRecorderHasAudio else {
                         return
                     }
-                    _ = self.textDelivery.updateLiveTranscript(
+                    _ = await self.textDelivery.updateLiveTranscript(
                         text,
                         in: self.currentSessionTarget
                     )
@@ -447,12 +421,14 @@ final class TranscriptionEngine: ObservableObject {
         }
 
         transition(to: Presentation(state: .stopping, statusText: "Finalizing recording…"))
-        let previewTask = livePreview.stop()
+        _ = livePreview.stop()
         activeTask = Task { @MainActor [weak self, recorder] in
             let outcome = await recorder.stop()
-            // Close the microphone promptly on key-up, even when Whisper is
-            // still winding down the last preview subprocess.
-            await previewTask?.value
+            if let self, self.currentSessionIdentifier == sessionIdentifier, self.state == .stopping {
+                self.recordingStoppedCue.play()
+            }
+            // Preview/final decoders are independent. Cancel drafts immediately
+            // and start the final pass without waiting for preview cleanup.
             guard let self,
                   self.currentSessionIdentifier == sessionIdentifier,
                   self.state == .stopping else {
@@ -488,6 +464,7 @@ final class TranscriptionEngine: ObservableObject {
 
         switch event {
         case .maximumDurationReached where state == .recording:
+            recordingStoppedCue.play()
             guard let recorder = currentRecorder,
                   confirmCapturedAudio(from: recorder) else { return }
             currentRecorder = nil
@@ -497,9 +474,8 @@ final class TranscriptionEngine: ObservableObject {
                     statusText: "Maximum recording length reached. Finalizing…"
                 )
             )
-            let previewTask = livePreview.stop()
+            _ = livePreview.stop()
             activeTask = Task { @MainActor [weak self] in
-                await previewTask?.value
                 guard let self,
                       self.currentSessionIdentifier == sessionIdentifier,
                       self.state == .stopping else {
@@ -535,7 +511,7 @@ final class TranscriptionEngine: ObservableObject {
 
     /// A recording that never rose above the silence floor means the wrong input
     /// was open — usually the built-in microphone while the user speaks into an
-    /// interface. Say so instead of inserting whatever Whisper invents.
+    /// interface. Say so instead of inserting any invented transcript.
     private func confirmCapturedAudio(from recorder: any AudioRecording) -> Bool {
         let peak = recorder.peakLevel
         logger.notice(
@@ -605,6 +581,7 @@ final class TranscriptionEngine: ObservableObject {
 
     private func invalidateCurrentSession() {
         recordingReadyCue.stop()
+        recordingStoppedCue.stop()
         currentSessionIdentifier = nil
         currentSessionTarget = nil
         livePreview.cleanup()
@@ -658,17 +635,6 @@ final class TranscriptionEngine: ObservableObject {
     private func transition(to presentation: Presentation) {
         state = presentation.state
         statusText = presentation.statusText
-        whisperRecovery = presentation.whisperRecovery
+        modelRecovery = presentation.modelRecovery
     }
-}
-
-@MainActor
-private final class UnavailableRecordingFileStore: RecordingFileStoring {
-    func allocateRecordingURL() throws -> URL {
-        throw RecordingFileStoreError.unableToAllocateRecording
-    }
-
-    func removeRecording(at url: URL) throws {}
-    func removeStaleOwnedFiles(olderThan age: TimeInterval) throws {}
-    func cleanupInstance() throws {}
 }

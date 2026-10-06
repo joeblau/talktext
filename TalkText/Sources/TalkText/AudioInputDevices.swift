@@ -73,6 +73,9 @@ final class AudioInputSelection: ObservableObject, AudioInputResolving {
 
     private let lister: any AudioInputDeviceListing
     private let defaults: UserDefaults
+    /// The recorder polls the route every 250 ms; report a missing device once
+    /// per disconnect instead of on every poll.
+    private var reportedMissingUID: String?
 
     init(
         lister: any AudioInputDeviceListing = CoreAudioInputDeviceLister(),
@@ -108,14 +111,24 @@ final class AudioInputSelection: ObservableObject, AudioInputResolving {
             return lister.systemDefaultInputDevice()
         case let .device(uid):
             if let match = lister.inputDevices().first(where: { $0.uid == uid }) {
+                reportedMissingUID = nil
                 return match
             }
             // The chosen interface is unplugged. Recording from the system
             // default beats failing outright, and the menu still shows the
             // choice so it takes effect again on reconnect.
-            audioInputLogger.notice("Selected input device is unavailable; falling back to system default")
+            if reportedMissingUID != uid {
+                reportedMissingUID = uid
+                audioInputLogger.notice("Selected input device is unavailable; falling back to system default")
+            }
             return lister.systemDefaultInputDevice()
         }
+    }
+
+    /// True when the saved device is not currently connected.
+    var isPreferredDeviceMissing: Bool {
+        guard let uid = preference.uid else { return false }
+        return !devices.contains { $0.uid == uid }
     }
 
     /// Name for the current choice, including the resolved device behind
