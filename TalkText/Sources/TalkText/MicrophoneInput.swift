@@ -103,7 +103,12 @@ actor MicrophoneInput: MicrophoneInputDriving {
     }
 
     private func set<T>(_ unit: AudioUnit, property: AudioUnitPropertyID, scope: AudioUnitScope, element: AudioUnitElement, value: inout T) throws {
-        try check(AudioUnitSetProperty(unit, property, scope, element, &value, UInt32(MemoryLayout<T>.size)))
+        // An owned copy avoids a closure capture, which Swift 6.1 rejects as
+        // sending the non-Sendable AudioUnit across an isolation boundary.
+        let pointer = UnsafeMutablePointer<T>.allocate(capacity: 1)
+        pointer.initialize(to: value)
+        defer { pointer.deinitialize(count: 1); pointer.deallocate() }
+        try check(AudioUnitSetProperty(unit, property, scope, element, pointer, UInt32(MemoryLayout<T>.size)))
     }
 
     private func check(_ status: OSStatus) throws {
