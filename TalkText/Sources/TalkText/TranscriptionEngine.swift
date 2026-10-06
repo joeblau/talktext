@@ -97,7 +97,7 @@ final class TranscriptionEngine: ObservableObject {
         textDelivery: any TextDelivering,
         applicationBundleIdentifier: String? = AppIdentity.bundleIdentifier,
         maximumDuration: TimeInterval = TranscriptionEngine.maximumRecordingDuration,
-        livePreviewInterval: TimeInterval = 0.5,
+        livePreviewInterval: TimeInterval = 0.25,
         performStartupCleanup: Bool = true,
         startupPresentation: Presentation? = nil
     ) {

@@ -1,10 +1,9 @@
-@preconcurrency import AVFoundation
 import CoreML
 import FluidAudio
 import Foundation
 
-/// All weights remain resident; previews and final passes have independent
-/// decoder state so cancellation cannot corrupt the next recording.
+/// All weights remain resident. Every pass, draft or final, gets its own
+/// decoder state so cancelling a draft cannot corrupt the final transcript.
 actor ParakeetTranscriber: SpeechTranscribing, TranscriptionPreflighting {
     private let resolver: any ParakeetModelResolving
     private let audioValidator: any AudioValidating
@@ -55,18 +54,6 @@ actor ParakeetTranscriber: SpeechTranscribing, TranscriptionPreflighting {
         work.cancelAll()
     }
 
-    func makeLiveSession() async -> (any LiveSpeechSession)? {
-        do {
-            _ = try await prepareBackend()
-            try Task.checkCancellation()
-            return try await recognizer.makeLiveSession()
-        } catch {
-            // The final pass reports failures; a best-effort preview must not
-            // interrupt capture or insert an error into the destination app.
-            return nil
-        }
-    }
-
     private func performTranscription(audioURL: URL) async -> TranscriptionOutcome {
         do {
             try Task.checkCancellation()
@@ -110,7 +97,6 @@ protocol ParakeetRecognizing: Sendable {
     func validateHardware() async throws
     func loadModels(at directory: URL) async throws
     func transcribe(audioURL: URL) async throws -> String
-    func makeLiveSession() async throws -> any LiveSpeechSession
 }
 
 extension ParakeetRecognizing {
@@ -164,11 +150,6 @@ private actor FluidAudioParakeetRecognizer: ParakeetRecognizing {
         var decoder = TdtDecoderState.make(decoderLayers: models.version.decoderLayers)
         return try await manager.transcribe(audioURL, decoderState: &decoder).text
     }
-
-    func makeLiveSession() async throws -> any LiveSpeechSession {
-        guard let models else { throw ASRError.notInitialized }
-        return try await ParakeetLiveSession(models: models)
-    }
 }
 
 private final class TranscriptionWorkRegistry: @unchecked Sendable {
@@ -188,59 +169,5 @@ private final class TranscriptionWorkRegistry: @unchecked Sendable {
     func cancelAll() {
         let pending = lock.withLock { Array(cancellations.values) }
         pending.forEach { $0() }
-    }
-}
-
-private actor ParakeetLiveSession: LiveSpeechSession {
-    private let manager: SlidingWindowAsrManager
-    private var readPosition: AVAudioFramePosition = 0
-    private var cancelled = false
-
-    init(models: AsrModels) async throws {
-        manager = SlidingWindowAsrManager(config: SlidingWindowAsrConfig(
-            chunkSeconds: 1.5,
-            hypothesisChunkSeconds: 1,
-            leftContextSeconds: 2,
-            rightContextSeconds: 0.25
-        ))
-        try await manager.loadModels(models)
-        try await manager.startStreaming()
-    }
-
-    func transcribeNewAudio(at snapshotURL: URL) async -> String? {
-        guard !cancelled, !Task.isCancelled else { return nil }
-        do {
-            // AVAudioFile handles the WAV layout. Seek past previously streamed
-            // frames so a growing recording never repeats inference from zero.
-            let file = try AVAudioFile(forReading: snapshotURL)
-            guard file.length >= readPosition else { return nil }
-            file.framePosition = readPosition
-            while file.framePosition < file.length {
-                try Task.checkCancellation()
-                guard !cancelled,
-                      let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: 16_000) else { return nil }
-                try file.read(into: buffer)
-                guard buffer.frameLength > 0 else { break }
-                await manager.streamAudio(buffer)
-                readPosition = file.framePosition
-            }
-            return await manager.talkTextDraftTranscript()
-        } catch {
-            return nil
-        }
-    }
-
-    func cancel() async {
-        cancelled = true
-        await manager.cancel()
-    }
-}
-
-private extension SlidingWindowAsrManager {
-    /// Read both tiers in one actor turn so promotion cannot duplicate or drop
-    /// words between separate awaits.
-    func talkTextDraftTranscript() -> String? {
-        let text = [confirmedTranscript, volatileTranscript].filter { !$0.isEmpty }.joined(separator: " ")
-        return text.isEmpty ? nil : text
     }
 }

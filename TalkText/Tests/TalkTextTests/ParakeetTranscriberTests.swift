@@ -111,6 +111,4 @@ private final class ParakeetRecognizerFake: ParakeetRecognizing, @unchecked Send
         if let error { throw error }
         return text
     }
-
-    func makeLiveSession() async throws -> any LiveSpeechSession { throw CocoaError(.featureUnsupported) }
 }

@@ -477,9 +477,16 @@ final class TextDeliveryService: TextDelivering {
     }
 
     func updateLiveTranscript(_ text: String, in target: PasteTarget?) async -> Bool {
-        guard let target,
-              workspace.availability(of: target) == .available,
-              accessibility.ensurePermission(prompt: true) else {
+        guard let target else {
+            liveTextLogger.debug("Live draft skipped; no target app")
+            return false
+        }
+        guard workspace.availability(of: target) == .available else {
+            liveTextLogger.debug("Live draft skipped; target app changed")
+            return false
+        }
+        guard accessibility.ensurePermission(prompt: true) else {
+            liveTextLogger.debug("Live draft skipped; Accessibility is not granted")
             return false
         }
         return await liveTextEditor.update(text, in: target) == .updated

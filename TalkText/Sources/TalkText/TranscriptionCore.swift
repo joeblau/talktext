@@ -357,19 +357,12 @@ protocol TranscriptionPreflighting: Sendable {
     func preflightDependencies() async -> TalkTextDependencyPreflightResult
 }
 
-protocol LiveSpeechSession: Sendable {
-    func transcribeNewAudio(at snapshotURL: URL) async -> String?
-    func cancel() async
-}
-
 protocol SpeechTranscribing: Sendable {
     func transcribe(audioURL: URL) async -> TranscriptionOutcome
-    func makeLiveSession() async -> (any LiveSpeechSession)?
     func cancelActiveTranscriptions()
 }
 
 extension SpeechTranscribing {
-    func makeLiveSession() async -> (any LiveSpeechSession)? { nil }
     func cancelActiveTranscriptions() {}
 }
 

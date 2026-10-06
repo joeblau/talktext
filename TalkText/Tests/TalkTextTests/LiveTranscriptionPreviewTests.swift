@@ -61,25 +61,22 @@ final class LiveTranscriptionPreviewTests: XCTestCase {
         await snapshotter.complete()
     }
 
-    func testNativePreviewUsesItsSessionAndWaitsForCancellation() async throws {
-        let session = PreviewSessionFake()
-        let transcriber = PreviewTranscriberFake(session: session)
+    func testEachDraftIsAFullPassAndRepeatsAreNotRedelivered() async throws {
+        let transcriber = PreviewTranscriberFake(drafts: ["ask", "ask not", "ask not"])
         let preview = LiveTranscriptionPreview(
             recordingFileStore: EngineFileStoreFake(),
             recordingSnapshotter: EngineSnapshotterFake(result: true), transcriber: transcriber
         )
         var drafts: [String] = []
         preview.start(recordingURL: URL(fileURLWithPath: "/fixture.wav"), interval: 0.1) { drafts.append($0) }
-        for _ in 0..<100 {
-            if !drafts.isEmpty { break }
+        for _ in 0..<200 {
+            if transcriber.callCount >= 3 { break }
             try await Task.sleep(for: .milliseconds(10))
         }
         let stopped = preview.stop()
         await stopped?.value
-        XCTAssertEqual(drafts, ["live draft"])
-        XCTAssertEqual(transcriber.batchCalls, 0, "Live sessions must bypass whole-file inference")
-        let count = await session.cancelCount
-        XCTAssertEqual(count, 1, "Final transcription must be able to await live-session cancellation")
+        XCTAssertGreaterThanOrEqual(transcriber.callCount, 3)
+        XCTAssertEqual(drafts, ["ask", "ask not"], "An unchanged draft must not retype text at the cursor")
     }
 
     private func waitForSnapshot(_ snapshotter: EngineGatedSnapshotter) async throws -> URL {
@@ -92,21 +89,16 @@ final class LiveTranscriptionPreviewTests: XCTestCase {
     }
 }
 
-private actor PreviewSessionFake: LiveSpeechSession {
-    private(set) var cancelCount = 0
-    func transcribeNewAudio(at snapshotURL: URL) async -> String? { "live draft" }
-    func cancel() async { cancelCount += 1 }
-}
-
 private final class PreviewTranscriberFake: SpeechTranscribing, @unchecked Sendable {
-    let session: PreviewSessionFake
     private let lock = NSLock()
+    private var drafts: [String]
     private var calls = 0
-    var batchCalls: Int { lock.withLock { calls } }
-    init(session: PreviewSessionFake) { self.session = session }
-    func makeLiveSession() async -> (any LiveSpeechSession)? { session }
+    var callCount: Int { lock.withLock { calls } }
+    init(drafts: [String]) { self.drafts = drafts }
     func transcribe(audioURL: URL) async -> TranscriptionOutcome {
-        lock.withLock { calls += 1 }
-        return .success("batch result")
+        lock.withLock {
+            calls += 1
+            return drafts.isEmpty ? .noSpeech : .success(drafts.removeFirst())
+        }
     }
 }

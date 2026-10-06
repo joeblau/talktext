@@ -126,10 +126,14 @@ final class SystemLiveTextEditor: LiveTextEditing {
         let originalText: String
         var draftUTF16Length: Int
         var expectedValue: String
+        /// False while only the cursor has been captured. Until a draft lands,
+        /// a field that refuses edits can still hand over to keystroke typing.
+        var hasDraft: Bool
     }
 
-    /// Text typed blind into an app with no readable focused element. Each
-    /// revision deletes only the characters that changed since the last draft.
+    /// Text typed blind into an app whose focused field cannot be read or
+    /// edited through Accessibility. Each revision deletes only the characters
+    /// that changed since the last draft.
     private struct KeystrokeSession {
         let target: PasteTarget
         var typedText: String
@@ -156,30 +160,52 @@ final class SystemLiveTextEditor: LiveTextEditing {
     private func updateDraft(_ text: String, in target: PasteTarget) async -> LiveTextUpdateOutcome {
         guard !Task.isCancelled else { return .unavailable }
         if keystrokeSession != nil {
-            return await reviseKeystrokeDraft(to: text, in: target) ? .updated : .unavailable
+            guard await reviseKeystrokeDraft(to: text, in: target) else {
+                liveTextLogger.debug("Keystroke draft revision failed")
+                return .unavailable
+            }
+            return .updated
         }
         if var session {
-            guard session.target == target,
-                  session.element.isFocused,
-                  let updatedValue = replacingDraft(in: session, with: text),
-                  await session.element.replace(replacementRange(in: session), with: text) else {
+            guard session.target == target, session.element.isFocused else {
+                liveTextLogger.debug("Live draft skipped; focus left the dictation field")
                 return .unavailable
+            }
+            guard let updatedValue = replacingDraft(in: session, with: text) else {
+                liveTextLogger.debug("Live draft skipped; field changed outside dictation")
+                return .unavailable
+            }
+            guard await session.element.replace(replacementRange(in: session), with: text) else {
+                guard !session.hasDraft else {
+                    liveTextLogger.debug("Live draft replacement was rejected by the field")
+                    return .unavailable
+                }
+                liveTextLogger.debug("Focused field rejected edits; using keystroke drafts")
+                self.session = nil
+                return await beginKeystrokeDraft(text, in: target)
             }
             _ = session.element.select(NSRange(location: session.replacementLocation + (text as NSString).length, length: 0))
             session.draftUTF16Length = (text as NSString).length
             session.expectedValue = updatedValue
+            session.hasDraft = true
             self.session = session
             return .updated
         }
 
-        guard let element = focusedElement(target) else {
+        // Editors such as Sublime Text expose a focused element without its
+        // value, and GPU terminals expose none at all. Both still accept typed
+        // text at the cursor.
+        guard let element = focusedElement(target), let currentValue = element.text else {
+            liveTextLogger.debug("No readable focused field; using keystroke drafts")
             return await beginKeystrokeDraft(text, in: target)
         }
-        guard let currentValue = element.text,
-              let replacementRange = element.selection,
+        // A readable value with no usable selection has an unknown cursor, so
+        // typing there could land anywhere in the user's text.
+        guard let replacementRange = element.selection,
               replacementRange.location >= 0, replacementRange.length >= 0,
               replacementRange.location <= (currentValue as NSString).length,
               replacementRange.length <= (currentValue as NSString).length - replacementRange.location else {
+            liveTextLogger.debug("Focused field has no usable selection")
             return .unavailable
         }
         let currentNSString = currentValue as NSString
@@ -188,12 +214,14 @@ final class SystemLiveTextEditor: LiveTextEditing {
         // startup. The first actual draft performs the guarded replacement.
         if text.isEmpty {
             session = Session(target: target, element: element, replacementLocation: replacementRange.location,
-                              originalText: originalText, draftUTF16Length: replacementRange.length, expectedValue: currentValue)
+                              originalText: originalText, draftUTF16Length: replacementRange.length,
+                              expectedValue: currentValue, hasDraft: false)
             return .updated
         }
         let updatedValue = currentNSString.replacingCharacters(in: replacementRange, with: text)
         guard await element.replace(replacementRange, with: text) else {
-            return .unavailable
+            liveTextLogger.debug("Focused field rejected edits; using keystroke drafts")
+            return await beginKeystrokeDraft(text, in: target)
         }
         _ = element.select(NSRange(location: replacementRange.location + (text as NSString).length, length: 0))
 
@@ -203,7 +231,8 @@ final class SystemLiveTextEditor: LiveTextEditing {
             replacementLocation: replacementRange.location,
             originalText: originalText,
             draftUTF16Length: (text as NSString).length,
-            expectedValue: updatedValue
+            expectedValue: updatedValue,
+            hasDraft: true
         )
         return .updated
     }
@@ -262,6 +291,7 @@ final class SystemLiveTextEditor: LiveTextEditing {
         let text = Self.blindKeystrokeText(text)
         guard let keystrokeTyper, keystrokeTyper.canType(into: target),
               await keystrokeTyper.type(deleting: 0, inserting: text, into: target) else {
+            liveTextLogger.debug("Keystroke draft could not start")
             return .unavailable
         }
         keystrokeSession = KeystrokeSession(target: target, typedText: text)

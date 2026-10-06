@@ -306,6 +306,56 @@ final class LiveTextEditorTests: XCTestCase {
         XCTAssertTrue(typer.operations.isEmpty)
     }
 
+    func testFieldWithoutReadableValueReceivesKeystrokeDrafts() async {
+        let element = LiveTextElementFake(text: "", selection: NSRange(location: 0, length: 0))
+        element.text = nil
+        let typer = LiveKeystrokeTyperFake()
+        let editor = SystemLiveTextEditor(focusedElement: { _ in element }, keystrokeTyper: typer)
+        let target = makeTarget()
+
+        let primed = await editor.update("", in: target)
+        let draft = await editor.update("one", in: target)
+        let final = await editor.finalize("one two.", in: target)
+
+        XCTAssertEqual([primed, draft], [.updated, .updated])
+        XCTAssertEqual(final, .finalized)
+        XCTAssertEqual(typer.text, "one two.")
+        XCTAssertEqual(element.selectedTextWrites, 0)
+    }
+
+    func testFieldThatRejectsTheFirstDraftHandsOverToKeystrokes() async {
+        let element = LiveTextElementFake(text: "Hi ", selection: NSRange(location: 3, length: 0))
+        element.canReplaceSelectedText = false
+        let typer = LiveKeystrokeTyperFake(text: "Hi ")
+        let editor = SystemLiveTextEditor(focusedElement: { _ in element }, keystrokeTyper: typer)
+        let target = makeTarget()
+
+        let primed = await editor.update("", in: target)
+        let draft = await editor.update("there", in: target)
+        let final = await editor.finalize("there.", in: target)
+
+        XCTAssertEqual([primed, draft], [.updated, .updated])
+        XCTAssertEqual(final, .finalized)
+        XCTAssertEqual(typer.text, "Hi there.")
+        XCTAssertEqual(element.text, "Hi ", "The rejected Accessibility write must not have changed the field")
+    }
+
+    func testFieldThatRejectsALaterRevisionKeepsItsDraftForCancellation() async {
+        let element = LiveTextElementFake(text: "", selection: NSRange(location: 0, length: 0))
+        let typer = LiveKeystrokeTyperFake()
+        let editor = SystemLiveTextEditor(focusedElement: { _ in element }, keystrokeTyper: typer)
+        _ = await editor.update("", in: makeTarget())
+        let draft = await editor.update("draft", in: makeTarget())
+        element.rejectedWrites = 1
+
+        let revision = await editor.update("draft two", in: makeTarget())
+
+        XCTAssertEqual([draft, revision], [.updated, .unavailable])
+        XCTAssertTrue(typer.operations.isEmpty, "Typing after an Accessibility draft would duplicate it")
+        await editor.cancel()
+        XCTAssertEqual(element.text, "")
+    }
+
     private func makeTarget(pid: pid_t = 42) -> PasteTarget {
         PasteTarget(processIdentifier: pid, bundleIdentifier: "test.editor", launchDate: Date(timeIntervalSince1970: 0), bundleURL: nil)!
     }

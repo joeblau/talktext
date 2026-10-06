@@ -34,9 +34,8 @@ final class ParakeetIntegrationTests: XCTestCase {
             guard case let .success(text) = final else { return XCTFail("Expected a successful native transcription") }
             XCTAssertTrue(text.lowercased().contains("country"))
             XCTAssertTrue(text.lowercased().contains("ask not"))
-            guard let session = await transcriber.makeLiveSession() else { return XCTFail("Expected a native live session") }
-            // Exercise the same open-file snapshot path as microphone capture,
-            // with short increments rather than feeding a finished WAV at once.
+            // Exercise the same open-file snapshot path as microphone capture:
+            // a draft must arrive from the first seconds, before the recorder stops.
             let captureURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".wav")
             let snapshotURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".wav")
             defer {
@@ -46,38 +45,17 @@ final class ParakeetIntegrationTests: XCTestCase {
             let source = try AVAudioFile(forReading: fixture)
             let capture = try CapturedAudioSink(file: AVAudioFile(forWriting: captureURL, settings: source.fileFormat.settings))
             XCTAssertTrue(capture.beginCapturing())
-            let snapshotter = ActiveWAVRecordingSnapshotter()
-            for _ in 0..<6 {
-                let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: source.processingFormat, frameCapacity: 8000))
-                try source.read(into: buffer)
-                capture.append(buffer)
-                let created = await snapshotter.createSnapshot(from: captureURL, at: snapshotURL)
-                XCTAssertTrue(created, "Active input must be readable before the recorder stops")
-                _ = await session.transcribeNewAudio(at: snapshotURL)
-                try await Task.sleep(for: .milliseconds(50))
-            }
-            var earlyDraft: String?
-            for _ in 0..<100 {
-                earlyDraft = await session.transcribeNewAudio(at: snapshotURL)
-                if earlyDraft?.isEmpty == false { break }
-                try await Task.sleep(for: .milliseconds(25))
-            }
-            XCTAssertFalse(earlyDraft?.isEmpty ?? true, "The first three seconds must produce a draft before stop")
+            let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: source.processingFormat, frameCapacity: 48000))
+            try source.read(into: buffer)
+            capture.append(buffer)
+            let created = await ActiveWAVRecordingSnapshotter().createSnapshot(from: captureURL, at: snapshotURL)
+            XCTAssertTrue(created, "Active input must be readable before the recorder stops")
+            let start = ContinuousClock.now
+            let draft = await transcriber.transcribe(audioURL: snapshotURL)
+            XCTAssertLessThan(ContinuousClock.now - start, .seconds(2), "A short draft must be fast enough to feel live")
             XCTAssertTrue(capture.close())
-            var draft: String?
-            for _ in 0..<100 {
-                draft = await session.transcribeNewAudio(at: fixture)
-                if draft?.lowercased().contains("country") == true { break }
-                try await Task.sleep(for: .milliseconds(50))
-            }
-            async let cancellation: Void = session.cancel()
-            let independentFinal = await transcriber.transcribe(audioURL: fixture)
-            await cancellation
-            guard case let .success(independentText) = independentFinal else { return XCTFail("Final inference must survive preview cancellation") }
-            XCTAssertTrue(independentText.lowercased().contains("ask not"))
-            XCTAssertFalse(draft?.isEmpty ?? true, "Expected a draft from the incremental recognizer")
-            let afterCancel = await session.transcribeNewAudio(at: fixture)
-            XCTAssertNil(afterCancel, "Cancelled sessions must not deliver stale drafts")
+            guard case let .success(draftText) = draft else { return XCTFail("Expected a draft from the first three seconds") }
+            XCTAssertTrue(draftText.lowercased().contains("fellow"))
         #endif
     }
 }
