@@ -10,6 +10,8 @@ RELEASE_COMMAND="${1:-release}"
 CANONICAL_RELEASE_FILES=(
     VERSION
     dependencies.env
+    TalkText/Package.resolved
+    TalkText/Sources/TalkText/Resources/parakeet-model.json
     TalkText/Info.plist
     TalkText/TalkText.entitlements
 )
@@ -91,6 +93,11 @@ if [[ -n "${TALKTEXT_DEPENDENCY_MANIFEST:-}" && "$TALKTEXT_DEPENDENCY_MANIFEST" 
     fail "release does not accept a dependency manifest override"
 fi
 export TALKTEXT_DEPENDENCY_MANIFEST="$DEPENDENCY_MANIFEST"
+CANONICAL_MODEL_MANIFEST="$SCRIPT_DIR/TalkText/Sources/TalkText/Resources/parakeet-model.json"
+if [[ -n "${TALKTEXT_MODEL_MANIFEST:-}" && "$TALKTEXT_MODEL_MANIFEST" != "$CANONICAL_MODEL_MANIFEST" ]]; then
+    fail "release does not accept a model manifest override"
+fi
+export TALKTEXT_MODEL_MANIFEST="$CANONICAL_MODEL_MANIFEST"
 
 VERSION="$("$SCRIPT_DIR/scripts/read-version.sh")"
 EXPECTED_TAG="v$VERSION"

@@ -4,6 +4,24 @@ import XCTest
 
 @MainActor
 final class TranscriptionEngineAudioStartupTests: XCTestCase {
+    func testCapturesCursorBeforeWaitingForMicrophoneReadiness() async {
+        let recorder = EngineRecorderFake()
+        recorder.completesPreparationImmediately = false
+        let delivery = EngineDeliveryFake()
+        let engine = makeEngine(factory: EngineRecorderFactoryFake(recorders: [recorder]), delivery: delivery)
+
+        engine.startRecording()
+        await waitUntil { recorder.preparationCount == 1 }
+        XCTAssertEqual(delivery.liveUpdatedTexts, [""])
+        XCTAssertEqual(engine.state, .starting)
+
+        engine.stopRecording()
+        XCTAssertEqual(engine.state, .idle)
+        recorder.completePreparation(with: true)
+        await spinMainActor()
+        XCTAssertEqual(recorder.startCount, 0)
+    }
+
     func testAutomaticStopRejectsSilentAndInvalidLevels() async {
         for peak: Float in [-80, -.infinity, .nan, .infinity] {
             let recorder = EngineRecorderFake()
@@ -183,7 +201,7 @@ final class TranscriptionEngineAudioStartupTests: XCTestCase {
         factory: EngineRecorderFactoryFake = EngineRecorderFactoryFake(),
         store: EngineFileStoreFake = EngineFileStoreFake(),
         snapshotter: any ActiveRecordingSnapshotting = EngineSnapshotterFake(),
-        transcriber: any WhisperTranscribing = EngineTranscriberFake(),
+        transcriber: any SpeechTranscribing = EngineTranscriberFake(),
         delivery: EngineDeliveryFake = EngineDeliveryFake(),
         livePreviewInterval: TimeInterval = 1.5
     ) -> TranscriptionEngine {
@@ -191,6 +209,7 @@ final class TranscriptionEngineAudioStartupTests: XCTestCase {
             permissionProvider: permission,
             recorderFactory: factory,
             recordingReadyCue: recordingReadyCue,
+            recordingStoppedCue: EngineStoppedCueFake(),
             recordingFileStore: store,
             recordingSnapshotter: snapshotter,
             dependencyPreflight: preflight,

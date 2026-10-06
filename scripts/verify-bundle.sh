@@ -129,11 +129,22 @@ done
 [[ -r "$DEPENDENCY_MANIFEST" ]] || fail "dependency manifest is missing: $DEPENDENCY_MANIFEST"
 # shellcheck source=/dev/null
 source "$DEPENDENCY_MANIFEST"
-[[ -n "${MODEL_FILE_NAME:-}" ]] || fail "dependency manifest does not define MODEL_FILE_NAME"
-BUNDLED_MODEL="$APP_PATH/Contents/Resources/models/$MODEL_FILE_NAME"
+[[ -n "${MODEL_DIRECTORY_NAME:-}" ]] || fail "dependency manifest does not define MODEL_DIRECTORY_NAME"
+CANONICAL_MODEL_MANIFEST="$REPOSITORY_ROOT/$MODEL_MANIFEST_RELATIVE_PATH"
+MODEL_MANIFEST="${TALKTEXT_MODEL_MANIFEST:-$CANONICAL_MODEL_MANIFEST}"
+if [[ "$EXPECTED_SIGNATURE" == 'developer-id' && "$MODEL_MANIFEST" != "$CANONICAL_MODEL_MANIFEST" ]]; then
+    fail "Developer ID verification does not accept a model manifest override"
+fi
+export TALKTEXT_MODEL_MANIFEST="$MODEL_MANIFEST"
+BUNDLED_MODEL="$APP_PATH/Contents/Resources/models/$MODEL_DIRECTORY_NAME"
+[[ -r "$APP_PATH/Contents/Resources/parakeet-model.json" ]] || fail "TalkText model manifest resource is missing"
+cmp -s "$CANONICAL_MODEL_MANIFEST" "$APP_PATH/Contents/Resources/parakeet-model.json" || fail "bundled model manifest differs from the reviewed source"
+[[ -d "$APP_PATH/Contents/Resources/FluidAudio_FluidAudio.bundle" ]] || fail "FluidAudio resources are missing"
 TALKTEXT_DEPENDENCY_MANIFEST="$DEPENDENCY_MANIFEST" \
     "$SCRIPT_DIR/dependency-tool.sh" verify-model "$BUNDLED_MODEL"
 
+[[ -r "$APP_PATH/Contents/Resources/Licenses/ParakeetNOTICE.txt" ]] || fail "Parakeet attribution is missing"
+[[ -r "$APP_PATH/Contents/Resources/Licenses/FluidAudio-Apache-2.0.txt" ]] || fail "FluidAudio license is missing"
 codesign --verify --deep --strict --verbose=4 "$APP_PATH"
 SIGNATURE_DETAILS="$(codesign --display --verbose=4 "$APP_PATH" 2>&1)"
 grep -Fq "Identifier=$BUNDLE_IDENTIFIER" <<< "$SIGNATURE_DETAILS" || fail "signature identifier does not match Info.plist"

@@ -476,13 +476,20 @@ final class TextDeliveryService: TextDelivering {
         workspace.currentExternalTarget(excludingBundleIdentifier: excludingBundleIdentifier)
     }
 
-    func updateLiveTranscript(_ text: String, in target: PasteTarget?) -> Bool {
-        guard let target,
-              workspace.availability(of: target) == .available,
-              accessibility.ensurePermission(prompt: true) else {
+    func updateLiveTranscript(_ text: String, in target: PasteTarget?) async -> Bool {
+        guard let target else {
+            liveTextLogger.debug("Live draft skipped; no target app")
             return false
         }
-        return liveTextEditor.update(text, in: target) == .updated
+        guard workspace.availability(of: target) == .available else {
+            liveTextLogger.debug("Live draft skipped; target app changed")
+            return false
+        }
+        guard accessibility.ensurePermission(prompt: true) else {
+            liveTextLogger.debug("Live draft skipped; Accessibility is not granted")
+            return false
+        }
+        return await liveTextEditor.update(text, in: target) == .updated
     }
 
     func finalizeLiveTranscript(_ text: String, in target: PasteTarget?) async -> DeliveryOutcome {
@@ -492,19 +499,24 @@ final class TextDeliveryService: TextDelivering {
         if let target,
            workspace.availability(of: target) == .available,
            accessibility.ensurePermission(prompt: true) {
-            switch liveTextEditor.finalize(text, in: target) {
+            switch await liveTextEditor.finalize(text, in: target) {
             case .finalized:
                 return .inserted
             case .noActiveDraft, .unavailable:
                 break
             }
         }
-        liveTextEditor.cancel()
+        if await liveTextEditor.cancel() == .unavailable {
+            let outcome = await deliver(text, to: nil)
+            if case .copiedForManualPaste = outcome { return .copiedForManualPaste(.liveDraftChanged) }
+            return outcome
+        }
         return await deliver(text, to: target)
     }
 
     func cancelLiveTranscript() {
-        liveTextEditor.cancel()
+        let editor = liveTextEditor
+        Task { _ = await editor.cancel() }
     }
 
     func deliver(_ text: String, to target: PasteTarget?) async -> DeliveryOutcome {

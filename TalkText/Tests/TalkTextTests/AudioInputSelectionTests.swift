@@ -48,10 +48,12 @@ final class AudioInputSelectionTests: XCTestCase {
         XCTAssertEqual(selection.resolveInputDevice(), .builtIn)
         XCTAssertEqual(selection.preference, .device(uid: AudioInputDevice.interface.uid))
         XCTAssertEqual(selection.selectionSummary, "Unavailable device — using system default")
+        XCTAssertTrue(selection.isPreferredDeviceMissing)
 
         lister.devices = [.builtIn, .interface]
         selection.refreshDevices()
         XCTAssertEqual(selection.resolveInputDevice(), .interface)
+        XCTAssertFalse(selection.isPreferredDeviceMissing)
     }
 
     func testSelectingSystemDefaultAgainClearsThePersistedChoice() {

@@ -1,63 +1,57 @@
 # TalkText
 
-TalkText is a macOS menu bar app for recording speech, transcribing it live at the cursor with Whisper, and inserting the final transcription into the focused text field.
+TalkText is a macOS menu bar app for recording speech, transcribing it live at the cursor with Parakeet, and inserting the final transcription into the focused text field.
 
-While recording, TalkText replaces Whisper's latest draft directly at the
-captured cursor and shows an active microphone in the menu bar. Drafts are
-generated from finalized copies of audio already flushed to disk, so previewing
-never pauses the microphone. When recording stops, TalkText replaces the draft
-with one final transcription of the complete recording.
+While recording, TalkText replaces Parakeet's latest draft directly at the
+captured cursor and shows an active microphone in the menu bar. Fields that
+answer Accessibility are edited in place. Fields that do not, such as Sublime
+Text's editor or GPU-rendered terminals, receive drafts as keystrokes: only the
+changed tail is deleted and retyped, and only while that app stays frontmost.
+Each draft is a full Parakeet pass over a snapshot of the recording so far, so
+the first words appear within about half a second and drafts read like the
+final text. When recording stops, TalkText cancels the draft loop and replaces the draft
+with one final transcription of the complete recording. This final pass uses
+fresh decoder state and the same loaded weights. Final text is trimmed without
+rewriting identifiers, symbols, or instructions; an LLM cleanup stage is not
+part of this workflow.
 
 Hold the right Option key to record and release it to stop, or double-tap it to
 lock recording on until the next right-Option press stops it. A single tap does
 nothing, so right Option stays usable as an ordinary modifier. TalkText opens
 and verifies the microphone silently, discards that warm-up audio, then plays a
-light ready chime; speech after the chime is what enters the recording.
+short two-note ready chime; speech after the chime is what enters the recording. A distinct
+stop cue plays once the microphone closes, including at the recording time
+limit, while final transcription continues.
 
 TalkText records from the input chosen under **Input** in the menu bar. The
 default follows System Settings, which is rarely what you want if you speak into
 an audio interface while the Mac's default input is still the built-in
 microphone — pick the interface once and TalkText remembers it, falling back to
 the system default whenever that device is unplugged. A recording that never
-rises above silence is reported by name instead of transcribed, because Whisper
-answers silence with confident inventions such as "you".
+rises above silence is reported by name instead of submitted to the recognizer.
 
 TalkText does not call a recording ready until microphone buffers have actually
 reached its WAV file. If macOS changes an input route during startup or capture
 — common when Bluetooth headphones switch profiles — TalkText resolves a fresh
-CoreAudio device ID, rebuilds the audio graph, and retries within a fixed bound.
+CoreAudio device ID and retries within a fixed bound. An input-only AUHAL keeps
+capture independent of playback, and a watchdog recovers stalled input even when
+macOS does not send a route notification. Device setup, chime playback, resampling,
+and disk writes run off the UI thread. The resampler flushes its trailing audio
+on stop and format changes so key-up does not clip the final syllable.
 
 ## Requirements
 
-- macOS 14+ on Apple Silicon or Intel (the app is Universal 2)
-- A supported `whisper-cli`: `whisper-cpp` 1.8.4, 1.9.1, or 1.9.2
+- macOS 14+ on Apple Silicon; Parakeet requires the native arm64 app
+- Parakeet TDT 0.6B v2 Core ML assets (about 464 MB; included in packaged apps)
+- Python 3.9+ for model setup and bundle verification
 - Accessibility access for auto-insert and synthetic paste fallback
 - Microphone access
 
 ## Local Development
 
-To build and launch the signed development app without opening Xcode, run from
-the repository root or the `TalkText/` Swift package directory:
-
-```sh
-bun macos
-```
-
-The command regenerates the development project, builds `TalkText.app` with
-`xcodebuild`, stops an older running instance, and launches the new build. It
-uses the same stable local signing configuration described below, so macOS
-permission grants survive rebuilds when an Apple Development certificate is
-available. The one-time project generator dependencies are `xcodegen` and
-`jq` (`brew install xcodegen jq`).
-
-The launcher identifies the running app by bundle identifier, waits for normal
-AppKit cleanup and LaunchServices deregistration, and retries transient macOS
-handoff failures such as error `-609`. It only reports success after the exact
-new executable has remained running, so a successful command means the menu-bar
-app actually started rather than merely that `open` accepted the request.
-
 To build the self-contained Universal 2 app and deploy it to
-`/Applications/TalkText.app`, run from either directory:
+`/Applications/TalkText.app`, run from the repository root or the `TalkText/`
+Swift package directory:
 
 ```sh
 bun talktext
@@ -69,6 +63,11 @@ the new bundle before replacing the installed app. If TalkText is running, the
 command quits it before deployment and restarts the installed build afterward
 through the same verified macOS launch lifecycle.
 
+The launcher identifies the running app by bundle identifier, waits for normal
+AppKit cleanup and LaunchServices deregistration, and retries transient macOS
+handoff failures such as error `-609`. It only reports success after the exact
+new executable has remained running.
+
 Without an Apple Development identity it falls back to ad-hoc signing, which
 can require renewed Accessibility and microphone grants after deployment.
 
@@ -78,24 +77,26 @@ From a clean checkout, run:
 ./setup.sh
 ```
 
-Setup resolves or installs a supported backend, downloads the pinned
-`ggml-base.en.bin` model with retries and verification, and builds the
-release executable. It prints an absolute, shell-escaped command that works
-from the caller's current directory. The equivalent command from the
-repository root is:
+Setup downloads and verifies every file of the pinned English Parakeet v2
+model, then builds the release executable. FluidAudio 0.17.4 is linked into
+TalkText through Swift Package Manager; no separate transcription executable
+or Homebrew STT formula is required. Setup prints the built executable path.
+Use `bun talktext` to build and deploy the app, or `./bundle.sh` to build a local
+app bundle with macOS permissions.
+The built executable is located at:
 
 ```sh
 "$(pwd)/TalkText/.build/release/TalkText"
 ```
 
 The development executable infers the repository root from its SwiftPM
-`.build` path, so it discovers the model installed at `models/` without a
+`.build` path, so it discovers models installed under `models/` without a
 machine-specific source path. To build the signed local Universal 2 app bundle
 instead, run:
 
 ```sh
 ./bundle.sh
-open TalkText.app
+open -a "$PWD/TalkText.app"
 ```
 
 ### Debugging in Xcode
@@ -124,7 +125,8 @@ resolves local signing, neither of which a plain `xcodegen` run can do.
 
 Development builds are signed with your own Apple Development certificate, which
 the script finds in your keychain and writes to an untracked `Local.xcconfig`.
-This matters for more than trust prompts: an ad-hoc signature's designated
+When the keychain holds several teams, it prefers team `K78G42H4U2`; set
+`TALKTEXT_DEVELOPMENT_TEAM` to choose a different one. This matters for more than trust prompts: an ad-hoc signature's designated
 requirement pins the exact code hash, so every rebuild invalidates the
 Accessibility and microphone grants and macOS re-prompts on the next paste, while
 the stale entry still shows as enabled in System Settings. A certificate identity
@@ -143,102 +145,80 @@ come from `./bundle.sh`, which is what CI verifies.
 See [docs/RELEASING.md](docs/RELEASING.md) for the architecture, signing,
 notarization, and required-check policy.
 
+## Parakeet transcription workflow
+
+The app loads Parakeet TDT 0.6B v2 through [FluidAudio](https://github.com/FluidInference/FluidAudio).
+It uses Core ML's CPU and Neural Engine on Apple Silicon. The Universal 2 app
+shows an unsupported-hardware message on Intel or under Rosetta before loading
+models. Weights remain resident between recordings. The first load may take
+longer while Core ML compiles for the device.
+
+Live preview re-transcribes a snapshot of the open recording every quarter
+second plus inference time. Parakeet decodes 3 seconds of audio in under 0.1
+seconds, 30 seconds in about 0.2 seconds, and the 5-minute maximum in about 0.9
+seconds on Apple Silicon, so drafts stay current for the whole recording. When
+recording stops, the microphone closes promptly, preview work is cancelled, and
+the complete recording receives one final audio pass before delivery without
+waiting for preview cleanup.
+
+Inference is offline. TalkText uses `AsrModels.loadLocal`, disables SDK network
+fetches, and suppresses SDK transcript logging. Setup is the only model-download
+step. Optional vocabulary boosting and LLM text cleanup can be added separately.
+
 ## Dependency discovery and preflight
 
-TalkText performs dependency preflight before requesting microphone permission
-or allocating a recording. It requires the model to be a readable regular GGML
-file of the pinned size, and `whisper-cli` to be readable, executable, an exact
-supported version, and to advertise every production option. Failures are
-shown as actionable setup errors before recording starts. Startup diagnostics
-record the resolution source and backend version; resolved paths are logged as
-private metadata and no dictated content is included.
+TalkText resolves and loads local models before requesting microphone permission
+or allocating recording files. Missing, incomplete, unreadable, or incorrectly
+sized assets become visible setup errors. Core ML load failures remain distinct
+from successful no-speech results. Startup logs include the SDK version and
+resolution source; paths remain private and dictated text is never logged.
 
-Backend resolution uses the same policy in setup and the app, in this order:
+Model directories are searched in this order:
 
-1. `TALKTEXT_WHISPER_CLI` explicit override
-2. `Contents/Resources/bin/whisper-cli` in a packaged app
-3. `PATH`
-4. `HOMEBREW_PREFIX`, `/opt/homebrew`, then `/usr/local`
-5. `.dependencies/bin` then `bin` under each development root:
-   `TALKTEXT_DEVELOPMENT_ROOT` (when set), the inferred checkout, the current
-   directory, then its parent
-6. `~/.local/bin`
+1. `TALKTEXT_MODEL_PATH`, an explicit directory override (relative paths resolve
+   against the working directory). An invalid override fails without fallback.
+2. Bundled `Contents/Resources/models/parakeet-tdt-0.6b-v2-coreml`.
+3. `models/parakeet-tdt-0.6b-v2-coreml` under `TALKTEXT_DEVELOPMENT_ROOT`, the
+   checkout inferred from a SwiftPM executable, the working directory, and its
+   parent.
+4. `~/Library/Application Support/TalkText/models/parakeet-tdt-0.6b-v2-coreml`.
 
-Model resolution uses `TALKTEXT_MODEL_PATH`, bundled `Resources/models`, a
-`models/` directory under the same development roots, per-user application
-data, then Homebrew model locations. An explicit but invalid override fails
-closed instead of silently selecting another file.
-
-Homebrew 1.8.4 does not implement `--version`, so the resolver can derive its
-version from the resolved Cellar path. A custom or bundled executable must
-report its version, have a neighboring `<executable>.version` file, or be paired
-with a reviewed `TALKTEXT_WHISPER_CLI_VERSION` override. An unreported or
-unsupported version is rejected even when its flags happen to look compatible.
-Version metadata trims only surrounding whitespace, accepts one optional
-lowercase `v`, and must otherwise be an exact three-component numeric version.
+An incomplete preferred directory fails without silently selecting other weights.
+`TALKTEXT_MODEL_PATH` now names a directory, rather than a GGML file. Remove old
+Whisper-specific environment overrides when migrating an existing checkout.
 
 ## Pinned model supply chain
 
-[`dependencies.env`](dependencies.env) is the only reviewed manifest for the
-model repository, immutable upstream revision, URL, exact byte size, GGML
-magic, and SHA-256. `scripts/dependency-tool.sh install-model` downloads into a
-temporary file in the destination directory using HTTP failure handling and
-retries. It validates format, size, and digest before an atomic rename. A valid
-cache avoids the network; an invalid cache is reported, replaced only after a
-verified download succeeds, and retained under an `.invalid.<timestamp>`
-quarantine name for diagnosis.
+[`parakeet-model.json`](TalkText/Sources/TalkText/Resources/parakeet-model.json)
+pins the model repository, immutable revision, and exact size and SHA-256 for
+all 21 required Core ML files. [`dependencies.env`](dependencies.env) mirrors the
+reviewed model identity and SDK version; tests prevent those values from drifting.
+[`Package.resolved`](TalkText/Package.resolved) pins the FluidAudio source revision.
 
-Production setup and release reject `TALKTEXT_DEPENDENCY_MANIFEST` values that
-do not name the repository's reviewed manifest. Developer ID bundling and
-verification enforce the same boundary before sourcing a manifest. Tests
-exercise alternate manifests only on non-production paths.
+The model installer verifies cached assets before avoiding the network. Downloads
+use the immutable revision, bounded retries, and a temporary directory. Every file
+must pass size and digest checks before installation. A corrupt existing cache is
+retained under an `.invalid.<uuid>` directory after a verified replacement is
+ready; failed downloads leave the prior cache untouched.
 
-Setup, bundling, and release all use the same verifier. To audit a local cache:
+Setup, bundle assembly, and bundle verification use the same verifier:
 
 ```sh
-./scripts/dependency-tool.sh verify-model ./models/ggml-base.en.bin
+./scripts/dependency-tool.sh verify-model ./models/parakeet-tdt-0.6b-v2-coreml
 ```
 
-Updating the model is an explicit dependency review:
+Production setup and release reject alternate model manifests. Developer ID
+bundling also rejects manifest overrides. CI uses a small deterministic fixture
+to verify packaging, plus real model inference on Apple Silicon and the
+unsupported-hardware guard on Intel.
 
-1. Select an immutable upstream revision—never a moving branch such as `main`.
-2. Independently download the object and record its repository, revision, URL,
-   byte size, GGML magic, and locally computed SHA-256 in `dependencies.env`.
-3. Run `tests/dependency-tool-fixtures.sh`, `swift test --package-path TalkText`,
-   and a verified bundle build.
-4. Review the manifest diff and record the model revision/digest in release
-   notes before publishing.
+To update the dependency, review the SDK pin, the immutable model revision, every
+file size and digest, the resolver contract, and native inference checks together.
+Run the Swift, model-installer, lint, and bundle gates before publishing.
 
-## Supported whisper-cli contract
-
-TalkText supports these exact backend builds, not an untested semantic-version
-range:
-
-| Version | Immutable upstream revision |
-| --- | --- |
-| 1.8.4 | `9386f239401074690479731c1e41683fbbeac557` |
-| 1.9.1 | `f049fff95a089aa9969deb009cdd4892b3e74916` |
-| 1.9.2 | `306c88f4d1286aec1bf96e544632897886af5501` |
-
-The repository URL, exact version list, revisions, and required flags are
-canonical in `dependencies.env`. Production invokes:
-
-```text
-whisper-cli --model <model> --file <controlled.wav> --no-timestamps --threads 4
-```
-
-CI builds each pinned revision natively on Intel and Apple Silicon and runs
-that exact invocation against a deterministic 16 kHz mono PCM fixture through
-`tests/backend-contract-fixture.sh`. Unit tests also lock the production
-argument array, resolver precedence, version policy, and missing/incompatible
-failure behavior.
-
-A backend upgrade requires adding the exact version and full upstream commit
-to the manifest, building it for both architectures, running the real backend
-fixture plus the full Swift/shell suite, and reviewing compatibility evidence.
-Only then may the compiled supported-version list change. Release notes must
-record the supported backend versions/revisions and any contract change for
-that TalkText version.
+The original [NVIDIA Parakeet TDT v2 model](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2)
+is licensed under CC BY 4.0; the Core ML conversion is provided by FluidInference.
+FluidAudio is licensed under Apache 2.0.
 
 ## Homebrew Tap
 

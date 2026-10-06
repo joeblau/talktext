@@ -53,7 +53,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: models
-          key: talktext-model-v1-${{ hashFiles('dependencies.env') }}
+          key: talktext-model-v1-${{ hashFiles('TalkText/Sources/TalkText/Resources/parakeet-model.json') }}
 
       - name: Install or verify the pinned production model
         run: ./scripts/dependency-tool.sh install-model
@@ -121,8 +121,8 @@ jobs:
           zip_name="$TALKTEXT_BUNDLE_NAME-$version.zip"
           release_preamble="$(printf '%s\n\n%s\n\n%s' \
             "This release is a notarized Universal 2 build for Apple Silicon and Intel Macs running macOS $TALKTEXT_MINIMUM_SYSTEM_VERSION or newer." \
-            "Pinned model: $MODEL_REPOSITORY@$MODEL_REVISION (sha256:$MODEL_SHA256)." \
-            "Supported whisper-cli versions and commits: $BACKEND_UPSTREAM_REVISIONS.")"
+            "Pinned Parakeet model: $MODEL_REPOSITORY@$MODEL_REVISION; file digests are in the reviewed model manifest." \
+            "Built-in transcription backend: FluidAudio $BACKEND_VERSION.")"
           ./release.sh verify-source
           gh release create "$GITHUB_REF_NAME" \
             "dist/$zip_name" \

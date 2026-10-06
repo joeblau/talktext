@@ -38,11 +38,15 @@ let package = Package(
     products: [
         .executable(name: executableName, targets: [executableName]),
     ],
-    dependencies: [],
+    dependencies: [
+        .package(url: "https://github.com/FluidInference/FluidAudio.git", exact: "0.17.4"),
+    ],
     targets: [
         .executableTarget(
             name: executableName,
-            path: "Sources/TalkText"
+            dependencies: [.product(name: "FluidAudio", package: "FluidAudio")],
+            path: "Sources/TalkText",
+            resources: [.process("Resources")]
         ),
         .testTarget(
             name: "TalkTextTests",

@@ -1,0 +1,12 @@
+TalkText uses NVIDIA Parakeet TDT 0.6B v2 for speech recognition.
+Original model: https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2
+Model license: Creative Commons Attribution 4.0 International (CC BY 4.0)
+License terms: https://creativecommons.org/licenses/by/4.0/legalcode
+
+Core ML conversion by FluidInference:
+https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v2-coreml
+TalkText uses the pinned conversion revision recorded in parakeet-model.json.
+
+Inference SDK: FluidAudio 0.17.4, licensed under Apache License 2.0.
+https://github.com/FluidInference/FluidAudio/tree/v0.17.4
+The full SDK license and third-party notices are included in Resources/Licenses.

@@ -78,6 +78,7 @@ describe("macOS application launch lifecycle", () => {
       "-n",
       "--env",
       "TALKTEXT_DEVELOPMENT_ROOT=/fixture",
+      "-a",
       "/fixture/TalkText.app",
     ]);
     expect(warnings[0]).toContain("-609");
@@ -125,6 +126,52 @@ describe("macOS application launch lifecycle", () => {
 
     expect(pid).toBe(73);
     expect(openCount).toBe(1);
+  });
+
+  test("launches the exact app path without sending it to a default document handler", async () => {
+    let now = 0;
+    let selectedTalkText = false;
+    const appPath = "/fixture with spaces/TalkText.app";
+    const executablePath = `${appPath}/Contents/MacOS/TalkText`;
+    const runtime: MacApplicationRuntime = {
+      now: () => now,
+      sleep: async (milliseconds) => {
+        now += milliseconds;
+      },
+      requestTermination: async () => unneeded(),
+      isSameProcess: async () => unneeded(),
+      sendSignal: async () => unneeded(),
+      runningPIDs: async (path) => {
+        expect(path).toBe(executablePath);
+        return selectedTalkText ? [84] : [];
+      },
+      open: async (command) => {
+        // A successful document open can start another app. Only explicit
+        // application selection starts TalkText in this runtime.
+        selectedTalkText = command.includes("-a") &&
+          command[command.indexOf("-a") + 1] === appPath;
+        expect(command).toEqual(["/usr/bin/open", "-n", "-a", appPath]);
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+      log: () => {},
+      warn: () => {},
+    };
+    const pid = await launchMacApplication(
+      {
+        appPath,
+        executablePath,
+        executableName: "TalkText",
+        displayName: "TalkText",
+        timings: {
+          pollIntervalMs: 1,
+          successfulOpenObservationMs: 2,
+          launchStabilityMs: 1,
+          launchRetryDelaysMs: [],
+        },
+      },
+      runtime,
+    );
+    expect(pid).toBe(84);
   });
 
   test("waits for graceful AppKit termination and the LaunchServices settle window", async () => {

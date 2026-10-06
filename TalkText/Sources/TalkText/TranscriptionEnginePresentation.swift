@@ -4,42 +4,16 @@ extension TranscriptionEngine {
     static func presentation(
         for failure: TalkTextDependencyPreflightFailure
     ) -> Presentation {
-        // An unsupported version offers no command, because reinstalling the
-        // formula reproduces the same version; the status text naming every
-        // supported version is the only actionable guidance there.
-        let recovery: WhisperRecovery? = switch failure {
-        case .missingBinary:
-            .install
-        case .backendProbeFailed,
-             .backendMissingOptions,
-             .backendVersionUnreported:
-            .reinstall
-        case .unsupportedBackendVersion,
-             .invalidOverride,
-             .missingModel,
-             .invalidModel:
-            nil
-        }
-
-        return Presentation(
-            state: .failed,
-            statusText: failure.userMessage,
-            whisperRecovery: recovery
-        )
+        Presentation(state: .failed, statusText: failure.userMessage, modelRecovery: failure == .unsupportedHardware ? nil : .setup)
     }
 
-    static func preflightFailureCategory(
-        _ failure: TalkTextDependencyPreflightFailure
-    ) -> String {
+    static func preflightFailureCategory(_ failure: TalkTextDependencyPreflightFailure) -> String {
         switch failure {
         case .invalidOverride: "invalid-override"
-        case .missingBinary: "missing-binary"
         case .missingModel: "missing-model"
         case .invalidModel: "invalid-model"
-        case .backendProbeFailed: "backend-probe-failed"
-        case .backendMissingOptions: "backend-missing-options"
-        case .backendVersionUnreported: "backend-version-unreported"
-        case .unsupportedBackendVersion: "unsupported-backend-version"
+        case .modelLoadFailed: "model-load-failed"
+        case .unsupportedHardware: "unsupported-hardware"
         }
     }
 
@@ -52,20 +26,8 @@ extension TranscriptionEngine {
                 state: .idle,
                 statusText: "No speech detected. Hold Right Option to record, double-tap to lock"
             )
-        case let .missingDependency(dependency):
-            switch dependency {
-            case .binary:
-                Presentation(
-                    state: .failed,
-                    statusText: "whisper-cli is missing.",
-                    whisperRecovery: .install
-                )
-            case .model:
-                Presentation(
-                    state: .failed,
-                    statusText: "The Whisper model is missing. Run setup.sh to install it."
-                )
-            }
+        case let .modelUnavailable(failure):
+            presentation(for: failure)
         case let .invalidAudio(reason):
             switch reason {
             case .missing, .empty:
@@ -89,33 +51,10 @@ extension TranscriptionEngine {
                     statusText: "The recording exceeded the safe duration limit. Please try again."
                 )
             }
-        case .launchFailed:
-            Presentation(
-                state: .failed,
-                statusText: "Couldn’t start whisper-cli. Run setup.sh and try again."
-            )
-        case let .processFailed(diagnostic):
-            if diagnostic.terminationReason == .uncaughtSignal {
-                Presentation(
-                    state: .failed,
-                    statusText: "Transcription was interrupted by the system. Please try again."
-                )
-            } else {
-                Presentation(
-                    state: .failed,
-                    statusText: "Transcription failed (exit \(diagnostic.terminationStatus ?? -1)). Please try again."
-                )
-            }
-        case .timedOut:
-            Presentation(
-                state: .failed,
-                statusText: "Transcription timed out. Try a shorter recording."
-            )
+        case .inferenceFailed:
+            Presentation(state: .failed, statusText: "Parakeet transcription failed. Please try again.")
         case .cancelled:
-            Presentation(
-                state: .failed,
-                statusText: "Transcription was cancelled. Hold Right Option to try again."
-            )
+            Presentation(state: .failed, statusText: "Transcription was cancelled. Hold Right Option to try again.")
         }
     }
 
@@ -170,6 +109,8 @@ extension TranscriptionEngine {
                     state: .failed,
                     statusText: "Copied, but automatic paste failed. Paste manually."
                 )
+            case .liveDraftChanged:
+                Presentation(state: .failed, statusText: "Copied. The live text could not be safely replaced; paste manually.")
             }
         case .failed(.pasteboardSnapshotFailed):
             Presentation(

@@ -3,490 +3,132 @@ import XCTest
 @testable import TalkText
 
 final class DependencyResolverContractTests: XCTestCase {
-    private var fixtureDirectory: URL!
+    private var root: URL!
+    private var manifestURL: URL!
 
     override func setUpWithError() throws {
-        fixtureDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("TalkText-DependencyResolverTests-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(
-            at: fixtureDirectory,
-            withIntermediateDirectories: true
-        )
+        root = FileManager.default.temporaryDirectory.appendingPathComponent("TalkText-ParakeetResolver-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        manifestURL = root.appendingPathComponent("manifest.json")
+        let paths = ParakeetModelContract.requiredComponents.map { $0 + "/coremldata.bin" } + ["parakeet_vocab.json"]
+        let manifest: [String: Any] = [
+            "repository": "FluidInference/parakeet-tdt-0.6b-v2-coreml",
+            "revision": String(repeating: "a", count: 40),
+            "directory": ParakeetModelContract.directoryName,
+            "fluidAudioVersion": ParakeetModelContract.sdkVersion,
+            "files": paths.map { ["path": $0, "size": 3, "sha256": String(repeating: "b", count: 64)] as [String: Any] },
+        ]
+        try JSONSerialization.data(withJSONObject: manifest).write(to: manifestURL)
     }
 
     override func tearDownWithError() throws {
-        if let fixtureDirectory {
-            try? FileManager.default.removeItem(at: fixtureDirectory)
+        try FileManager.default.removeItem(at: root)
+    }
+
+    func testBundledModelIsPreferredWithoutAnExternalExecutable() throws {
+        let bundled = try stageModels(under: root.appendingPathComponent("resources"))
+        _ = try stageModels(under: root.appendingPathComponent("checkout"))
+        let ready = try resolved(configuration(environment: ["TALKTEXT_DEVELOPMENT_ROOT": root.appendingPathComponent("checkout").path]))
+        XCTAssertEqual(ready.model.url, bundled)
+        XCTAssertEqual(ready.model.source, .bundled)
+    }
+
+    func testInvalidExplicitOverrideFailsBeforeBundledFallback() throws {
+        _ = try stageModels(under: root.appendingPathComponent("resources"))
+        let result = TalkTextDependencyResolver(configuration: configuration(environment: ["TALKTEXT_MODEL_PATH": "missing"])).preflight()
+        guard case .failure(.invalidOverride) = result else { return XCTFail("Expected override failure") }
+    }
+
+    func testRelativeOverrideResolvesAgainstWorkingDirectory() throws {
+        let model = try stageModels(under: root)
+        let ready = try resolved(configuration(environment: ["TALKTEXT_MODEL_PATH": "models/" + ParakeetModelContract.directoryName]))
+        XCTAssertEqual(ready.model.url, model)
+        XCTAssertEqual(ready.model.source, .override)
+    }
+
+    func testSwiftPMExecutableFindsCheckoutModelsFromAnotherWorkingDirectory() throws {
+        let checkout = root.appendingPathComponent("checkout")
+        let model = try stageModels(under: checkout)
+        var config = configuration()
+        config.currentDirectoryURL = root.appendingPathComponent("elsewhere")
+        config.executableURL = checkout.appendingPathComponent("TalkText/.build/arm64-apple-macosx/debug/TalkText")
+        let ready = try resolved(config)
+        XCTAssertEqual(ready.model.url, model)
+        XCTAssertEqual(ready.model.source, .development)
+    }
+
+    func testIncompletePreferredBundleCannotFallBackToOtherWeights() throws {
+        let bundle = try stageModels(under: root.appendingPathComponent("resources"))
+        _ = try stageModels(under: root.appendingPathComponent("checkout"))
+        try FileManager.default.removeItem(at: bundle.appendingPathComponent("Encoder.mlmodelc/coremldata.bin"))
+        let config = configuration(environment: ["TALKTEXT_DEVELOPMENT_ROOT": root.appendingPathComponent("checkout").path])
+        guard case .failure(.invalidModel) = TalkTextDependencyResolver(configuration: config).preflight() else {
+            return XCTFail("Expected the incomplete bundled model to fail")
         }
     }
 
-    func testBundledDependenciesTakePriorityAndPreflightCapturesVersion() throws {
-        let resources = fixtureDirectory.appendingPathComponent("BundleResources", isDirectory: true)
-        let backend = try makeExecutable(at: resources.appendingPathComponent("bin/whisper-cli"))
-        let model = try makeModel(at: resources.appendingPathComponent("models/fixture-model.bin"))
-        let resolver = makeResolver(
-            environment: [
-                "PATH": "",
-                "TALKTEXT_WHISPER_CLI_VERSION": "1.8.4",
-            ],
-            bundleResourceURL: resources
-        )
-
-        let preflight = try readyPreflight(from: resolver)
-
-        XCTAssertEqual(preflight.dependencies.binaryURL, backend.resolvingSymlinksInPath())
-        XCTAssertEqual(preflight.dependencies.modelURL, model.resolvingSymlinksInPath())
-        XCTAssertEqual(preflight.backend.executable.source, .bundled)
-        XCTAssertEqual(preflight.model.source, .bundled)
-        XCTAssertEqual(preflight.backend.version, "1.8.4")
-        XCTAssertFalse(preflight.diagnosticSummary.contains(fixtureDirectory.path))
-    }
-
-    func testRelativePATHAndOverridesResolveAgainstInjectedWorkingDirectory() throws {
-        let workingDirectory = fixtureDirectory.appendingPathComponent("working", isDirectory: true)
-        let backend = try makeExecutable(at: workingDirectory.appendingPathComponent("toolchain/whisper-cli"))
-        let model = try makeModel(at: workingDirectory.appendingPathComponent("relative/model.bin"))
-        let resolver = makeResolver(
-            environment: [
-                "PATH": "toolchain",
-                "TALKTEXT_MODEL_PATH": "relative/model.bin",
-                "TALKTEXT_WHISPER_CLI_VERSION": "1.9.1",
-            ],
-            currentDirectoryURL: workingDirectory
-        )
-
-        let preflight = try readyPreflight(from: resolver)
-
-        XCTAssertEqual(preflight.dependencies.binaryURL, backend.resolvingSymlinksInPath())
-        XCTAssertEqual(preflight.dependencies.modelURL, model.resolvingSymlinksInPath())
-        XCTAssertEqual(preflight.backend.executable.source, .path)
-        XCTAssertEqual(preflight.model.source, .override)
-    }
-
-    func testExplicitOverridesWinOverBundledDependencies() throws {
-        let resources = fixtureDirectory.appendingPathComponent("resources", isDirectory: true)
-        _ = try makeExecutable(at: resources.appendingPathComponent("bin/whisper-cli"))
-        _ = try makeModel(at: resources.appendingPathComponent("models/fixture-model.bin"))
-        let overrideBackend = try makeExecutable(at: fixtureDirectory.appendingPathComponent("overrides/backend"))
-        let overrideModel = try makeModel(at: fixtureDirectory.appendingPathComponent("overrides/model.bin"))
-        let resolver = makeResolver(
-            environment: [
-                "PATH": "",
-                "TALKTEXT_WHISPER_CLI": overrideBackend.path,
-                "TALKTEXT_MODEL_PATH": overrideModel.path,
-                "TALKTEXT_WHISPER_CLI_VERSION": "1.9.1",
-            ],
-            bundleResourceURL: resources
-        )
-
-        let preflight = try readyPreflight(from: resolver)
-
-        XCTAssertEqual(preflight.backend.executable.source, .override)
-        XCTAssertEqual(preflight.model.source, .override)
-        XCTAssertEqual(preflight.dependencies.binaryURL, overrideBackend.resolvingSymlinksInPath())
-        XCTAssertEqual(preflight.dependencies.modelURL, overrideModel.resolvingSymlinksInPath())
-    }
-
-    func testHomebrewPrefixDiscovery() throws {
-        let prefix = fixtureDirectory.appendingPathComponent("homebrew", isDirectory: true)
-        let backend = try makeExecutable(at: prefix.appendingPathComponent("bin/whisper-cli"))
-        let model = try makeModel(at: fixtureDirectory.appendingPathComponent("model.bin"))
-        let resolver = makeResolver(
-            environment: [
-                "PATH": "",
-                "HOMEBREW_PREFIX": prefix.path,
-                "TALKTEXT_MODEL_PATH": model.path,
-                "TALKTEXT_WHISPER_CLI_VERSION": "1.8.4",
-            ]
-        )
-
-        let preflight = try readyPreflight(from: resolver)
-
-        XCTAssertEqual(preflight.dependencies.binaryURL, backend.resolvingSymlinksInPath())
-        XCTAssertEqual(preflight.backend.executable.source, .homebrew)
-    }
-
-    func testDevelopmentModelAndBackendAreInferredFromSwiftPMExecutable() throws {
-        let repository = fixtureDirectory.appendingPathComponent("checkout", isDirectory: true)
-        let package = repository.appendingPathComponent("TalkText", isDirectory: true)
-        let executable = package.appendingPathComponent(".build/release/TalkText")
-        let backend = try makeExecutable(at: repository.appendingPathComponent(".dependencies/bin/whisper-cli"))
-        let model = try makeModel(at: repository.appendingPathComponent("models/fixture-model.bin"))
-        let unrelatedWorkingDirectory = fixtureDirectory.appendingPathComponent("somewhere/else", isDirectory: true)
-        let resolver = makeResolver(
-            environment: [
-                "PATH": "",
-                "TALKTEXT_WHISPER_CLI_VERSION": "1.8.4",
-            ],
-            executableURL: executable,
-            currentDirectoryURL: unrelatedWorkingDirectory
-        )
-
-        let preflight = try readyPreflight(from: resolver)
-
-        XCTAssertEqual(preflight.dependencies.binaryURL, backend.resolvingSymlinksInPath())
-        XCTAssertEqual(preflight.dependencies.modelURL, model.resolvingSymlinksInPath())
-        XCTAssertEqual(preflight.backend.executable.source, .development)
-        XCTAssertEqual(preflight.model.source, .development)
-    }
-
-    func testMissingBinaryReportsActionableFailure() {
-        let resolver = makeResolver(environment: ["PATH": ""])
-
-        guard case let .failure(.missingBinary(paths)) = resolver.preflight() else {
-            return XCTFail("Expected a missing binary failure")
+    func testTruncatedModelAndUnreadableManifestAreRejected() throws {
+        let model = try stageModels(under: root.appendingPathComponent("resources"))
+        try Data().write(to: model.appendingPathComponent("Decoder.mlmodelc/coremldata.bin"))
+        guard case .failure(.invalidModel) = TalkTextDependencyResolver(configuration: configuration()).preflight() else {
+            return XCTFail("Expected a truncated model to fail")
         }
-        XCTAssertFalse(paths.isEmpty)
-    }
-
-    func testMissingModelReportsActionableFailure() throws {
-        let backend = try makeExecutable(at: fixtureDirectory.appendingPathComponent("bin/whisper-cli"))
-        let resolver = makeResolver(environment: [
-            "PATH": "",
-            "TALKTEXT_WHISPER_CLI": backend.path,
-            "TALKTEXT_WHISPER_CLI_VERSION": "1.8.4",
-        ])
-
-        guard case let .failure(failure) = resolver.preflight() else {
-            return XCTFail("Expected a missing model failure")
-        }
-        guard case .missingModel = failure else {
-            return XCTFail("Expected missingModel, received \(failure)")
-        }
-        XCTAssertTrue(failure.userMessage.contains("./setup.sh"))
-    }
-
-    func testInvalidExplicitOverrideFailsClosed() throws {
-        let validBackend = try makeExecutable(at: fixtureDirectory.appendingPathComponent("path/whisper-cli"))
-        let invalidOverride = fixtureDirectory.appendingPathComponent("not-an-executable", isDirectory: true)
-        try FileManager.default.createDirectory(at: invalidOverride, withIntermediateDirectories: true)
-        let resolver = makeResolver(environment: [
-            "PATH": validBackend.deletingLastPathComponent().path,
-            "TALKTEXT_WHISPER_CLI": invalidOverride.path,
-            "TALKTEXT_WHISPER_CLI_VERSION": "1.8.4",
-        ])
-
-        guard case let .failure(.invalidOverride(variable, _, _)) = resolver.preflight() else {
-            return XCTFail("Expected invalid override to fail closed")
-        }
-        XCTAssertEqual(variable, "TALKTEXT_WHISPER_CLI")
-    }
-
-    func testInvalidModelHeaderIsRejectedBeforeRecording() throws {
-        let backend = try makeExecutable(at: fixtureDirectory.appendingPathComponent("bin/whisper-cli"))
-        let model = fixtureDirectory.appendingPathComponent("bad-model.bin")
-        try Data("not-ggml".utf8).write(to: model)
-        let resolver = makeResolver(environment: [
-            "PATH": "",
-            "TALKTEXT_WHISPER_CLI": backend.path,
-            "TALKTEXT_MODEL_PATH": model.path,
-            "TALKTEXT_WHISPER_CLI_VERSION": "1.8.4",
-        ])
-
-        guard case let .failure(.invalidModel(path, reason)) = resolver.preflight() else {
-            return XCTFail("Expected an invalid model failure")
-        }
-        XCTAssertEqual(path, model.path)
-        XCTAssertTrue(reason.contains("GGML"))
-    }
-
-    func testUnsupportedBackendVersionFailsClosed() throws {
-        let backend = try makeExecutable(at: fixtureDirectory.appendingPathComponent("bin/whisper-cli"))
-        let model = try makeModel(at: fixtureDirectory.appendingPathComponent("model.bin"))
-        let resolver = makeResolver(environment: [
-            "PATH": "",
-            "TALKTEXT_WHISPER_CLI": backend.path,
-            "TALKTEXT_MODEL_PATH": model.path,
-            "TALKTEXT_WHISPER_CLI_VERSION": "2.0.0",
-        ])
-
-        guard case let .failure(.unsupportedBackendVersion(_, version, supported)) = resolver.preflight() else {
-            return XCTFail("Expected unsupported backend version failure")
-        }
-        XCTAssertEqual(version, "2.0.0")
-        XCTAssertEqual(supported, ["1.8.4", "1.9.1", "1.9.2"])
-    }
-
-    func testMissingProductionOptionFailsClosed() throws {
-        let backend = try makeExecutable(at: fixtureDirectory.appendingPathComponent("bin/whisper-cli"))
-        let model = try makeModel(at: fixtureDirectory.appendingPathComponent("model.bin"))
-        let runner = StubDependencyProbeRunner(
-            help: DependencyProbeOutput(
-                terminationStatus: 0,
-                output: "--model --file --no-timestamps"
-            ),
-            version: nil
-        )
-        let resolver = makeResolver(
-            environment: [
-                "PATH": "",
-                "TALKTEXT_WHISPER_CLI": backend.path,
-                "TALKTEXT_MODEL_PATH": model.path,
-                "TALKTEXT_WHISPER_CLI_VERSION": "1.8.4",
-            ],
-            runner: runner
-        )
-
-        guard case let .failure(.backendMissingOptions(_, options)) = resolver.preflight() else {
-            return XCTFail("Expected missing backend option failure")
-        }
-        XCTAssertEqual(options, ["--threads"])
-    }
-
-    func testUnreportedVersionFailsClosed() throws {
-        let backend = try makeExecutable(at: fixtureDirectory.appendingPathComponent("custom/whisper-cli"))
-        let model = try makeModel(at: fixtureDirectory.appendingPathComponent("model.bin"))
-        let runner = StubDependencyProbeRunner.compatible(versionOutput: "usage only")
-        let resolver = makeResolver(
-            environment: [
-                "PATH": "",
-                "TALKTEXT_WHISPER_CLI": backend.path,
-                "TALKTEXT_MODEL_PATH": model.path,
-            ],
-            runner: runner
-        )
-
-        guard case .failure(.backendVersionUnreported) = resolver.preflight() else {
-            return XCTFail("Expected unreported version failure")
+        try Data("invalid json".utf8).write(to: manifestURL)
+        guard case .failure(.invalidModel) = TalkTextDependencyResolver(configuration: configuration()).preflight() else {
+            return XCTFail("Expected an invalid manifest to fail")
         }
     }
 
-    func testVersionSidecarSupportsPinnedBundledBackend() throws {
-        let backend = try makeExecutable(at: fixtureDirectory.appendingPathComponent("bundle/bin/whisper-cli"))
-        try Data("1.9.1\n".utf8).write(to: URL(fileURLWithPath: backend.path + ".version"))
-        let model = try makeModel(at: fixtureDirectory.appendingPathComponent("model.bin"))
-        let resolver = makeResolver(environment: [
-            "PATH": "",
-            "TALKTEXT_WHISPER_CLI": backend.path,
-            "TALKTEXT_MODEL_PATH": model.path,
-        ])
-
-        XCTAssertEqual(try readyPreflight(from: resolver).backend.version, "1.9.1")
-    }
-
-    func testMalformedVersionSidecarFailsClosed() throws {
-        let backend = try makeExecutable(at: fixtureDirectory.appendingPathComponent("bundle/bin/whisper-cli"))
-        try Data("1.8. 4\n".utf8).write(to: URL(fileURLWithPath: backend.path + ".version"))
-        let model = try makeModel(at: fixtureDirectory.appendingPathComponent("model.bin"))
-        let resolver = makeResolver(
-            environment: [
-                "PATH": "",
-                "TALKTEXT_WHISPER_CLI": backend.path,
-                "TALKTEXT_MODEL_PATH": model.path,
-            ],
-            runner: StubDependencyProbeRunner.compatible(versionOutput: "whisper.cpp version 1.9.1")
-        )
-
-        guard case .failure(.backendVersionUnreported) = resolver.preflight() else {
-            return XCTFail("Expected malformed sidecar metadata to fail closed")
+    func testMissingModelsReportFailureInsteadOfDownloading() {
+        guard case .failure(.missingModel) = TalkTextDependencyResolver(configuration: configuration()).preflight() else {
+            return XCTFail("Expected missing local models")
         }
     }
 
-    func testProductionInvocationArgumentsAreExact() {
-        let arguments = WhisperBackendContract.productionArguments(
-            modelURL: URL(fileURLWithPath: "/model.ggml"),
-            audioURL: URL(fileURLWithPath: "/controlled.wav")
-        )
-
-        XCTAssertEqual(arguments, [
-            "--model", "/model.ggml",
-            "--file", "/controlled.wav",
-            "--no-timestamps",
-            "--threads", "4",
-        ])
+    func testReviewedManifestPinsCompleteWeightsAndSDK() throws {
+        let manifest = try JSONDecoder().decode(ParakeetModelManifest.self, from: Data(contentsOf: ParakeetModelContract.manifestURL))
+        XCTAssertEqual(manifest.directory, ParakeetModelContract.directoryName)
+        XCTAssertEqual(manifest.fluidAudioVersion, ParakeetModelContract.sdkVersion)
+        XCTAssertNotNil(manifest.revision.range(of: "^[0-9a-f]{40}$", options: .regularExpression))
+        for component in ParakeetModelContract.requiredComponents {
+            XCTAssertTrue(manifest.files.contains { $0.path == component + "/coremldata.bin" })
+        }
+        XCTAssertTrue(manifest.files.contains { $0.path == "parakeet_vocab.json" })
+        for file in manifest.files {
+            XCTAssertGreaterThan(file.size, 0)
+            XCTAssertNotNil(file.sha256.range(of: "^[0-9a-f]{64}$", options: .regularExpression))
+        }
+        let package = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let resolved = try String(contentsOf: package.appendingPathComponent("Package.resolved"), encoding: .utf8)
+        XCTAssertTrue(resolved.contains("\"version\" : \"0.17.4\""))
     }
 
-    func testCompiledContractMatchesReviewedManifest() throws {
-        let manifestURL = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent() // TalkTextTests
-            .deletingLastPathComponent() // Tests
-            .deletingLastPathComponent() // TalkText package
-            .deletingLastPathComponent() // repository
-            .appendingPathComponent("dependencies.env")
-        let manifest = try parseManifest(at: manifestURL)
-
-        XCTAssertEqual(manifest["BACKEND_EXECUTABLE"], WhisperBackendContract.executableName)
-        XCTAssertEqual(manifest["BACKEND_FORMULA"], WhisperBackendContract.formulaName)
-        XCTAssertEqual(manifest["MODEL_FILE_NAME"], WhisperBackendContract.modelFileName)
-        XCTAssertEqual(try UInt64(XCTUnwrap(manifest["MODEL_SIZE_BYTES"])), WhisperBackendContract.modelSizeBytes)
-        XCTAssertEqual(
-            try data(fromHexadecimal: XCTUnwrap(manifest["MODEL_MAGIC_HEX"])),
-            WhisperBackendContract.modelMagic
-        )
-        XCTAssertEqual(
-            manifest["BACKEND_SUPPORTED_VERSIONS"]?.split(separator: " ").map(String.init),
-            WhisperBackendContract.supportedVersions
-        )
-        XCTAssertEqual(
-            manifest["BACKEND_REQUIRED_FLAGS"]?.split(separator: " ").map(String.init),
-            WhisperBackendContract.requiredOptions
+    private func configuration(environment: [String: String] = [:]) -> ParakeetResolverConfiguration {
+        ParakeetResolverConfiguration(
+            environment: environment,
+            bundleResourceURL: root.appendingPathComponent("resources"),
+            executableURL: nil,
+            currentDirectoryURL: root,
+            applicationSupportURL: root.appendingPathComponent("support"),
+            manifestURL: manifestURL
         )
     }
 
-    func testFoundationProbeBoundsVerboseOutputWithoutDeadlocking() throws {
-        let executable = try makeExecutable(
-            at: fixtureDirectory.appendingPathComponent("verbose"),
-            body: "dd if=/dev/zero bs=1024 count=512 2>/dev/null | tr '\\000' X"
-        )
-        let runner = FoundationDependencyProbeRunner(
-            timeout: 2,
-            maximumOutputBytes: 4_096
-        )
-
-        let result = try XCTUnwrap(runner.run(executableURL: executable, arguments: []))
-
-        XCTAssertEqual(result.terminationStatus, 0)
-        XCTAssertLessThanOrEqual(result.output.utf8.count, 4_096)
-    }
-
-    func testFoundationProbeTimesOutStuckBackend() throws {
-        let executable = try makeExecutable(
-            at: fixtureDirectory.appendingPathComponent("stuck"),
-            body: "exec /bin/sleep 5"
-        )
-        let runner = FoundationDependencyProbeRunner(
-            timeout: 0.05,
-            terminationGracePeriod: 0.05
-        )
-        let start = Date()
-
-        let result = runner.run(executableURL: executable, arguments: [])
-
-        XCTAssertNil(result)
-        XCTAssertLessThan(Date().timeIntervalSince(start), 1)
-    }
-
-    /// `whisper-cli --help` loads every ggml backend before parsing arguments, so
-    /// the first run after installing or upgrading `whisper-cpp` compiles the Metal
-    /// shader library. That took 8.5s on an M3 Max, which the previous 5s budget
-    /// misreported as a broken backend. Keep real headroom over that measurement.
-    func testDefaultProbeTimeoutToleratesColdBackendStart() {
-        XCTAssertGreaterThanOrEqual(FoundationDependencyProbeRunner.defaultTimeout, 20)
-    }
-
-    func testFoundationProbeWaitsForABackendSlowerThanTheOldFiveSecondBudget() throws {
-        let executable = try makeExecutable(
-            at: fixtureDirectory.appendingPathComponent("cold-start"),
-            body: "/bin/sleep 6; printf '%s\\n' '--model --file --no-timestamps --threads'"
-        )
-        let runner = FoundationDependencyProbeRunner()
-
-        let result = try XCTUnwrap(runner.run(executableURL: executable, arguments: ["--help"]))
-
-        XCTAssertEqual(result.terminationStatus, 0)
-        for option in WhisperBackendContract.requiredOptions {
-            XCTAssertTrue(result.output.contains(option))
+    private func resolved(_ config: ParakeetResolverConfiguration) throws -> TalkTextDependencyPreflight {
+        switch TalkTextDependencyResolver(configuration: config).preflight() {
+        case let .ready(value): value
+        case let .failure(failure): throw failure
         }
     }
 
-    private func makeResolver(
-        environment: [String: String],
-        bundleResourceURL: URL? = nil,
-        executableURL: URL? = nil,
-        currentDirectoryURL: URL? = nil,
-        runner: any DependencyProbeRunning = StubDependencyProbeRunner.compatible()
-    ) -> TalkTextDependencyResolver {
-        TalkTextDependencyResolver(
-            configuration: DependencyResolverConfiguration(
-                environment: environment,
-                bundleResourceURL: bundleResourceURL,
-                executableURL: executableURL,
-                currentDirectoryURL: currentDirectoryURL ?? fixtureDirectory,
-                homeDirectoryURL: fixtureDirectory.appendingPathComponent("home", isDirectory: true),
-                homebrewPrefixes: [],
-                additionalDevelopmentRoots: [],
-                modelFileName: "fixture-model.bin",
-                expectedModelSizeBytes: nil
-            ),
-            probeRunner: runner
-        )
-    }
-
-    private func readyPreflight(
-        from resolver: TalkTextDependencyResolver
-    ) throws -> TalkTextDependencyPreflight {
-        switch resolver.preflight() {
-        case let .ready(preflight):
-            return preflight
-        case let .failure(failure):
-            throw failure
+    private func stageModels(under parent: URL) throws -> URL {
+        let model = parent.appendingPathComponent("models").appendingPathComponent(ParakeetModelContract.directoryName, isDirectory: true)
+        let manifest = try JSONDecoder().decode(ParakeetModelManifest.self, from: Data(contentsOf: manifestURL))
+        for file in manifest.files {
+            let url = model.appendingPathComponent(file.path)
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data("abc".utf8).write(to: url)
         }
-    }
-
-    @discardableResult
-    private func makeExecutable(at url: URL, body: String = "exit 0") throws -> URL {
-        try FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try Data("#!/bin/bash\nset -euo pipefail\n\(body)\n".utf8).write(to: url)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
-        return url
-    }
-
-    @discardableResult
-    private func makeModel(at url: URL) throws -> URL {
-        try FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        var data = WhisperBackendContract.modelMagic
-        data.append(Data(" deterministic fixture".utf8))
-        try data.write(to: url)
-        return url
-    }
-
-    private func parseManifest(at url: URL) throws -> [String: String] {
-        let contents = try String(contentsOf: url, encoding: .utf8)
-        return contents.split(separator: "\n").reduce(into: [:]) { values, line in
-            guard !line.hasPrefix("#"),
-                  let separator = line.firstIndex(of: "=") else {
-                return
-            }
-            let key = String(line[..<separator])
-            var value = String(line[line.index(after: separator)...])
-            if value.hasPrefix("'"), value.hasSuffix("'") {
-                value.removeFirst()
-                value.removeLast()
-            }
-            values[key] = value
-        }
-    }
-
-    private func data(fromHexadecimal value: String) throws -> Data {
-        guard value.count.isMultiple(of: 2) else {
-            throw HexadecimalFixtureError.invalidValue(value)
-        }
-        return try stride(from: 0, to: value.count, by: 2).reduce(into: Data()) { data, offset in
-            let start = value.index(value.startIndex, offsetBy: offset)
-            let end = value.index(start, offsetBy: 2)
-            guard let byte = UInt8(value[start ..< end], radix: 16) else {
-                throw HexadecimalFixtureError.invalidValue(value)
-            }
-            data.append(byte)
-        }
-    }
-}
-
-private enum HexadecimalFixtureError: Error {
-    case invalidValue(String)
-}
-
-private struct StubDependencyProbeRunner: DependencyProbeRunning {
-    let help: DependencyProbeOutput?
-    let version: DependencyProbeOutput?
-
-    static func compatible(versionOutput: String = "whisper.cpp version 1.8.4") -> StubDependencyProbeRunner {
-        StubDependencyProbeRunner(
-            help: DependencyProbeOutput(
-                terminationStatus: 0,
-                output: WhisperBackendContract.requiredOptions.joined(separator: " ")
-            ),
-            version: DependencyProbeOutput(terminationStatus: 0, output: versionOutput)
-        )
-    }
-
-    func run(executableURL: URL, arguments: [String]) -> DependencyProbeOutput? {
-        arguments == ["--help"] ? help : version
+        return model
     }
 }

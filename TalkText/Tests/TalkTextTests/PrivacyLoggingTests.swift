@@ -42,8 +42,8 @@ final class PrivacyLoggingTests: XCTestCase {
         // Diagnostics retain bodies for typed handling, but logging is restricted
         // to byte counts, status/reason, and typed launch-error domain/code.
         let source = try productionSwiftSource()
-        XCTAssertTrue(source.contains("standardOutput.count"))
-        XCTAssertTrue(source.contains("standardError.count"))
+        XCTAssertTrue(source.contains("diagnostic.domain"))
+        XCTAssertTrue(source.contains("diagnostic.code"))
     }
 
     func testLoggedResolvedPathsUsePrivateHashMask() throws {

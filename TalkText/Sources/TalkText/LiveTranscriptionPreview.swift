@@ -1,12 +1,18 @@
 import Foundation
+import os
+
+let liveTextLogger = Logger(subsystem: AppIdentity.bundleIdentifier, category: "live-text")
 
 /// Owns the best-effort draft loop independently from the canonical final
 /// transcription. Preview failures never stop recording or deliver partial text.
+/// Each draft is a full pass over the audio so far: Parakeet decodes 30 seconds
+/// in about 0.2 seconds, so drafts appear within the first spoken words and
+/// read the same as the final text rather than lagging a streaming window.
 @MainActor
 final class LiveTranscriptionPreview {
     private let recordingFileStore: any RecordingFileStoring
     private let recordingSnapshotter: any ActiveRecordingSnapshotting
-    private let transcriber: any WhisperTranscribing
+    private let transcriber: any SpeechTranscribing
 
     private var currentPreviewURL: URL?
     private var task: Task<Void, Never>?
@@ -14,7 +20,7 @@ final class LiveTranscriptionPreview {
     init(
         recordingFileStore: any RecordingFileStoring,
         recordingSnapshotter: any ActiveRecordingSnapshotting,
-        transcriber: any WhisperTranscribing
+        transcriber: any SpeechTranscribing
     ) {
         self.recordingFileStore = recordingFileStore
         self.recordingSnapshotter = recordingSnapshotter
@@ -24,29 +30,31 @@ final class LiveTranscriptionPreview {
     func start(
         recordingURL: URL,
         interval: TimeInterval,
-        receiveTranscript: @escaping @MainActor (String) -> Void
+        receiveTranscript: @escaping @MainActor (String) async -> Void
     ) {
         cleanup()
         let boundedInterval = max(0.1, interval)
         task = Task { @MainActor [weak self] in
+            var lastTranscript: String?
             while !Task.isCancelled {
                 do {
                     try await Task.sleep(for: .seconds(boundedInterval))
                 } catch {
-                    return
+                    break
                 }
                 guard let self else {
-                    return
+                    break
                 }
-                if let transcript = await self.refresh(recordingURL: recordingURL) {
-                    receiveTranscript(transcript)
+                if let transcript = await self.refresh(recordingURL: recordingURL), transcript != lastTranscript {
+                    liveTextLogger.debug("Live draft ready; characters: \(transcript.count, privacy: .public)")
+                    lastTranscript = transcript
+                    await receiveTranscript(transcript)
                 }
             }
         }
     }
 
-    /// Cancels the current Whisper pass and returns the task so the final flow
-    /// can wait until its subprocess and snapshot have been cleaned up.
+    /// Cancels the draft pass so the final flow can wait for it to wind down.
     func stop() -> Task<Void, Never>? {
         let currentTask = task
         task = nil
@@ -85,6 +93,7 @@ final class LiveTranscriptionPreview {
             at: previewURL
         )
         guard !Task.isCancelled, snapshotCreated else {
+            if !Task.isCancelled { liveTextLogger.debug("Live snapshot unavailable") }
             return nil
         }
 

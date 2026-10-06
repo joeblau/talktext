@@ -28,12 +28,19 @@ settings:
     # The version-injection phase reads VERSION and writes the built plist.
     ENABLE_USER_SCRIPT_SANDBOXING: NO
 
+packages:
+  FluidAudio:
+    url: https://github.com/FluidInference/FluidAudio.git
+    exactVersion: 0.17.4
+
 targets:
   TalkText:
     type: application
     platform: macOS
     sources:
       - path: TalkText/Sources/TalkText
+    dependencies:
+      - package: FluidAudio
     settings:
       base:
         PRODUCT_NAME: TalkText # Checked against CFBundleExecutable.

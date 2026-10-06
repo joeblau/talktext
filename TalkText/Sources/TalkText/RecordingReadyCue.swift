@@ -1,10 +1,4 @@
-import AppKit
-import os
-
-private let recordingReadyCueLogger = Logger(
-    subsystem: AppIdentity.bundleIdentifier,
-    category: "recording-ready-cue"
-)
+import Foundation
 
 @MainActor
 protocol RecordingReadyCuePlaying: AnyObject {
@@ -12,40 +6,32 @@ protocol RecordingReadyCuePlaying: AnyObject {
     func stop()
 }
 
-/// Plays a short, quiet system chime before microphone capture begins. Waiting
-/// for playback to finish prevents TalkText from transcribing its own cue.
+/// The menu toggle writes this key through `@AppStorage`; players read it at
+/// play time so a change applies to the very next recording.
+enum RecordingCuePreference {
+    static let defaultsKey = "TalkTextPlaysRecordingCues"
+
+    static func isEnabled(in defaults: UserDefaults = .standard) -> Bool {
+        defaults.object(forKey: defaultsKey) as? Bool ?? true
+    }
+}
+
+/// Plays the complete ready cue before microphone capture begins.
 @MainActor
 final class SystemRecordingReadyCuePlayer: RecordingReadyCuePlaying {
-    private let sound: NSSound?
+    private let audio = RecordingCueAudio(ascending: true)
+    private let isEnabled: @MainActor () -> Bool
 
-    init(sound: NSSound? = NSSound(named: NSSound.Name("Tink"))) {
-        self.sound = sound
-        sound?.volume = 0.2
+    init(isEnabled: @escaping @MainActor () -> Bool = { RecordingCuePreference.isEnabled() }) {
+        self.isEnabled = isEnabled
     }
 
     func play() async {
-        guard let sound else {
-            return
-        }
-
-        sound.stop()
-        guard sound.play() else {
-            recordingReadyCueLogger.error("Recording ready cue could not play")
-            return
-        }
-        recordingReadyCueLogger.notice("Recording ready cue played")
-
-        let duration = min(max(sound.duration, 0), 0.25)
-        do {
-            try await Task.sleep(for: .seconds(duration))
-        } catch {
-            sound.stop()
-            return
-        }
-        sound.stop()
+        guard isEnabled() else { return }
+        await audio.play()
     }
 
     func stop() {
-        sound?.stop()
+        audio.stop()
     }
 }
