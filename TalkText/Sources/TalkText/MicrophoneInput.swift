@@ -103,9 +103,7 @@ actor MicrophoneInput: MicrophoneInputDriving {
     }
 
     private func set<T>(_ unit: AudioUnit, property: AudioUnitPropertyID, scope: AudioUnitScope, element: AudioUnitElement, value: inout T) throws {
-        try withUnsafePointer(to: &value) { pointer in
-            try check(AudioUnitSetProperty(unit, property, scope, element, pointer, UInt32(MemoryLayout<T>.size)))
-        }
+        try check(AudioUnitSetProperty(unit, property, scope, element, &value, UInt32(MemoryLayout<T>.size)))
     }
 
     private func check(_ status: OSStatus) throws {
