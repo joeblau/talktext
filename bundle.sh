@@ -148,7 +148,24 @@ cp -- "$CANONICAL_MODEL_MANIFEST" "$RESOURCES/parakeet-model.json"
 PRODUCT_DIRECTORY="$(dirname -- "$ARM64_PRODUCT")"
 for resource_bundle in "$PRODUCT_DIRECTORY"/*.bundle; do
     [[ -d "$resource_bundle" ]] || continue
-    cp -R -- "$resource_bundle" "$RESOURCES/"
+    copied_bundle="$RESOURCES/$(basename -- "$resource_bundle")"
+    cp -R -- "$resource_bundle" "$copied_bundle"
+    # The native SwiftPM build system emits flat resource bundles without an
+    # Info.plist, which codesign rejects. Give them the standard macOS layout
+    # that the Swift Build backend already produces.
+    if [[ ! -f "$copied_bundle/Contents/Info.plist" ]]; then
+        bundle_name="$(basename -- "$copied_bundle" .bundle)"
+        flat_contents="$(mktemp -d "$WORK_BUNDLE.resources.XXXXXX")"
+        find "$copied_bundle" -mindepth 1 -maxdepth 1 -exec mv -- {} "$flat_contents/" \;
+        mkdir -p "$copied_bundle/Contents"
+        mv -- "$flat_contents" "$copied_bundle/Contents/Resources"
+        /usr/libexec/PlistBuddy \
+            -c "Add :CFBundleIdentifier string talktext.${bundle_name//_/.}.resources" \
+            -c "Add :CFBundleName string $bundle_name" \
+            -c "Add :CFBundlePackageType string BNDL" \
+            -c "Add :CFBundleInfoDictionaryVersion string 6.0" \
+            "$copied_bundle/Contents/Info.plist" >/dev/null
+    fi
 done
 mkdir -p "$RESOURCES/Licenses"
 SDK_SOURCE="$PACKAGE_DIR/.build/release-arm64/checkouts/FluidAudio"
