@@ -62,6 +62,16 @@ preview without recording the microphone or posting keystrokes:
 TALKTEXT_PARAKEET_SMOKE_TEST=1 swift test --package-path TalkText --filter ParakeetIntegrationTests
 ```
 
+The smoke test reports short-draft latency and always checks final and draft
+transcripts, including a draft from a still-open capture. Shared CI runners have
+variable load and Core ML warm-up costs, so their wall-clock latency is diagnostic.
+On an otherwise idle native Apple Silicon Mac, also enforce the two-second draft
+latency budget with:
+
+```sh
+TALKTEXT_PARAKEET_SMOKE_TEST=1 TALKTEXT_PARAKEET_LATENCY_TEST=1 swift test --package-path TalkText --filter ParakeetIntegrationTests
+```
+
 The integration fixture `tests/fixtures/jfk.wav` comes from
 `ggml-org/whisper.cpp` at commit `9386f239401074690479731c1e41683fbbeac557`
 (`samples/jfk.wav`, SHA-256 `59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e`).
