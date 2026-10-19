@@ -6,6 +6,28 @@ import XCTest
 
 @MainActor
 final class SystemAudioRecorderTests: XCTestCase {
+    func testDefaultMicrophoneDeliversWarmupBuffers() async throws {
+        guard ProcessInfo.processInfo.environment["TALKTEXT_MICROPHONE_SMOKE_TEST"] == "1" else {
+            throw XCTSkip("Hardware startup is opt-in; it briefly opens the system default microphone")
+        }
+        guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
+            throw XCTSkip("Hardware startup requires an existing microphone permission grant")
+        }
+        let device = try XCTUnwrap(CoreAudioInputDeviceLister().systemDefaultInputDevice())
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".wav")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let input = MicrophoneInput()
+        let recorder = try SystemAudioRecorder(url: url, inputResolver: RecorderInputResolver(device: device), input: input) { _ in }
+        let prepared = await recorder.prepare()
+        XCTAssertTrue(prepared, "The system default microphone must supply real input buffers")
+        XCTAssertEqual(recorder.inputDeviceName, device.name)
+        XCTAssertEqual(input.health.isRunning, prepared)
+        // Preparation verifies incoming buffers while the sink discards audio.
+        recorder.cancel()
+        await input.close()
+        XCTAssertEqual(try AVAudioFile(forReading: url).length, 0)
+    }
+
     func testKeyUpDuringAutomaticStopSharesFinalizationAndPreservesAudio() async throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".wav")
         defer { try? FileManager.default.removeItem(at: url) }
@@ -42,7 +64,13 @@ final class SystemAudioRecorderTests: XCTestCase {
 
 @MainActor
 private final class RecorderInputResolver: AudioInputResolving {
-    func resolveInputDevice() -> AudioInputDevice? { .init(uid: "fixture", name: "Fixture Microphone", deviceID: 42) }
+    let device: AudioInputDevice
+
+    init(device: AudioInputDevice = .init(uid: "fixture", name: "Fixture Microphone", deviceID: 42)) {
+        self.device = device
+    }
+
+    func resolveInputDevice() -> AudioInputDevice? { device }
 }
 
 private actor GatedMicrophoneInput: MicrophoneInputDriving {

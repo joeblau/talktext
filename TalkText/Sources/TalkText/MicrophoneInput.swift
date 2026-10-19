@@ -47,10 +47,7 @@ actor MicrophoneInput: MicrophoneInputDriving {
             var hardware = AudioStreamBasicDescription()
             var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
             try check(AudioUnitGetProperty(instance, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 1, &hardware, &size))
-            guard hardware.mSampleRate.isFinite, hardware.mSampleRate > 0, hardware.mChannelsPerFrame > 0,
-                  let format = AVAudioFormat(standardFormatWithSampleRate: hardware.mSampleRate, channels: hardware.mChannelsPerFrame) else {
-                throw AudioRecorderCreationError.inputDeviceUnusable
-            }
+            let format = try Self.captureFormat(for: hardware)
             var clientFormat = format.streamDescription.pointee
             try set(instance, property: kAudioUnitProperty_StreamFormat, scope: kAudioUnitScope_Output, element: 1, value: &clientFormat)
 
@@ -100,6 +97,17 @@ actor MicrophoneInput: MicrophoneInputDriving {
     nonisolated func cancel() {
         health.cancel()
         Task { await close() }
+    }
+
+    nonisolated static func captureFormat(for hardware: AudioStreamBasicDescription) throws -> AVAudioFormat {
+        guard hardware.mSampleRate.isFinite, hardware.mSampleRate > 0, hardware.mChannelsPerFrame > 0,
+              hardware.mChannelsPerFrame <= UInt16.max,
+              let layout = AVAudioChannelLayout(layoutTag: kAudioChannelLayoutTag_DiscreteInOrder | hardware.mChannelsPerFrame) else {
+            throw AudioRecorderCreationError.inputDeviceUnusable
+        }
+        // The channel-count initializer only accepts mono or stereo. Interfaces
+        // such as CONNECT 6 need an explicit layout for their ordered inputs.
+        return AVAudioFormat(standardFormatWithSampleRate: hardware.mSampleRate, channelLayout: layout)
     }
 
     private func set<T>(_ unit: AudioUnit, property: AudioUnitPropertyID, scope: AudioUnitScope, element: AudioUnitElement, value: inout T) throws {

@@ -29,6 +29,17 @@ line-percentage target. A change must keep deterministic tests for:
   body, or clipboard-content logging.
 
 The ordinary Swift suite uses injected recognizers and requires no model download.
+To check the actual system default microphone after granting microphone access,
+run:
+
+```sh
+TALKTEXT_MICROPHONE_SMOKE_TEST=1 swift test --package-path TalkText --filter SystemAudioRecorderTests.testDefaultMicrophoneDeliversWarmupBuffers
+```
+
+This opens the real input and requires incoming warm-up buffers. It discards the
+audio and verifies that the temporary WAV contains no recorded frames. Regression
+tests also cover an 18-channel CONNECT 6 format through mono WAV capture.
+
 The real-model test checks draft text from snapshots of an open recording within
 the first three seconds of input and final inference during preview cancellation.
 It uses fixture audio, not microphone access. AirPods profile negotiation and
