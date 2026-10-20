@@ -2,6 +2,17 @@ import AppKit
 import ApplicationServices
 import Foundation
 
+/// Chromium and Electron apps keep their accessibility tree empty until a
+/// trusted client opts in, which hides their text fields from dictation.
+enum AccessibilityEnhancements {
+    static func enable(for processIdentifier: pid_t) {
+        let application = AXUIElementCreateApplication(processIdentifier)
+        AXUIElementSetMessagingTimeout(application, 0.5)
+        AXUIElementSetAttributeValue(application, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+        AXUIElementSetAttributeValue(application, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+    }
+}
+
 /// Uses selection replacement first so native and rich editors retain their
 /// formatting and undo behavior while a live transcript is revised.
 @MainActor
@@ -12,15 +23,43 @@ final class SystemLiveTextElement: LiveTextElement {
     private init(element: AXUIElement, processIdentifier: pid_t) {
         self.element = element
         self.processIdentifier = processIdentifier
-        AXUIElementSetMessagingTimeout(element, 0.15)
+        AXUIElementSetMessagingTimeout(element, 0.5)
     }
 
     static func focused(for target: PasteTarget) -> (any LiveTextElement)? {
+        if let element = focusedElement(), let wrapped = wrap(element, for: target) {
+            return wrapped
+        }
+        // A busy or opted-out app may answer late or not at all; opting in and
+        // retrying once recovers fields the first query could not see.
+        AccessibilityEnhancements.enable(for: target.processIdentifier)
         guard let element = focusedElement() else { return nil }
-        var processIdentifier: pid_t = 0
-        guard AXUIElementGetPid(element, &processIdentifier) == .success,
-              processIdentifier == target.processIdentifier else { return nil }
-        return SystemLiveTextElement(element: element, processIdentifier: processIdentifier)
+        return wrap(element, for: target)
+    }
+
+    /// The system-wide focused element is the user's cursor even when a helper
+    /// process owns it: browser and Electron fields live in web-content and
+    /// renderer processes, not the target app's. Those are accepted while the
+    /// target stays frontmost, which keeps the guard against stale targets.
+    static func accepts(
+        elementProcessIdentifier: pid_t,
+        target: PasteTarget,
+        frontmostProcessIdentifier: pid_t?
+    ) -> Bool {
+        elementProcessIdentifier == target.processIdentifier
+            || frontmostProcessIdentifier == target.processIdentifier
+    }
+
+    private static func wrap(_ element: AXUIElement, for target: PasteTarget) -> (any LiveTextElement)? {
+        var elementProcessIdentifier: pid_t = 0
+        guard AXUIElementGetPid(element, &elementProcessIdentifier) == .success else { return nil }
+        guard accepts(
+            elementProcessIdentifier: elementProcessIdentifier,
+            target: target,
+            frontmostProcessIdentifier: NSWorkspace.shared.frontmostApplication?.processIdentifier
+        ) else { return nil }
+        // Keystrokes must go to the app that owns the window, never a helper.
+        return SystemLiveTextElement(element: element, processIdentifier: target.processIdentifier)
     }
 
     var text: String? {
@@ -109,7 +148,7 @@ final class SystemLiveTextElement: LiveTextElement {
 
     private static func focusedElement() -> AXUIElement? {
         let system = AXUIElementCreateSystemWide()
-        AXUIElementSetMessagingTimeout(system, 0.15)
+        AXUIElementSetMessagingTimeout(system, 0.5)
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(system, kAXFocusedUIElementAttribute as CFString, &value) == .success,
               let value, CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }

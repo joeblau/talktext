@@ -194,19 +194,24 @@ final class SystemLiveTextEditor: LiveTextEditing {
 
         // Editors such as Sublime Text expose a focused element without its
         // value, and GPU terminals expose none at all. Both still accept typed
-        // text at the cursor.
+        // text at the cursor. An empty priming draft types nothing, so it is
+        // skipped: a later tick can still capture the field directly once the
+        // app answers Accessibility queries.
         guard let element = focusedElement(target), let currentValue = element.text else {
             liveTextLogger.debug("No readable focused field; using keystroke drafts")
+            guard !text.isEmpty else { return .updated }
             return await beginKeystrokeDraft(text, in: target)
         }
-        // A readable value with no usable selection has an unknown cursor, so
-        // typing there could land anywhere in the user's text.
+        // A readable value with no usable selection cannot be edited through
+        // Accessibility, but the cursor is still where the user put it, so
+        // blind typing lands exactly where they expect.
         guard let replacementRange = element.selection,
               replacementRange.location >= 0, replacementRange.length >= 0,
               replacementRange.location <= (currentValue as NSString).length,
               replacementRange.length <= (currentValue as NSString).length - replacementRange.location else {
-            liveTextLogger.debug("Focused field has no usable selection")
-            return .unavailable
+            liveTextLogger.debug("Focused field has no usable selection; using keystroke drafts")
+            guard !text.isEmpty else { return .updated }
+            return await beginKeystrokeDraft(text, in: target)
         }
         let currentNSString = currentValue as NSString
         let originalText = currentNSString.substring(with: replacementRange)
