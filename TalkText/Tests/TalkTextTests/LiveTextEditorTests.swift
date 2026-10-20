@@ -176,14 +176,17 @@ final class LiveTextEditorTests: XCTestCase {
         XCTAssertEqual(element.text, "final")
     }
 
-    func testUnavailableOrInvalidSelectionDoesNotAppendAtEnd() async {
+    func testUnavailableOrInvalidSelectionTypesAtCursorInsteadOfAppending() async {
         for range in [nil, NSRange(location: NSNotFound, length: 0), NSRange(location: 3, length: 99)] {
             let element = LiveTextElementFake(text: "Keep this", selection: range)
-            let editor = SystemLiveTextEditor { _ in element }
+            let typer = LiveKeystrokeTyperFake(text: "Keep this")
+            let editor = SystemLiveTextEditor(focusedElement: { _ in element }, keystrokeTyper: typer)
             let outcome19 = await editor.update("wrong place", in: makeTarget())
-            XCTAssertEqual(outcome19, .unavailable)
+            XCTAssertEqual(outcome19, .updated)
             XCTAssertEqual(element.text, "Keep this")
             XCTAssertEqual(element.selectedTextWrites, 0)
+            XCTAssertEqual(typer.text, "Keep thiswrong place")
+            await editor.cancel()
         }
     }
 
@@ -239,9 +242,9 @@ final class LiveTextEditorTests: XCTestCase {
         XCTAssertEqual(revised, .updated)
         XCTAssertEqual(final, .finalized)
         XCTAssertEqual(typer.text, "Hello world.")
-        XCTAssertEqual(typer.operations.map(\.deletions), [0, 0, 1, 13])
+        XCTAssertEqual(typer.operations.map(\.deletions), [0, 1, 13])
         XCTAssertEqual(typer.operations.last?.insertion, "Hello world.")
-        XCTAssertEqual(typer.operations[2].insertion, "ld 🌎", "Only the changed tail is retyped")
+        XCTAssertEqual(typer.operations[1].insertion, "ld 🌎", "Only the changed tail is retyped")
         let afterFinal = await editor.cancel()
         XCTAssertEqual(afterFinal, .noActiveDraft)
     }
@@ -295,15 +298,57 @@ final class LiveTextEditorTests: XCTestCase {
         XCTAssertFalse(typer.operations.contains { $0.insertion.contains { $0.isNewline || $0 == "\t" } })
     }
 
-    func testReadableFieldNeverFallsBackToBlindKeystrokes() async {
+    func testReadableFieldWithoutSelectionTypesAtTheRealCursor() async {
         let element = LiveTextElementFake(text: "Keep this", selection: nil)
-        let typer = LiveKeystrokeTyperFake()
+        let typer = LiveKeystrokeTyperFake(text: "Keep this")
         let editor = SystemLiveTextEditor(focusedElement: { _ in element }, keystrokeTyper: typer)
 
-        let outcome = await editor.update("wrong place", in: makeTarget())
+        let outcome = await editor.update(" added", in: makeTarget())
+        let final = await editor.finalize(" added.", in: makeTarget())
 
-        XCTAssertEqual(outcome, .unavailable)
-        XCTAssertTrue(typer.operations.isEmpty)
+        XCTAssertEqual(outcome, .updated)
+        XCTAssertEqual(final, .finalized)
+        XCTAssertEqual(element.text, "Keep this", "A selection-less field is not edited through Accessibility")
+        XCTAssertEqual(element.selectedTextWrites, 0)
+        XCTAssertEqual(typer.text, "Keep this added.")
+    }
+
+    func testPrimingAnUnreadableFieldStillCapturesItWhenItLaterAnswers() async {
+        let element = LiveTextElementFake(text: "", selection: NSRange(location: 0, length: 0))
+        var answers = false
+        let typer = LiveKeystrokeTyperFake()
+        let editor = SystemLiveTextEditor(
+            focusedElement: { _ in answers ? element : nil },
+            keystrokeTyper: typer
+        )
+        let target = makeTarget()
+
+        let primed = await editor.update("", in: target)
+        answers = true
+        let draft = await editor.update("hello", in: target)
+        let final = await editor.finalize("hello.", in: target)
+
+        XCTAssertEqual(primed, .updated)
+        XCTAssertEqual(draft, .updated)
+        XCTAssertEqual(final, .finalized)
+        XCTAssertEqual(element.text, "hello.")
+        XCTAssertTrue(typer.operations.isEmpty, "Nothing was typed blindly before the field answered")
+    }
+
+    func testHelperProcessFieldIsAcceptedOnlyWhileTargetIsFrontmost() {
+        let target = makeTarget()
+        XCTAssertTrue(SystemLiveTextElement.accepts(
+            elementProcessIdentifier: 42, target: target, frontmostProcessIdentifier: nil
+        ))
+        XCTAssertTrue(SystemLiveTextElement.accepts(
+            elementProcessIdentifier: 77, target: target, frontmostProcessIdentifier: 42
+        ))
+        XCTAssertFalse(SystemLiveTextElement.accepts(
+            elementProcessIdentifier: 77, target: target, frontmostProcessIdentifier: 99
+        ))
+        XCTAssertFalse(SystemLiveTextElement.accepts(
+            elementProcessIdentifier: 77, target: target, frontmostProcessIdentifier: nil
+        ))
     }
 
     func testFieldWithoutReadableValueReceivesKeystrokeDrafts() async {

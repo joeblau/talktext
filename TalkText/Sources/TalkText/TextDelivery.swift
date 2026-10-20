@@ -166,7 +166,14 @@ final class SystemAccessibilityService: AccessibilityServing {
         guard pidError == .success else {
             return .failed(errorCode: pidError.rawValue)
         }
-        guard focusedProcessIdentifier == target.processIdentifier else {
+        // Browser and Electron fields are owned by web-content and renderer
+        // helper processes; the focused element is still the user's cursor
+        // while the target app is frontmost.
+        guard SystemLiveTextElement.accepts(
+            elementProcessIdentifier: focusedProcessIdentifier,
+            target: target,
+            frontmostProcessIdentifier: NSWorkspace.shared.frontmostApplication?.processIdentifier
+        ) else {
             return .targetNotFocused
         }
 
