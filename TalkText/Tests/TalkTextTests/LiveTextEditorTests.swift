@@ -315,16 +315,16 @@ final class LiveTextEditorTests: XCTestCase {
 
     func testPrimingAnUnreadableFieldStillCapturesItWhenItLaterAnswers() async {
         let element = LiveTextElementFake(text: "", selection: NSRange(location: 0, length: 0))
-        var answers = false
+        let gate = FieldAnswersGate()
         let typer = LiveKeystrokeTyperFake()
         let editor = SystemLiveTextEditor(
-            focusedElement: { _ in answers ? element : nil },
+            focusedElement: { _ in gate.answers ? element : nil },
             keystrokeTyper: typer
         )
         let target = makeTarget()
 
         let primed = await editor.update("", in: target)
-        answers = true
+        gate.answers = true
         let draft = await editor.update("hello", in: target)
         let final = await editor.finalize("hello.", in: target)
 
@@ -469,6 +469,11 @@ private final class LiveTextElementFake: LiveTextElement {
         if rejectedWrites > 0 { rejectedWrites -= 1; return false }
         return true
     }
+}
+
+@MainActor
+private final class FieldAnswersGate {
+    var answers = false
 }
 
 @MainActor
