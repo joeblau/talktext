@@ -18,7 +18,7 @@ if [[ -n "${TALKTEXT_MODEL_MANIFEST:-}" && "$TALKTEXT_MODEL_MANIFEST" != "$MODEL
     exit 1
 fi
 export TALKTEXT_MODEL_MANIFEST="$MODEL_MANIFEST"
-echo "==> Installing the pinned English Parakeet v2 models..."
+echo "==> Installing the pinned Parakeet Ultra models..."
 MODEL_PATH="${TALKTEXT_MODEL_PATH:-$REPOSITORY_ROOT/models/$MODEL_DIRECTORY_NAME}"
 "$DEPENDENCY_TOOL" install-model "$MODEL_PATH"
 

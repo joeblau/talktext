@@ -7,9 +7,8 @@ captured cursor and shows an active microphone in the menu bar. Fields that
 answer Accessibility are edited in place. Fields that do not, such as Sublime
 Text's editor or GPU-rendered terminals, receive drafts as keystrokes: only the
 changed tail is deleted and retyped, and only while that app stays frontmost.
-Each draft is a full Parakeet pass over a snapshot of the recording so far, so
-the first words appear within about half a second and drafts read like the
-final text. When recording stops, TalkText cancels the draft loop and replaces the draft
+Each draft is a full Parakeet Ultra pass over a snapshot of the recording so far.
+When recording stops, TalkText cancels the draft loop and replaces the draft
 with one final transcription of the complete recording. This final pass uses
 fresh decoder state and the same loaded weights. Final text is trimmed without
 rewriting identifiers, symbols, or instructions; an LLM cleanup stage is not
@@ -42,7 +41,7 @@ on stop and format changes so key-up does not clip the final syllable.
 ## Requirements
 
 - macOS 14+ on Apple Silicon; Parakeet requires the native arm64 app
-- Parakeet TDT 0.6B v2 Core ML assets (about 464 MB; included in packaged apps)
+- Parakeet Ultra Core ML assets (about 632 MB; included in packaged apps)
 - Python 3.9+ for model setup and bundle verification
 - Accessibility access for auto-insert and synthetic paste fallback
 - Microphone access
@@ -77,7 +76,7 @@ From a clean checkout, run:
 ./setup.sh
 ```
 
-Setup downloads and verifies every file of the pinned English Parakeet v2
+Setup downloads and verifies every file of the pinned Parakeet Ultra
 model, then builds the release executable. FluidAudio 0.17.4 is linked into
 TalkText through Swift Package Manager; no separate transcription executable
 or Homebrew STT formula is required. Setup prints the built executable path.
@@ -147,17 +146,18 @@ notarization, and required-check policy.
 
 ## Parakeet transcription workflow
 
-The app loads Parakeet TDT 0.6B v2 through [FluidAudio](https://github.com/FluidInference/FluidAudio).
+The app loads [Parakeet Ultra](https://huggingface.co/FluidInference/parakeet-ultra-coreml/tree/95eaa59a39d4394f047a4dc5cce480388a60d1b6)
+through [FluidAudio](https://github.com/FluidInference/FluidAudio). Ultra is a
+post-trained Parakeet v3 model supporting 25 languages.
 It uses Core ML's CPU and Neural Engine on Apple Silicon. The Universal 2 app
 shows an unsupported-hardware message on Intel or under Rosetta before loading
 models. Weights remain resident between recordings. The first load may take
 longer while Core ML compiles for the device.
 
 Live preview re-transcribes a snapshot of the open recording every quarter
-second plus inference time. Parakeet decodes 3 seconds of audio in under 0.1
-seconds, 30 seconds in about 0.2 seconds, and the 5-minute maximum in about 0.9
-seconds on Apple Silicon, so drafts stay current for the whole recording. When
-recording stops, the microphone closes promptly, preview work is cancelled, and
+second plus inference time. Actual draft latency depends on the Mac, recording
+length, and Core ML warm-up. When recording stops, the microphone closes
+promptly, preview work is cancelled, and
 the complete recording receives one final audio pass before delivery without
 waiting for preview cleanup.
 
@@ -177,13 +177,17 @@ Model directories are searched in this order:
 
 1. `TALKTEXT_MODEL_PATH`, an explicit directory override (relative paths resolve
    against the working directory). An invalid override fails without fallback.
-2. Bundled `Contents/Resources/models/parakeet-tdt-0.6b-v2-coreml`.
-3. `models/parakeet-tdt-0.6b-v2-coreml` under `TALKTEXT_DEVELOPMENT_ROOT`, the
+2. Bundled `Contents/Resources/models/parakeet-ultra-coreml`.
+3. `models/parakeet-ultra-coreml` under `TALKTEXT_DEVELOPMENT_ROOT`, the
    checkout inferred from a SwiftPM executable, the working directory, and its
    parent.
-4. `~/Library/Application Support/TalkText/models/parakeet-tdt-0.6b-v2-coreml`.
+4. `~/Library/Application Support/TalkText/models/parakeet-ultra-coreml`.
 
 An incomplete preferred directory fails without silently selecting other weights.
+When upgrading from Parakeet v2, rerun `./setup.sh` to install Ultra and update or
+unset any `TALKTEXT_MODEL_PATH` override that points at `parakeet-tdt-0.6b-v2-coreml`.
+Old v2 assets cannot be loaded as Ultra; the installer leaves their directory
+untouched, and it can be removed once the new model is verified.
 `TALKTEXT_MODEL_PATH` now names a directory, rather than a GGML file. Remove old
 Whisper-specific environment overrides when migrating an existing checkout.
 
@@ -191,8 +195,9 @@ Whisper-specific environment overrides when migrating an existing checkout.
 
 [`parakeet-model.json`](TalkText/Sources/TalkText/Resources/parakeet-model.json)
 pins the model repository, immutable revision, and exact size and SHA-256 for
-all 21 required Core ML files. [`dependencies.env`](dependencies.env) mirrors the
-reviewed model identity and SDK version; tests prevent those values from drifting.
+all 18 required compiled Core ML and vocabulary files.
+[`dependencies.env`](dependencies.env) mirrors the reviewed model identity and
+SDK version; tests prevent those values from drifting.
 [`Package.resolved`](TalkText/Package.resolved) pins the FluidAudio source revision.
 
 The model installer verifies cached assets before avoiding the network. Downloads
@@ -204,7 +209,7 @@ ready; failed downloads leave the prior cache untouched.
 Setup, bundle assembly, and bundle verification use the same verifier:
 
 ```sh
-./scripts/dependency-tool.sh verify-model ./models/parakeet-tdt-0.6b-v2-coreml
+./scripts/dependency-tool.sh verify-model ./models/parakeet-ultra-coreml
 ```
 
 Production setup and release reject alternate model manifests. Developer ID
@@ -216,8 +221,10 @@ To update the dependency, review the SDK pin, the immutable model revision, ever
 file size and digest, the resolver contract, and native inference checks together.
 Run the Swift, model-installer, lint, and bundle gates before publishing.
 
-The original [NVIDIA Parakeet TDT v2 model](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2)
-is licensed under CC BY 4.0; the Core ML conversion is provided by FluidInference.
+The [Parakeet Ultra checkpoint](https://huggingface.co/moondream/parakeet-ultra)
+by Moondream is based on [NVIDIA Parakeet TDT v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3).
+The [Core ML conversion](https://huggingface.co/FluidInference/parakeet-ultra-coreml/blob/95eaa59a39d4394f047a4dc5cce480388a60d1b6/README.md)
+by FluidInference is licensed under CC BY 4.0, as is the upstream checkpoint.
 FluidAudio is licensed under Apache 2.0.
 
 ## Homebrew Tap

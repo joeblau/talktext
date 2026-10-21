@@ -5,9 +5,8 @@ let liveTextLogger = Logger(subsystem: AppIdentity.bundleIdentifier, category: "
 
 /// Owns the best-effort draft loop independently from the canonical final
 /// transcription. Preview failures never stop recording or deliver partial text.
-/// Each draft is a full pass over the audio so far: Parakeet decodes 30 seconds
-/// in about 0.2 seconds, so drafts appear within the first spoken words and
-/// read the same as the final text rather than lagging a streaming window.
+/// Each draft is a full pass over the audio so far, using the same resident
+/// Parakeet Ultra weights as the final transcript with fresh decoder state.
 @MainActor
 final class LiveTranscriptionPreview {
     private let recordingFileStore: any RecordingFileStoring

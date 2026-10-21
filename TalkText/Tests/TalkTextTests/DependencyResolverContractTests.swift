@@ -12,7 +12,7 @@ final class DependencyResolverContractTests: XCTestCase {
         manifestURL = root.appendingPathComponent("manifest.json")
         let paths = ParakeetModelContract.requiredComponents.map { $0 + "/coremldata.bin" } + ["parakeet_vocab.json"]
         let manifest: [String: Any] = [
-            "repository": "FluidInference/parakeet-tdt-0.6b-v2-coreml",
+            "repository": ParakeetModelContract.repository,
             "revision": String(repeating: "a", count: 40),
             "directory": ParakeetModelContract.directoryName,
             "fluidAudioVersion": ParakeetModelContract.sdkVersion,
@@ -85,8 +85,32 @@ final class DependencyResolverContractTests: XCTestCase {
         }
     }
 
+    func testLegacyJointModelCannotSatisfyUltraContract() throws {
+        var manifest = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: manifestURL)) as? [String: Any])
+        var files = try XCTUnwrap(manifest["files"] as? [[String: Any]])
+        let joint = try XCTUnwrap(files.firstIndex { ($0["path"] as? String) == "JointDecisionv3.mlmodelc/coremldata.bin" })
+        files[joint]["path"] = "JointDecision.mlmodelc/coremldata.bin"
+        manifest["files"] = files
+        try JSONSerialization.data(withJSONObject: manifest).write(to: manifestURL)
+        _ = try stageModels(under: root.appendingPathComponent("resources"))
+        guard case .failure(.invalidModel) = TalkTextDependencyResolver(configuration: configuration()).preflight() else {
+            return XCTFail("Ultra must reject assets declaring the v2 joint contract")
+        }
+    }
+
+    func testLegacyRepositoryCannotSatisfyUltraContract() throws {
+        var manifest = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: manifestURL)) as? [String: Any])
+        manifest["repository"] = "FluidInference/parakeet-tdt-0.6b-v2-coreml"
+        try JSONSerialization.data(withJSONObject: manifest).write(to: manifestURL)
+        _ = try stageModels(under: root.appendingPathComponent("resources"))
+        guard case .failure(.invalidModel) = TalkTextDependencyResolver(configuration: configuration()).preflight() else {
+            return XCTFail("Ultra must reject a manifest for the legacy model repository")
+        }
+    }
+
     func testReviewedManifestPinsCompleteWeightsAndSDK() throws {
         let manifest = try JSONDecoder().decode(ParakeetModelManifest.self, from: Data(contentsOf: ParakeetModelContract.manifestURL))
+        XCTAssertEqual(manifest.repository, ParakeetModelContract.repository)
         XCTAssertEqual(manifest.directory, ParakeetModelContract.directoryName)
         XCTAssertEqual(manifest.fluidAudioVersion, ParakeetModelContract.sdkVersion)
         XCTAssertNotNil(manifest.revision.range(of: "^[0-9a-f]{40}$", options: .regularExpression))

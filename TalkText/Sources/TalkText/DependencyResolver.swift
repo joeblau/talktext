@@ -3,10 +3,11 @@ import Foundation
 /// These weights and the SDK version are reviewed together. Setup and bundling
 /// verify every file against the same manifest before the app loads local assets.
 enum ParakeetModelContract {
-    static let directoryName = "parakeet-tdt-0.6b-v2-coreml"
+    static let repository = "FluidInference/parakeet-ultra-coreml"
+    static let directoryName = "parakeet-ultra-coreml"
     static let sdkVersion = "0.17.4"
     static let requiredComponents = [
-        "Preprocessor.mlmodelc", "Encoder.mlmodelc", "Decoder.mlmodelc", "JointDecision.mlmodelc",
+        "Preprocessor.mlmodelc", "Encoder.mlmodelc", "Decoder.mlmodelc", "JointDecisionv3.mlmodelc",
     ]
 
     static var manifestURL: URL {
@@ -49,7 +50,7 @@ struct TalkTextDependencyPreflight: Equatable, Sendable {
     let model: ResolvedDependencyPath
 
     var diagnosticSummary: String {
-        "Parakeet TDT 0.6B v2; FluidAudio=\(ParakeetModelContract.sdkVersion); model source=\(model.source.rawValue)"
+        "Parakeet Ultra 0.6B; FluidAudio=\(ParakeetModelContract.sdkVersion); model source=\(model.source.rawValue)"
     }
 }
 
@@ -120,9 +121,11 @@ struct TalkTextDependencyResolver: ParakeetModelResolving {
         } catch {
             return .failure(.invalidModel(path: configuration.manifestURL.path, reason: "model manifest is unreadable"))
         }
-        guard manifest.directory == ParakeetModelContract.directoryName,
+        let requiredFiles = ParakeetModelContract.requiredComponents.map { $0 + "/coremldata.bin" } + ["parakeet_vocab.json"]
+        guard manifest.repository == ParakeetModelContract.repository,
+              manifest.directory == ParakeetModelContract.directoryName,
               manifest.fluidAudioVersion == ParakeetModelContract.sdkVersion,
-              !manifest.files.isEmpty else {
+              requiredFiles.allSatisfy({ required in manifest.files.contains { $0.path == required } }) else {
             return .failure(.invalidModel(path: configuration.manifestURL.path, reason: "model manifest does not match the backend"))
         }
 
@@ -132,7 +135,7 @@ struct TalkTextDependencyResolver: ParakeetModelResolving {
                 return .failure(.invalidOverride(
                     variable: "TALKTEXT_MODEL_PATH",
                     path: url.path,
-                    requirement: "a complete Parakeet v2 model directory (\(reason))"
+                    requirement: "a complete Parakeet Ultra model directory (\(reason))"
                 ))
             }
             return .ready(TalkTextDependencyPreflight(model: ResolvedDependencyPath(url: url, source: .override)))
