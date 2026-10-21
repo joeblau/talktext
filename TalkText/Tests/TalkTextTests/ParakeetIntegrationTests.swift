@@ -34,6 +34,7 @@ final class ParakeetIntegrationTests: XCTestCase {
             guard case let .success(text) = final else { return XCTFail("Expected a successful native transcription") }
             XCTAssertTrue(text.lowercased().contains("country"))
             XCTAssertTrue(text.lowercased().contains("ask not"))
+            try await assertSpeechSurvivesUltraWindows(fixture: fixture, transcriber: transcriber)
             // Exercise the same open-file snapshot path as microphone capture:
             // a draft must arrive from the first seconds, before the recorder stops.
             let captureURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".wav")
@@ -63,5 +64,37 @@ final class ParakeetIntegrationTests: XCTestCase {
             guard case let .success(draftText) = draft else { return XCTFail("Expected a draft from the first three seconds") }
             XCTAssertTrue(draftText.lowercased().contains("fellow"))
         #endif
+    }
+
+    /// Repeating the public fixture crosses multiple 15-second Ultra windows.
+    /// Every repetition must survive decoding and overlap merging.
+    private func assertSpeechSurvivesUltraWindows(fixture: URL, transcriber: ParakeetTranscriber) async throws {
+        let source = try AVAudioFile(forReading: fixture)
+        let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: source.processingFormat, frameCapacity: AVAudioFrameCount(source.length)))
+        try source.read(into: buffer)
+        let fixtureDuration = Double(buffer.frameLength) / source.processingFormat.sampleRate
+        XCTAssertGreaterThan(fixtureDuration, 0)
+        guard fixtureDuration > 0 else { return }
+        let repetitions = max(3, Int(ceil(31 / fixtureDuration)))
+        let extendedURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".wav")
+        defer { try? FileManager.default.removeItem(at: extendedURL) }
+        do {
+            let extended = try AVAudioFile(
+                forWriting: extendedURL,
+                settings: source.fileFormat.settings,
+                commonFormat: source.processingFormat.commonFormat,
+                interleaved: source.processingFormat.isInterleaved
+            )
+            for _ in 0 ..< repetitions {
+                try extended.write(from: buffer)
+            }
+        }
+        let written = try AVAudioFile(forReading: extendedURL)
+        XCTAssertGreaterThan(Double(written.length) / written.processingFormat.sampleRate, 30)
+        let outcome = await transcriber.transcribe(audioURL: extendedURL)
+        guard case let .success(text) = outcome else { return XCTFail("Expected speech across Ultra's 15-second windows") }
+        let words = text.lowercased().split { !$0.isLetter }.map(String.init).joined(separator: " ")
+        let phraseCount = words.components(separatedBy: "ask not").count - 1
+        XCTAssertEqual(phraseCount, repetitions, "Every repeated passage must survive multi-window transcription: \(text)")
     }
 }

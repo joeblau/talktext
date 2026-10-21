@@ -129,7 +129,7 @@ private actor FluidAudioParakeetRecognizer: ParakeetRecognizing {
             }
             let task = Task.detached(priority: .userInitiated) {
                 let configuration = AsrModels.defaultConfiguration()
-                return try AsrModels.loadLocal(from: directory, version: .v2, configuration: configuration)
+                return try AsrModels.loadLocal(from: directory, version: .ultra, configuration: configuration)
             }
             loading = (directory, task)
             do {

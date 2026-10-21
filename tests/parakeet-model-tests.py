@@ -26,7 +26,7 @@ class ParakeetModelTests(unittest.TestCase):
         self.manifest = {
             "repository": "fixture/parakeet",
             "revision": "a" * 40,
-            "directory": "parakeet-tdt-0.6b-v2-coreml",
+            "directory": "parakeet-ultra-coreml",
             "files": [{"path": "Encoder.mlmodelc/weights/weight.bin", "size": len(self.payload),
                        "sha256": hashlib.sha256(self.payload).hexdigest()}],
         }

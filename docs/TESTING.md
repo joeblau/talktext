@@ -62,6 +62,13 @@ preview without recording the microphone or posting keystrokes:
 TALKTEXT_PARAKEET_SMOKE_TEST=1 swift test --package-path TalkText --filter ParakeetIntegrationTests
 ```
 
+These checks use the pinned Parakeet Ultra assets in `models/parakeet-ultra-coreml`
+and the SDK's Ultra decoder path. When upgrading from v2, update or unset an old
+`TALKTEXT_MODEL_PATH` override before running them. The installer verifies the
+Ultra manifest independently of any previous v2 cache.
+The real-model suite also repeats the public fixture across more than 30 seconds
+and checks that every passage survives Ultra's 15-second decoding windows.
+
 The smoke test reports short-draft latency and always checks final and draft
 transcripts, including a draft from a still-open capture. Shared CI runners have
 variable load and Core ML warm-up costs, so their wall-clock latency is diagnostic.

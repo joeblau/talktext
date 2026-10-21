@@ -1,10 +1,14 @@
-TalkText uses NVIDIA Parakeet TDT 0.6B v2 for speech recognition.
-Original model: https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2
+TalkText uses Moondream Parakeet Ultra for speech recognition.
+Original model: https://huggingface.co/moondream/parakeet-ultra
+Parakeet Ultra is a full-precision post-training of NVIDIA Parakeet TDT 0.6B v3.
+Base model: https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3
 Model license: Creative Commons Attribution 4.0 International (CC BY 4.0)
 License terms: https://creativecommons.org/licenses/by/4.0/legalcode
 
 Core ML conversion by FluidInference:
-https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v2-coreml
+https://huggingface.co/FluidInference/parakeet-ultra-coreml
+The conversion uses an int8 encoder and re-exported Ultra decoder and joint;
+the preprocessor and vocabulary are from Parakeet v3.
 TalkText uses the pinned conversion revision recorded in parakeet-model.json.
 
 Inference SDK: FluidAudio 0.17.4, licensed under Apache License 2.0.
