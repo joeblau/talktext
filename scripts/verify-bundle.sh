@@ -75,6 +75,8 @@ for version_key in CFBundleVersion CFBundleShortVersionString; do
 done
 
 CANONICAL_KEYS=(
+    CFBundleIconFile
+    CFBundleIconName
     CFBundleDevelopmentRegion
     CFBundleDisplayName
     CFBundleInfoDictionaryVersion
@@ -86,6 +88,11 @@ for key in "${CANONICAL_KEYS[@]}"; do
     source_value="$(plist_value "$SOURCE_INFO" "$key")" || fail "canonical Info.plist is missing $key"
     final_value="$(plist_value "$FINAL_INFO" "$key")" || fail "final Info.plist is missing $key"
     [[ "$source_value" == "$final_value" ]] || fail "final $key differs from canonical Info.plist"
+done
+
+for icon_resource in AppIcon.icns Assets.car; do
+    [[ -s "$APP_PATH/Contents/Resources/$icon_resource" ]] || \
+        fail "app icon resource is missing or empty: $icon_resource"
 done
 
 EXECUTABLE_NAME="$(plist_string "$FINAL_INFO" CFBundleExecutable)" || fail "final Info.plist is missing CFBundleExecutable"
