@@ -39,6 +39,8 @@ targets:
     platform: macOS
     sources:
       - path: TalkText/Sources/TalkText
+      - path: TalkText/Branding/Compiled
+        buildPhase: resources
     dependencies:
       - package: FluidAudio
     settings:

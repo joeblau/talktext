@@ -138,6 +138,8 @@ CONTENTS="$WORK_BUNDLE/Contents"
 MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
 mkdir -p "$MACOS" "$RESOURCES/models"
+cp -- "$PACKAGE_DIR/Branding/Compiled/AppIcon.icns" "$RESOURCES/AppIcon.icns"
+cp -- "$PACKAGE_DIR/Branding/Compiled/Assets.car" "$RESOURCES/Assets.car"
 
 echo "==> Assembling canonical bundle metadata and resources..."
 lipo -create "$ARM64_PRODUCT" "$X86_64_PRODUCT" -output "$MACOS/$EXECUTABLE_NAME"
