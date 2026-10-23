@@ -19,10 +19,12 @@ enum AccessibilityEnhancements {
 final class SystemLiveTextElement: LiveTextElement {
     private let element: AXUIElement
     private let processIdentifier: pid_t
+    private let bundleIdentifier: String?
 
-    private init(element: AXUIElement, processIdentifier: pid_t) {
+    private init(element: AXUIElement, target: PasteTarget) {
         self.element = element
-        self.processIdentifier = processIdentifier
+        self.processIdentifier = target.processIdentifier
+        self.bundleIdentifier = target.bundleIdentifier
         AXUIElementSetMessagingTimeout(element, 0.5)
     }
 
@@ -59,7 +61,7 @@ final class SystemLiveTextElement: LiveTextElement {
             frontmostProcessIdentifier: NSWorkspace.shared.frontmostApplication?.processIdentifier
         ) else { return nil }
         // Keystrokes must go to the app that owns the window, never a helper.
-        return SystemLiveTextElement(element: element, processIdentifier: target.processIdentifier)
+        return SystemLiveTextElement(element: element, target: target)
     }
 
     var text: String? {
@@ -91,6 +93,15 @@ final class SystemLiveTextElement: LiveTextElement {
 
     var canTypeAtSelection: Bool {
         isSettable(kAXSelectedTextRangeAttribute) && CGPreflightPostEventAccess()
+    }
+
+    var requiresKeystrokeDrafts: Bool {
+        // Terminal's read-only text area represents the rendered screen, not an
+        // editable buffer. Its writable AX selection only highlights output.
+        // Normal editable controls (Find, Settings, etc.) retain AX editing.
+        bundleIdentifier == "com.apple.Terminal"
+            && attribute(kAXRoleAttribute) as? String == kAXTextAreaRole
+            && !canReplaceSelectedText && !canReplaceValue
     }
 
     func setSelectedText(_ text: String) -> Bool {
