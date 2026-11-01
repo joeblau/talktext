@@ -16,10 +16,15 @@ final class CapturedAudioSink: @unchecked Sendable {
     private var receivedBuffers: UInt64 = 0
     private var successfulBufferWrites: UInt64 = 0
     private var errorDiagnostic: RecorderErrorDiagnostic?
+    private var audioHandler: (@Sendable (AVAudioPCMBuffer) -> Void)?
 
     init(file: AVAudioFile) {
         self.file = file
         processingFormat = file.processingFormat
+    }
+
+    func setAudioHandler(_ handler: (@Sendable (AVAudioPCMBuffer) -> Void)?) {
+        lock.withLock { audioHandler = handler }
     }
 
     var peakLevel: Float {
@@ -134,6 +139,7 @@ final class CapturedAudioSink: @unchecked Sendable {
             do {
                 try file.write(from: converted)
                 successfulBufferWrites &+= 1
+                audioHandler?(converted)
                 return nil
             } catch {
                 let nsError = error as NSError
@@ -167,8 +173,8 @@ final class CapturedAudioSink: @unchecked Sendable {
     /// a format change so the last syllable isn't lost when releasing Option.
     private func flushConverter() -> Bool {
         guard let converter, let file else { return true }
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: processingFormat, frameCapacity: 4096) else { return false }
         for _ in 0..<8 {
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: processingFormat, frameCapacity: 4096) else { return false }
             var error: NSError?
             let status = converter.convert(to: buffer, error: &error) { _, inputStatus in
                 inputStatus.pointee = .endOfStream
@@ -179,7 +185,10 @@ final class CapturedAudioSink: @unchecked Sendable {
                 return false
             }
             do {
-                if buffer.frameLength > 0 { try file.write(from: buffer) }
+                if buffer.frameLength > 0 {
+                    try file.write(from: buffer)
+                    audioHandler?(buffer)
+                }
             } catch {
                 let diagnostic = error as NSError
                 _ = record(failure: .init(domain: diagnostic.domain, code: diagnostic.code))

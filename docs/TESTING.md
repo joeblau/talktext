@@ -40,9 +40,10 @@ This opens the real input and requires incoming warm-up buffers. It discards the
 audio and verifies that the temporary WAV contains no recorded frames. Regression
 tests also cover an 18-channel CONNECT 6 format through mono WAV capture.
 
-The real-model test checks draft text from snapshots of an open recording within
-the first three seconds of input and final inference during preview cancellation.
-It uses fixture audio, not microphone access. AirPods profile negotiation and
+The real-model test checks batch transcription, incremental transcription across
+more than 30 seconds, and draft text from snapshots of an open recording within
+the first three seconds of input. It uses fixture audio, not microphone access.
+AirPods profile negotiation and
 audible cue playback still need a hardware check: select the AirPods under Input,
 hold Right Option until the ready chime, speak, check the panel's level meter and
 draft, then release. Repeat immediately and check that input recovers after an
@@ -69,11 +70,14 @@ Ultra manifest independently of any previous v2 cache.
 The real-model suite also repeats the public fixture across more than 30 seconds
 and checks that every passage survives Ultra's 15-second decoding windows.
 
-The smoke test reports short-draft latency and always checks final and draft
-transcripts, including a draft from a still-open capture. Shared CI runners have
-variable load and Core ML warm-up costs, so their wall-clock latency is diagnostic.
-On an otherwise idle native Apple Silicon Mac, also enforce the two-second draft
-latency budget with:
+The smoke test reports short-draft latency and batch and streaming transcription
+times. It always checks final and draft transcripts, including a draft from a
+still-open capture and every passage in the incremental long-form result. Shared
+CI runners have variable load and Core ML warm-up costs, so wall-clock latency is
+diagnostic. To replay the long stream at real-time speed and also measure
+release-to-final latency, add `TALKTEXT_PARAKEET_REALTIME_STREAM_TEST=1` to the
+command below. On an otherwise idle native Apple Silicon Mac, enforce the
+two-second draft latency budget with:
 
 ```sh
 TALKTEXT_PARAKEET_SMOKE_TEST=1 TALKTEXT_PARAKEET_LATENCY_TEST=1 swift test --package-path TalkText --filter ParakeetIntegrationTests

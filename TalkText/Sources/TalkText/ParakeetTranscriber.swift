@@ -2,8 +2,8 @@ import CoreML
 import FluidAudio
 import Foundation
 
-/// All weights remain resident. Every pass, draft or final, gets its own
-/// decoder state so cancelling a draft cannot corrupt the final transcript.
+/// Weights and the batch manager remain resident. Independent batch passes and
+/// streaming sessions own their decoder state.
 actor ParakeetTranscriber: SpeechTranscribing, TranscriptionPreflighting {
     private let resolver: any ParakeetModelResolving
     private let audioValidator: any AudioValidating
@@ -30,6 +30,7 @@ actor ParakeetTranscriber: SpeechTranscribing, TranscriptionPreflighting {
     func preflightDependencies() async -> TalkTextDependencyPreflightResult {
         do {
             let preflight = try await prepareBackend()
+            try await recognizer.prewarm()
             return .ready(preflight)
         } catch let failure as TalkTextDependencyPreflightFailure {
             return .failure(failure)
@@ -47,6 +48,17 @@ actor ParakeetTranscriber: SpeechTranscribing, TranscriptionPreflighting {
             return await task.value
         } onCancel: {
             task.cancel()
+        }
+    }
+
+    func startStreamingTranscription(
+        onUpdate: @escaping @MainActor (String) async -> Void
+    ) async -> (any StreamingTranscriptionSession)? {
+        do {
+            _ = try await prepareBackend()
+            return try await recognizer.startStreaming(onUpdate: onUpdate)
+        } catch {
+            return nil
         }
     }
 
@@ -96,17 +108,29 @@ actor ParakeetTranscriber: SpeechTranscribing, TranscriptionPreflighting {
 protocol ParakeetRecognizing: Sendable {
     func validateHardware() async throws
     func loadModels(at directory: URL) async throws
+    func prewarm() async throws
+    func startStreaming(
+        onUpdate: @escaping @MainActor (String) async -> Void
+    ) async throws -> (any StreamingTranscriptionSession)?
     func transcribe(audioURL: URL) async throws -> String
 }
 
 extension ParakeetRecognizing {
     func validateHardware() async throws {}
+    func prewarm() async throws {}
+    func startStreaming(
+        onUpdate: @escaping @MainActor (String) async -> Void
+    ) async throws -> (any StreamingTranscriptionSession)? {
+        nil
+    }
 }
 
 private actor FluidAudioParakeetRecognizer: ParakeetRecognizing {
     private var models: AsrModels?
     private var modelURL: URL?
+    private var manager: AsrManager?
     private var loading: (url: URL, task: Task<AsrModels, Error>)?
+    private var prewarmTask: Task<Void, Error>?
 
     func validateHardware() async throws {
         // Core ML prediction crashes under Rosetta for these assets. Keep the
@@ -122,20 +146,23 @@ private actor FluidAudioParakeetRecognizer: ParakeetRecognizing {
             if models != nil, modelURL == directory { return }
             if let pending = loading {
                 let loaded = try await pending.task.value
-                models = loaded
-                modelURL = pending.url
+                install(loaded, at: pending.url)
                 loading = nil
                 if pending.url == directory { return }
             }
             let task = Task.detached(priority: .userInitiated) {
                 let configuration = AsrModels.defaultConfiguration()
-                return try AsrModels.loadLocal(from: directory, version: .ultra, configuration: configuration)
+                return try AsrModels.loadLocal(
+                    from: directory,
+                    version: .ultra,
+                    configuration: configuration,
+                    encoderComputeUnits: .cpuAndNeuralEngine
+                )
             }
             loading = (directory, task)
             do {
                 let loaded = try await task.value
-                models = loaded
-                modelURL = directory
+                install(loaded, at: directory)
                 loading = nil
             } catch {
                 loading = nil
@@ -144,11 +171,46 @@ private actor FluidAudioParakeetRecognizer: ParakeetRecognizing {
         #endif
     }
 
-    func transcribe(audioURL: URL) async throws -> String {
+    func prewarm() async throws {
+        if let prewarmTask {
+            try await prewarmTask.value
+            return
+        }
+        guard let manager, let models else { throw ASRError.notInitialized }
+        let task = Task {
+            var decoder = TdtDecoderState.make(decoderLayers: models.version.decoderLayers)
+            _ = try await manager.transcribe(
+                [Float](repeating: 0, count: 4_800),
+                decoderState: &decoder
+            )
+        }
+        prewarmTask = task
+        do {
+            try await task.value
+        } catch {
+            prewarmTask = nil
+            throw error
+        }
+    }
+
+    func startStreaming(
+        onUpdate: @escaping @MainActor (String) async -> Void
+    ) async throws -> (any StreamingTranscriptionSession)? {
         guard let models else { throw ASRError.notInitialized }
-        let manager = AsrManager(models: models)
+        return try await FluidAudioStreamingTranscriptionSession(models: models, onUpdate: onUpdate)
+    }
+
+    func transcribe(audioURL: URL) async throws -> String {
+        guard let manager, let models else { throw ASRError.notInitialized }
         var decoder = TdtDecoderState.make(decoderLayers: models.version.decoderLayers)
         return try await manager.transcribe(audioURL, decoderState: &decoder).text
+    }
+
+    private func install(_ loaded: AsrModels, at directory: URL) {
+        models = loaded
+        modelURL = directory
+        manager = AsrManager(models: loaded)
+        prewarmTask = nil
     }
 }
 

@@ -427,6 +427,34 @@ final class EngineSequencedTranscriberFake: SpeechTranscribing, @unchecked Senda
     }
 }
 
+final class EnginePreviewTranscriberFake: SpeechTranscribing, @unchecked Sendable {
+    private let lock = NSLock()
+    private let draft: TranscriptionOutcome
+    private let final: TranscriptionOutcome
+    private var finalRecordingURL: URL?
+    private var _audioURLs: [URL] = []
+
+    init(draft: TranscriptionOutcome, final: TranscriptionOutcome) {
+        self.draft = draft
+        self.final = final
+    }
+
+    var audioURLs: [URL] {
+        lock.withLock { _audioURLs }
+    }
+
+    func setFinalRecordingURL(_ url: URL) {
+        lock.withLock { finalRecordingURL = url }
+    }
+
+    func transcribe(audioURL: URL) async -> TranscriptionOutcome {
+        lock.withLock {
+            _audioURLs.append(audioURL)
+            return audioURL == finalRecordingURL ? final : draft
+        }
+    }
+}
+
 @MainActor
 final class EngineDeliveryFake: TextDelivering {
     var capturedTarget: PasteTarget?

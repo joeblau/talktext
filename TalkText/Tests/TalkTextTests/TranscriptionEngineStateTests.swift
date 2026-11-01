@@ -292,8 +292,9 @@ final class TranscriptionEngineStateTests: XCTestCase {
 
     func testRecordingReplacesTextAtCursorButOnlyFinalizesCompleteTranscript() async {
         let snapshotter = EngineSnapshotterFake(result: true)
-        let transcriber = EngineSequencedTranscriberFake(
-            outcomes: [.success("A live draft"), .success("The final transcript")]
+        let transcriber = EnginePreviewTranscriberFake(
+            draft: .success("A live draft"),
+            final: .success("The final transcript")
         )
         let store = EngineFileStoreFake()
         let delivery = EngineDeliveryFake()
@@ -307,19 +308,20 @@ final class TranscriptionEngineStateTests: XCTestCase {
         )
 
         engine.toggleRecording()
-        await waitUntilWithDelay { delivery.liveUpdatedTexts == ["", "A live draft"] }
+        await waitUntilWithDelay { delivery.liveUpdatedTexts.last == "A live draft" }
 
         XCTAssertEqual(engine.state, .recording)
-        XCTAssertEqual(snapshotter.requests.count, 1)
+        XCTAssertGreaterThanOrEqual(snapshotter.requests.count, 1)
         XCTAssertEqual(delivery.deliveredTexts, [], "A draft must not run final delivery")
-        XCTAssertEqual(store.removedURLs, [snapshotter.requests[0].destination])
+        XCTAssertTrue(store.removedURLs.contains(snapshotter.requests[0].destination))
+        transcriber.setFinalRecordingURL(snapshotter.requests[0].source)
 
         engine.toggleRecording()
         await waitUntilWithDelay { engine.state == .idle }
 
-        XCTAssertEqual(transcriber.audioURLs.count, 2)
+        XCTAssertGreaterThanOrEqual(transcriber.audioURLs.count, 2)
         XCTAssertEqual(transcriber.audioURLs[0], snapshotter.requests[0].destination)
-        XCTAssertEqual(transcriber.audioURLs[1], snapshotter.requests[0].source)
+        XCTAssertEqual(transcriber.audioURLs.last, snapshotter.requests[0].source)
         XCTAssertEqual(delivery.finalizedTexts, ["The final transcript"])
         XCTAssertEqual(delivery.deliveredTexts, ["The final transcript"])
         XCTAssertEqual(Set(store.removedURLs), Set(store.allocatedURLs))

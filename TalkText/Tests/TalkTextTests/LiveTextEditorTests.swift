@@ -4,6 +4,65 @@ import XCTest
 
 @MainActor
 final class LiveTextEditorTests: XCTestCase {
+    func testDiscordUsesGuardedKeystrokesWithoutChangingOtherEditors() {
+        for bundleIdentifier in ["com.hnc.Discord", "com.hnc.DiscordPTB", "com.hnc.DiscordCanary"] {
+            XCTAssertTrue(SystemLiveTextElement.forcesKeystrokeDrafts(bundleIdentifier: bundleIdentifier))
+        }
+        XCTAssertFalse(SystemLiveTextElement.forcesKeystrokeDrafts(bundleIdentifier: "com.apple.TextEdit"))
+        XCTAssertFalse(SystemLiveTextElement.forcesKeystrokeDrafts(bundleIdentifier: "com.microsoft.VSCode"))
+        XCTAssertFalse(SystemLiveTextElement.forcesKeystrokeDrafts(bundleIdentifier: nil))
+    }
+
+    func testTerminalScreenChangesDoNotStopContinuousDrafts() async {
+        let element = LiveTextElementFake(text: "scrollback\n% ", selection: NSRange(location: 12, length: 0))
+        element.canReplaceSelectedText = false
+        element.canTypeAtSelection = true
+        element.requiresKeystrokeDrafts = true
+        let typer = LiveKeystrokeTyperFake(text: "keep ")
+        let editor = SystemLiveTextEditor(focusedElement: { _ in element }, keystrokeTyper: typer)
+        let target = makeTarget()
+
+        let primed = await editor.update("", in: target)
+        // Output may change even between microphone startup and the first draft.
+        element.text = "new output\n% "
+        let first = await editor.update("hello word", in: target)
+        element.text = "new output\n% hello word\n"
+        let revised = await editor.update("hello world with more words", in: target)
+        // Wrapping and scrolling change both the AX value and its selection.
+        element.text = "% hello world\nwith more words\n"
+        element.selection = NSRange(location: 0, length: 5)
+        let continued = await editor.update("hello world with more words and another line", in: target)
+        let final = await editor.finalize("Hello world with more words and another line.\n", in: target)
+
+        XCTAssertEqual([primed, first, revised, continued], [.updated, .updated, .updated, .updated])
+        XCTAssertEqual(final, .finalized)
+        XCTAssertEqual(typer.text, "keep Hello world with more words and another line. ")
+        XCTAssertEqual(typer.operations[1].deletions, 1)
+        XCTAssertEqual(typer.operations[1].insertion, "ld with more words")
+        XCTAssertEqual(typer.operations[2].deletions, 0)
+        XCTAssertTrue(element.typedTexts.isEmpty)
+        XCTAssertEqual(element.selectedTextWrites, 0)
+        XCTAssertEqual(element.valueWrites, 0)
+        XCTAssertEqual(element.selection, NSRange(location: 0, length: 5))
+    }
+
+    func testCancellingTerminalDraftAfterScreenChangesDeletesOnlyDictation() async {
+        let element = LiveTextElementFake(text: "% keep ", selection: NSRange(location: 7, length: 0))
+        element.requiresKeystrokeDrafts = true
+        let typer = LiveKeystrokeTyperFake(text: "keep ")
+        let editor = SystemLiveTextEditor(focusedElement: { _ in element }, keystrokeTyper: typer)
+        let started = await editor.update("draft 🌎", in: makeTarget())
+        element.text = "% keep draft 🌎\nbackground output\n"
+
+        let cancelled = await editor.cancel()
+
+        XCTAssertEqual(started, .updated)
+        XCTAssertEqual(cancelled, .restored)
+        XCTAssertEqual(typer.text, "keep ")
+        XCTAssertEqual(element.selectedTextWrites, 0)
+        XCTAssertEqual(element.valueWrites, 0)
+    }
+
     func testReadOnlyAccessibilityFieldReceivesLiveTypingAtCapturedSelection() async {
         let element = LiveTextElementFake(text: "Before old after", selection: NSRange(location: 7, length: 3))
         element.canReplaceSelectedText = false
@@ -422,6 +481,7 @@ private final class LiveTextElementFake: LiveTextElement {
     var canReplaceSelectedText = true
     var canReplaceValue = false
     var canTypeAtSelection = false
+    var requiresKeystrokeDrafts = false
     var typedTexts: [String] = []
     var typingDelay: Duration = .zero
     private(set) var typingStarted = false

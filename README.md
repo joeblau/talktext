@@ -2,17 +2,23 @@
 
 TalkText is a macOS menu bar app for recording speech, transcribing it live at the cursor with Parakeet, and inserting the final transcription into the focused text field.
 
-While recording, TalkText replaces Parakeet's latest draft directly at the
-captured cursor and shows an active microphone in the menu bar. Fields that
-answer Accessibility are edited in place. Fields that do not, such as Sublime
-Text's editor or GPU-rendered terminals, receive drafts as keystrokes: only the
-changed tail is deleted and retyped, and only while that app stays frontmost.
-Each draft is a full Parakeet Ultra pass over a snapshot of the recording so far.
-When recording stops, TalkText cancels the draft loop and replaces the draft
-with one final transcription of the complete recording. This final pass uses
-fresh decoder state and the same loaded weights. Final text is trimmed without
-rewriting identifiers, symbols, or instructions; an LLM cleanup stage is not
-part of this workflow.
+While recording, TalkText streams Parakeet's latest draft directly at the
+captured cursor in short character batches and shows an active microphone in the
+menu bar. Native fields that answer Accessibility are edited in place. Web
+fields in Safari, Chrome, and Electron apps such as Discord, plus fields that do
+not answer Accessibility, such as Sublime Text's editor or GPU-rendered
+terminals, receive drafts as keystrokes: only the changed tail is deleted and
+retyped, and only while that app stays frontmost. Safari reports Accessibility
+edits to web fields as successful without applying them, and rich web editors
+such as X's composer ignore value writes, so keystrokes are the reliable path. Converted audio feeds one incremental Parakeet
+Ultra session while it is also written to the recording. Drafts accumulate during
+capture instead of repeatedly transcribing the whole file. When recording stops,
+TalkText cancels the presentation animation and finalizes that session
+and replaces the draft with its final text. If streaming is unavailable, fails, or
+returns no text, TalkText transcribes the complete recording with fresh decoder
+state and the same loaded weights. Final text is trimmed without rewriting
+identifiers, symbols, or instructions; an LLM cleanup stage is not part of this
+workflow.
 
 Hold the right Option key to record and release it to stop, or double-tap it to
 lock recording on until the next right-Option press stops it. A single tap does
@@ -151,15 +157,15 @@ through [FluidAudio](https://github.com/FluidInference/FluidAudio). Ultra is a
 post-trained Parakeet v3 model supporting 25 languages.
 It uses Core ML's CPU and Neural Engine on Apple Silicon. The Universal 2 app
 shows an unsupported-hardware message on Intel or under Rosetta before loading
-models. Weights remain resident between recordings. The first load may take
-longer while Core ML compiles for the device.
+models. Weights and the batch manager remain resident between recordings. Startup
+prewarms inference after Core ML loads and compiles for the device.
 
-Live preview re-transcribes a snapshot of the open recording every quarter
-second plus inference time. Actual draft latency depends on the Mac, recording
-length, and Core ML warm-up. When recording stops, the microphone closes
-promptly, preview work is cancelled, and
-the complete recording receives one final audio pass before delivery without
-waiting for preview cleanup.
+During capture, 320 ms chunks flow into an incremental decoder with two seconds
+of left context and 240 ms of right context. Live preview appends or revises text
+as those chunks decode, and release only needs to finish the remaining audio.
+If incremental decoding cannot start, the previous snapshot preview remains as a
+fallback. Empty or failed streamed results trigger a complete batch transcription
+of the authoritative recording before delivery.
 
 Inference is offline. TalkText uses `AsrModels.loadLocal`, disables SDK network
 fetches, and suppresses SDK transcript logging. Setup is the only model-download

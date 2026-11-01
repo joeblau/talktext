@@ -78,6 +78,7 @@ protocol LiveTextElement: AnyObject {
     var canReplaceSelectedText: Bool { get }
     var canReplaceValue: Bool { get }
     var canTypeAtSelection: Bool { get }
+    var requiresKeystrokeDrafts: Bool { get }
     func setSelectedText(_ text: String) -> Bool
     func setValue(_ text: String) -> Bool
     func select(_ range: NSRange) -> Bool
@@ -85,6 +86,8 @@ protocol LiveTextElement: AnyObject {
 }
 
 extension LiveTextElement {
+    var requiresKeystrokeDrafts: Bool { false }
+
     func replace(_ range: NSRange, with replacement: String) async -> Bool {
         guard let text,
               range.location >= 0, range.length >= 0,
@@ -197,8 +200,12 @@ final class SystemLiveTextEditor: LiveTextEditing {
         // text at the cursor. An empty priming draft types nothing, so it is
         // skipped: a later tick can still capture the field directly once the
         // app answers Accessibility queries.
-        guard let element = focusedElement(target), let currentValue = element.text else {
-            liveTextLogger.debug("No readable focused field; using keystroke drafts")
+        // Terminal exposes its screen and scrollback as readable text, but its
+        // AX selection is not the shell's input cursor. Choose keystrokes before
+        // priming a range so wrapping or output cannot invalidate the session.
+        guard let element = focusedElement(target), !element.requiresKeystrokeDrafts,
+              let currentValue = element.text else {
+            liveTextLogger.debug("Focused field requires keystroke drafts")
             guard !text.isEmpty else { return .updated }
             return await beginKeystrokeDraft(text, in: target)
         }
