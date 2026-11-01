@@ -16,15 +16,10 @@ final class CapturedAudioSink: @unchecked Sendable {
     private var receivedBuffers: UInt64 = 0
     private var successfulBufferWrites: UInt64 = 0
     private var errorDiagnostic: RecorderErrorDiagnostic?
-    private var audioHandler: (@Sendable (AVAudioPCMBuffer) -> Void)?
 
     init(file: AVAudioFile) {
         self.file = file
         processingFormat = file.processingFormat
-    }
-
-    func setAudioHandler(_ handler: (@Sendable (AVAudioPCMBuffer) -> Void)?) {
-        lock.withLock { audioHandler = handler }
     }
 
     var peakLevel: Float {
@@ -139,7 +134,6 @@ final class CapturedAudioSink: @unchecked Sendable {
             do {
                 try file.write(from: converted)
                 successfulBufferWrites &+= 1
-                audioHandler?(converted)
                 return nil
             } catch {
                 let nsError = error as NSError
@@ -185,10 +179,7 @@ final class CapturedAudioSink: @unchecked Sendable {
                 return false
             }
             do {
-                if buffer.frameLength > 0 {
-                    try file.write(from: buffer)
-                    audioHandler?(buffer)
-                }
+                if buffer.frameLength > 0 { try file.write(from: buffer) }
             } catch {
                 let diagnostic = error as NSError
                 _ = record(failure: .init(domain: diagnostic.domain, code: diagnostic.code))
