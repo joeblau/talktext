@@ -91,10 +91,43 @@ final class ParakeetIntegrationTests: XCTestCase {
         }
         let written = try AVAudioFile(forReading: extendedURL)
         XCTAssertGreaterThan(Double(written.length) / written.processingFormat.sampleRate, 30)
+        let batchStart = ContinuousClock.now
         let outcome = await transcriber.transcribe(audioURL: extendedURL)
+        print("Parakeet long batch transcription: \(ContinuousClock.now - batchStart)")
         guard case let .success(text) = outcome else { return XCTFail("Expected speech across Ultra's 15-second windows") }
         let words = text.lowercased().split { !$0.isLetter }.map(String.init).joined(separator: " ")
         let phraseCount = words.components(separatedBy: "ask not").count - 1
         XCTAssertEqual(phraseCount, repetitions, "Every repeated passage must survive multi-window transcription: \(text)")
+
+        let optionalStream = await transcriber.startStreamingTranscription(onUpdate: { _ in })
+        let stream = try XCTUnwrap(optionalStream, "Ultra must expose incremental transcription")
+        let streamStart = ContinuousClock.now
+        let realtime = ProcessInfo.processInfo.environment["TALKTEXT_PARAKEET_REALTIME_STREAM_TEST"] == "1"
+        while written.framePosition < written.length {
+            let chunk = try XCTUnwrap(AVAudioPCMBuffer(
+                pcmFormat: written.processingFormat,
+                frameCapacity: 16_000
+            ))
+            let remaining = AVAudioFrameCount(written.length - written.framePosition)
+            try written.read(into: chunk, frameCount: min(16_000, remaining))
+            stream.append(chunk)
+            if realtime {
+                try await Task.sleep(for: .seconds(Double(chunk.frameLength) / written.processingFormat.sampleRate))
+            }
+        }
+        let finishStart = ContinuousClock.now
+        let streamedOutcome = await stream.finish()
+        print("Parakeet long streaming transcription: \(ContinuousClock.now - streamStart)")
+        print("Parakeet streaming release latency: \(ContinuousClock.now - finishStart)")
+        guard case let .success(streamedText) = streamedOutcome else {
+            return XCTFail("Expected incremental speech across Ultra's decoding windows: \(streamedOutcome)")
+        }
+        let streamedWords = streamedText.lowercased().split { !$0.isLetter }.map(String.init).joined(separator: " ")
+        let streamedPhraseCount = streamedWords.components(separatedBy: "ask not").count - 1
+        XCTAssertEqual(
+            streamedPhraseCount,
+            repetitions,
+            "Every repeated passage must survive incremental transcription: \(streamedText)"
+        )
     }
 }

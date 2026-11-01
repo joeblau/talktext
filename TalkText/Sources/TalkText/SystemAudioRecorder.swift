@@ -103,6 +103,10 @@ final class SystemAudioRecorder: NSObject, AudioRecording {
         return true
     }
 
+    func setAudioBufferHandler(_ handler: (@Sendable (AVAudioPCMBuffer) -> Void)?) {
+        sink.setAudioHandler(handler)
+    }
+
     func stop() async -> RecorderStopOutcome {
         // Key-up can coincide with the time limit or a device-loss stop. Share
         // finalization instead of reporting a spurious "not recording" error.

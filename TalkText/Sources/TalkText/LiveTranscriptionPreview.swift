@@ -3,10 +3,9 @@ import os
 
 let liveTextLogger = Logger(subsystem: AppIdentity.bundleIdentifier, category: "live-text")
 
-/// Owns the best-effort draft loop independently from the canonical final
-/// transcription. Preview failures never stop recording or deliver partial text.
-/// Each draft is a full pass over the audio so far, using the same resident
-/// Parakeet Ultra weights as the final transcript with fresh decoder state.
+/// Fallback draft loop for backends without incremental transcription. Preview
+/// failures never stop recording or deliver partial text. Each draft is a full
+/// pass over the audio so far with fresh decoder state.
 @MainActor
 final class LiveTranscriptionPreview {
     private let recordingFileStore: any RecordingFileStoring
