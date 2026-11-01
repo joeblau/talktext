@@ -4,6 +4,15 @@ import XCTest
 
 @MainActor
 final class LiveTextEditorTests: XCTestCase {
+    func testDiscordUsesGuardedKeystrokesWithoutChangingOtherEditors() {
+        for bundleIdentifier in ["com.hnc.Discord", "com.hnc.DiscordPTB", "com.hnc.DiscordCanary"] {
+            XCTAssertTrue(SystemLiveTextElement.forcesKeystrokeDrafts(bundleIdentifier: bundleIdentifier))
+        }
+        XCTAssertFalse(SystemLiveTextElement.forcesKeystrokeDrafts(bundleIdentifier: "com.apple.TextEdit"))
+        XCTAssertFalse(SystemLiveTextElement.forcesKeystrokeDrafts(bundleIdentifier: "com.microsoft.VSCode"))
+        XCTAssertFalse(SystemLiveTextElement.forcesKeystrokeDrafts(bundleIdentifier: nil))
+    }
+
     func testTerminalScreenChangesDoNotStopContinuousDrafts() async {
         let element = LiveTextElementFake(text: "scrollback\n% ", selection: NSRange(location: 12, length: 0))
         element.canReplaceSelectedText = false

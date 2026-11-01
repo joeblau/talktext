@@ -4,10 +4,13 @@ TalkText is a macOS menu bar app for recording speech, transcribing it live at t
 
 While recording, TalkText streams Parakeet's latest draft directly at the
 captured cursor in short character batches and shows an active microphone in the
-menu bar. Fields that answer Accessibility are edited in place. Fields that do
-not, such as Discord, Sublime Text's editor, or GPU-rendered terminals, receive
-drafts as keystrokes: only the changed tail is deleted and retyped, and only
-while that app stays frontmost. Converted audio feeds one incremental Parakeet
+menu bar. Native fields that answer Accessibility are edited in place. Web
+fields in Safari, Chrome, and Electron apps such as Discord, plus fields that do
+not answer Accessibility, such as Sublime Text's editor or GPU-rendered
+terminals, receive drafts as keystrokes: only the changed tail is deleted and
+retyped, and only while that app stays frontmost. Safari reports Accessibility
+edits to web fields as successful without applying them, and rich web editors
+such as X's composer ignore value writes, so keystrokes are the reliable path. Converted audio feeds one incremental Parakeet
 Ultra session while it is also written to the recording. Drafts accumulate during
 capture instead of repeatedly transcribing the whole file. When recording stops,
 TalkText cancels the presentation animation and finalizes that session

@@ -176,6 +176,11 @@ final class SystemAccessibilityService: AccessibilityServing {
         ) else {
             return .targetNotFocused
         }
+        // An AXValue write bypasses a web page's input events, so editors such
+        // as Draft.js keep text the page never shows. Paste goes through them.
+        guard !SystemLiveTextElement.isInWebContent(focusedElement) else {
+            return .valueNotWritable
+        }
 
         var valueSettable = DarwinBoolean(false)
         let valueSettableError = AXUIElementIsAttributeSettable(

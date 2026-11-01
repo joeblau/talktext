@@ -96,13 +96,46 @@ final class SystemLiveTextElement: LiveTextElement {
     }
 
     var requiresKeystrokeDrafts: Bool {
+        if Self.forcesKeystrokeDrafts(bundleIdentifier: bundleIdentifier) { return true }
+        // Web fields cannot be edited reliably through Accessibility. Safari
+        // reports AXSelectedText writes as successful without applying them, and
+        // AXValue writes bypass input events, so editors like Draft.js (X) keep
+        // text in their model that the page never shows. Keystrokes go through
+        // the page's own input handling in every browser and Electron app.
+        if Self.isInWebContent(element) { return true }
         // Terminal's read-only text area represents the rendered screen, not an
         // editable buffer. Its writable AX selection only highlights output.
         // Normal editable controls (Find, Settings, etc.) retain AX editing.
-        bundleIdentifier == "com.apple.Terminal"
+        return bundleIdentifier == "com.apple.Terminal"
             && attribute(kAXRoleAttribute) as? String == kAXTextAreaRole
             && !canReplaceSelectedText && !canReplaceValue
     }
+
+    static func forcesKeystrokeDrafts(bundleIdentifier: String?) -> Bool {
+        switch bundleIdentifier {
+        case "com.hnc.Discord", "com.hnc.DiscordPTB", "com.hnc.DiscordCanary":
+            true
+        default:
+            false
+        }
+    }
+
+    /// Browsers and Electron expose page content beneath an AXWebArea. Native
+    /// controls in the same app, such as the address bar, are not inside one.
+    static func isInWebContent(_ element: AXUIElement) -> Bool {
+        var current: AXUIElement? = element
+        for _ in 0..<Self.webAreaSearchDepth {
+            guard let candidate = current else { return false }
+            if Self.attribute(kAXRoleAttribute, of: candidate) as? String == Self.webAreaRole { return true }
+            guard let parent = Self.attribute(kAXParentAttribute, of: candidate),
+                  CFGetTypeID(parent) == AXUIElementGetTypeID() else { return false }
+            current = unsafeDowncast(parent, to: AXUIElement.self)
+        }
+        return false
+    }
+
+    private static let webAreaRole = "AXWebArea"
+    private static let webAreaSearchDepth = 64
 
     func setSelectedText(_ text: String) -> Bool {
         AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFTypeRef) == .success
@@ -147,6 +180,10 @@ final class SystemLiveTextElement: LiveTextElement {
     }
 
     private func attribute(_ name: String) -> CFTypeRef? {
+        Self.attribute(name, of: element)
+    }
+
+    private static func attribute(_ name: String, of element: AXUIElement) -> CFTypeRef? {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success else { return nil }
         return value
@@ -200,6 +237,28 @@ enum KeystrokeEvents {
         }
     }
 
+    /// Safari applies posted Delete presses after text posted behind them, so a
+    /// revision that deletes a tail and retypes it scrambles the draft. Letting
+    /// the deletions settle before typing keeps the order. The batch runs in its
+    /// own task so cancelling a draft cannot stop it halfway, which would leave
+    /// text the editor no longer tracks.
+    @MainActor
+    static func postDeletionsBeforeText(_ events: [CGEvent], to processIdentifier: pid_t) async {
+        let delivery = Task { @MainActor in
+            let deletions = events.prefix { $0.getIntegerValueField(.keyboardEventKeycode) == Int64(deleteKeyCode) }
+            let insertions = events.dropFirst(deletions.count)
+            post(Array(deletions), to: processIdentifier)
+            if !deletions.isEmpty, !insertions.isEmpty {
+                try? await Task.sleep(for: deletionSettleInterval)
+            }
+            post(Array(insertions), to: processIdentifier)
+        }
+        await delivery.value
+    }
+
+    /// 20 ms was enough to retype a 120-character draft in Safari; this leaves margin.
+    static let deletionSettleInterval: Duration = .milliseconds(50)
+
     private static func unicodeChunks(_ text: String) -> [[UniChar]] {
         var chunks: [[UniChar]] = []
         var current: [UniChar] = []
@@ -231,7 +290,7 @@ final class SystemLiveKeystrokeTyper: LiveKeystrokeTyping {
               let source = CGEventSource(stateID: .privateState),
               let events = KeystrokeEvents.make(deleting: deletions, inserting: text, source: source) else { return false }
         guard !events.isEmpty else { return true }
-        KeystrokeEvents.post(events, to: target.processIdentifier)
+        await KeystrokeEvents.postDeletionsBeforeText(events, to: target.processIdentifier)
         // Without a readable value there is no acknowledgement to wait for. A
         // short pause lets the app drain this batch before the next revision.
         try? await Task.sleep(for: .milliseconds(20))
