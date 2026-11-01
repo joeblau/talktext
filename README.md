@@ -2,20 +2,26 @@
 
 TalkText is a macOS menu bar app for recording speech, transcribing it live at the cursor with Parakeet, and inserting the final transcription into the focused text field.
 
-While recording, TalkText writes Parakeet's latest draft directly at the
-captured cursor as soon as each pass finishes and shows an active microphone in
-the menu bar. Native fields that answer Accessibility are edited in place. Web
-fields in Safari, Chrome, and Electron apps such as Discord, plus fields that do
-not answer Accessibility, such as Sublime Text's editor or GPU-rendered
-terminals, receive drafts as keystrokes: only the changed tail is deleted and
-retyped, and only while that app stays frontmost. Safari reports Accessibility
-edits to web fields as successful without applying them, and rich web editors
-such as X's composer ignore value writes, so keystrokes are the reliable path.
-Every draft is a full-context pass with fresh decoder state, so a later draft may
-correct words an earlier one showed. When recording stops, TalkText replaces the
-draft with one final pass using the same loaded weights. Final text is trimmed
-without rewriting identifiers, symbols, or instructions; an LLM cleanup stage is
-not part of this workflow.
+While recording, TalkText shows the live transcript in a small overlay just below
+the text cursor and an active microphone in the menu bar. New words appear the
+moment each pass finishes, drawn faint. Every draft is a full-context pass with
+fresh decoder state, so a later pass may correct a word; once two consecutive
+passes agree on a word and everything before it, a soft left-to-right sweep
+develops it to full strength. Apps that do not report the cursor position, such
+as Chrome's web fields, place the overlay at the field's first line, and apps
+without an accessible field place it at the mouse pointer.
+
+The text field itself is written once, when recording stops: TalkText runs one
+final pass with the same loaded weights, develops the whole transcript in the
+overlay, and inserts it at the cursor captured when recording began. Native
+fields that answer Accessibility are edited in place. Web fields in Safari,
+Chrome, and Electron apps such as Discord, plus fields that do not answer
+Accessibility, such as Sublime Text's editor or GPU-rendered terminals, receive
+the text as keystrokes while that app stays frontmost. Safari reports
+Accessibility edits to web fields as successful without applying them, and rich
+web editors such as X's composer ignore value writes, so keystrokes are the
+reliable path. Final text is trimmed without rewriting identifiers, symbols, or
+instructions; an LLM cleanup stage is not part of this workflow.
 
 Hold the right Option key to record and release it to stop, or double-tap it to
 lock recording on until the next right-Option press stops it. A single tap does

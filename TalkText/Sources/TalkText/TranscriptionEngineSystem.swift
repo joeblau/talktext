@@ -25,6 +25,7 @@ extension TranscriptionEngine {
             dependencyPreflight: transcriber,
             transcriber: transcriber,
             textDelivery: TextDeliveryService(),
+            liveOverlay: SystemLiveTranscriptOverlay(),
             applicationBundleIdentifier: Bundle.main.bundleIdentifier,
             startupPresentation: startupPresentation
         )

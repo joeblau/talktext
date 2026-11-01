@@ -456,6 +456,27 @@ final class EnginePreviewTranscriberFake: SpeechTranscribing, @unchecked Sendabl
 }
 
 @MainActor
+final class EngineOverlayFake: LiveTranscriptOverlaying {
+    private(set) var shown: [(text: String, confirmed: Int)] = []
+    private(set) var completedTexts: [String] = []
+    private(set) var dismissCount = 0
+
+    var shownTexts: [String] { shown.map(\.text) }
+
+    func show(_ text: String, confirmedCharacters: Int, near target: PasteTarget?) {
+        shown.append((text, confirmedCharacters))
+    }
+
+    func complete(with text: String) {
+        completedTexts.append(text)
+    }
+
+    func dismiss() {
+        dismissCount += 1
+    }
+}
+
+@MainActor
 final class EngineDeliveryFake: TextDelivering {
     var capturedTarget: PasteTarget?
     var outcome: DeliveryOutcome?

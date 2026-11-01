@@ -290,7 +290,7 @@ final class TranscriptionEngineStateTests: XCTestCase {
         XCTAssertEqual(store.removedURLs.count, 1)
     }
 
-    func testRecordingReplacesTextAtCursorButOnlyFinalizesCompleteTranscript() async {
+    func testDraftsStayInTheOverlayAndTheFieldIsWrittenOnceOnRelease() async {
         let snapshotter = EngineSnapshotterFake(result: true)
         let transcriber = EnginePreviewTranscriberFake(
             draft: .success("A live draft"),
@@ -298,20 +298,22 @@ final class TranscriptionEngineStateTests: XCTestCase {
         )
         let store = EngineFileStoreFake()
         let delivery = EngineDeliveryFake()
-        delivery.liveUpdateResult = false
+        let overlay = EngineOverlayFake()
         let engine = makeEngine(
             store: store,
             snapshotter: snapshotter,
             transcriber: transcriber,
             delivery: delivery,
+            overlay: overlay,
             livePreviewInterval: 0.01
         )
 
         engine.toggleRecording()
-        await waitUntilWithDelay { delivery.liveUpdatedTexts.last == "A live draft" }
+        await waitUntilWithDelay { overlay.shownTexts.last == "A live draft" }
 
         XCTAssertEqual(engine.state, .recording)
-        XCTAssertGreaterThanOrEqual(snapshotter.requests.count, 1)
+        XCTAssertEqual(overlay.shown.first?.confirmed, 0, "A first pass has nothing to agree with")
+        XCTAssertEqual(delivery.liveUpdatedTexts, [""], "Drafts must not touch the field; only the cursor is captured")
         XCTAssertEqual(delivery.deliveredTexts, [], "A draft must not run final delivery")
         XCTAssertTrue(store.removedURLs.contains(snapshotter.requests[0].destination))
         transcriber.setFinalRecordingURL(snapshotter.requests[0].source)
@@ -319,12 +321,33 @@ final class TranscriptionEngineStateTests: XCTestCase {
         engine.toggleRecording()
         await waitUntilWithDelay { engine.state == .idle }
 
-        XCTAssertGreaterThanOrEqual(transcriber.audioURLs.count, 2)
-        XCTAssertEqual(transcriber.audioURLs[0], snapshotter.requests[0].destination)
+        XCTAssertEqual(transcriber.audioURLs.first, snapshotter.requests[0].destination)
         XCTAssertEqual(transcriber.audioURLs.last, snapshotter.requests[0].source)
+        XCTAssertEqual(overlay.completedTexts, ["The final transcript"])
+        XCTAssertEqual(delivery.liveUpdatedTexts, ["", "The final transcript"])
         XCTAssertEqual(delivery.finalizedTexts, ["The final transcript"])
         XCTAssertEqual(delivery.deliveredTexts, ["The final transcript"])
         XCTAssertEqual(Set(store.removedURLs), Set(store.allocatedURLs))
+    }
+
+    func testCancellingDuringRecordingDismissesTheOverlayWithoutWriting() async {
+        let snapshotter = EngineSnapshotterFake(result: true)
+        let transcriber = EnginePreviewTranscriberFake(draft: .success("draft"), final: .success("unused"))
+        let delivery = EngineDeliveryFake()
+        let overlay = EngineOverlayFake()
+        let engine = makeEngine(
+            snapshotter: snapshotter, transcriber: transcriber, delivery: delivery,
+            overlay: overlay, livePreviewInterval: 0.01
+        )
+
+        engine.toggleRecording()
+        await waitUntilWithDelay { overlay.shownTexts.last == "draft" }
+        engine.cancelCurrentOperation()
+
+        XCTAssertGreaterThanOrEqual(overlay.dismissCount, 1)
+        XCTAssertEqual(overlay.completedTexts, [])
+        XCTAssertEqual(delivery.liveUpdatedTexts, [""])
+        XCTAssertEqual(delivery.deliveredTexts, [])
     }
 
     func testRapidTogglesCannotStartAnotherSessionWhileDeliveryIsPending() async {
@@ -463,6 +486,7 @@ final class TranscriptionEngineStateTests: XCTestCase {
         snapshotter: any ActiveRecordingSnapshotting = EngineSnapshotterFake(),
         transcriber: any SpeechTranscribing = EngineTranscriberFake(),
         delivery: EngineDeliveryFake = EngineDeliveryFake(),
+        overlay: any LiveTranscriptOverlaying = DisabledLiveTranscriptOverlay(),
         livePreviewInterval: TimeInterval = 1.5
     ) -> TranscriptionEngine {
         TranscriptionEngine(
@@ -475,6 +499,7 @@ final class TranscriptionEngineStateTests: XCTestCase {
             dependencyPreflight: preflight,
             transcriber: transcriber,
             textDelivery: delivery,
+            liveOverlay: overlay,
             livePreviewInterval: livePreviewInterval,
             performStartupCleanup: false
         )

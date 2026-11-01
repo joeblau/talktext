@@ -70,6 +70,8 @@ final class TranscriptionEngine: ObservableObject {
     private let maximumDuration: TimeInterval
     private let livePreviewInterval: TimeInterval
     private let livePreview: LiveTranscriptionPreview
+    private let liveOverlay: any LiveTranscriptOverlaying
+    private var draftConfirmation = TranscriptConfirmation()
 
     /// Peak level below which a recording holds no speech. Real speech peaks far
     /// above this even from across a room; digital silence sits at -infinity.
@@ -95,6 +97,7 @@ final class TranscriptionEngine: ObservableObject {
         dependencyPreflight: any TranscriptionPreflighting,
         transcriber: any SpeechTranscribing,
         textDelivery: any TextDelivering,
+        liveOverlay: any LiveTranscriptOverlaying = DisabledLiveTranscriptOverlay(),
         applicationBundleIdentifier: String? = AppIdentity.bundleIdentifier,
         maximumDuration: TimeInterval = TranscriptionEngine.maximumRecordingDuration,
         livePreviewInterval: TimeInterval = 0.1,
@@ -109,6 +112,7 @@ final class TranscriptionEngine: ObservableObject {
         self.dependencyPreflight = dependencyPreflight
         self.transcriber = transcriber
         self.textDelivery = textDelivery
+        self.liveOverlay = liveOverlay
         self.applicationBundleIdentifier = applicationBundleIdentifier
         self.maximumDuration = maximumDuration
         self.livePreviewInterval = max(0.05, livePreviewInterval)
@@ -381,8 +385,9 @@ final class TranscriptionEngine: ObservableObject {
                         statusText: "Recording… Release or tap Right Option to stop"
                     )
                 )
-                // Each draft goes to the cursor as soon as it is ready; the next
-                // pass starts right after it, so the newest text always wins.
+                // Drafts appear in the overlay the moment each pass finishes, faint
+                // until two passes agree. The field is written once, on release.
+                self.draftConfirmation = TranscriptConfirmation()
                 self.livePreview.start(
                     recordingURL: recordingURL,
                     minimumInterval: self.livePreviewInterval
@@ -393,7 +398,8 @@ final class TranscriptionEngine: ObservableObject {
                           self.currentRecorderHasAudio else {
                         return
                     }
-                    _ = await self.textDelivery.updateLiveTranscript(text, in: self.currentSessionTarget)
+                    let confirmed = self.draftConfirmation.update(with: text)
+                    self.liveOverlay.show(text, confirmedCharacters: confirmed, near: self.currentSessionTarget)
                 }
                 logger.notice(
                     "Recording started with verified input; device: \(recorder.inputDeviceName, privacy: .public)"
@@ -562,12 +568,17 @@ final class TranscriptionEngine: ObservableObject {
         transition(to: outcomePresentation)
 
         guard case let .success(text) = outcome else {
+            liveOverlay.dismiss()
             textDelivery.cancelLiveTranscript()
             finishSessionKeepingPresentation()
             return
         }
 
         let target = currentSessionTarget
+        liveOverlay.complete(with: text)
+        // One write at the cursor captured when recording began, using the
+        // field's own editing path (Accessibility or keystrokes), then commit.
+        _ = await textDelivery.updateLiveTranscript(text, in: target)
         let deliveryOutcome = await textDelivery.finalizeLiveTranscript(text, in: target)
         guard currentSessionIdentifier == sessionIdentifier else {
             return
@@ -582,6 +593,7 @@ final class TranscriptionEngine: ObservableObject {
         recordingStoppedCue.stop()
         currentSessionIdentifier = nil
         currentSessionTarget = nil
+        liveOverlay.dismiss()
         livePreview.cleanup()
         textDelivery.cancelLiveTranscript()
         activeTask?.cancel()
@@ -597,6 +609,7 @@ final class TranscriptionEngine: ObservableObject {
 
     private func finishFailure(_ presentation: Presentation) {
         recordingReadyCue.stop()
+        liveOverlay.dismiss()
         livePreview.cleanup()
         textDelivery.cancelLiveTranscript()
         activeTask?.cancel()
