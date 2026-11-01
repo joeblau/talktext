@@ -70,7 +70,8 @@ final class TranscriptionEngine: ObservableObject {
     private let maximumDuration: TimeInterval
     private let livePreviewInterval: TimeInterval
     private let livePreview: LiveTranscriptionPreview
-    private let liveTextPresenter = LiveTextStreamingPresenter()
+    private let liveOverlay: any LiveTranscriptOverlaying
+    private var draftConfirmation = TranscriptConfirmation()
 
     /// Peak level below which a recording holds no speech. Real speech peaks far
     /// above this even from across a room; digital silence sits at -infinity.
@@ -81,7 +82,6 @@ final class TranscriptionEngine: ObservableObject {
     private var currentSessionTarget: PasteTarget?
     private var currentRecordingURL: URL?
     private var currentRecorder: (any AudioRecording)?
-    private var currentStreamingSession: (any StreamingTranscriptionSession)?
     private var activeTask: Task<Void, Never>?
     var dependencyPreparationTask: Task<TalkTextDependencyPreflightResult, Never>?
     private var dependencyPresentationTask: Task<Void, Never>?
@@ -97,9 +97,10 @@ final class TranscriptionEngine: ObservableObject {
         dependencyPreflight: any TranscriptionPreflighting,
         transcriber: any SpeechTranscribing,
         textDelivery: any TextDelivering,
+        liveOverlay: any LiveTranscriptOverlaying = DisabledLiveTranscriptOverlay(),
         applicationBundleIdentifier: String? = AppIdentity.bundleIdentifier,
         maximumDuration: TimeInterval = TranscriptionEngine.maximumRecordingDuration,
-        livePreviewInterval: TimeInterval = 0.25,
+        livePreviewInterval: TimeInterval = 0.1,
         performStartupCleanup: Bool = true,
         startupPresentation: Presentation? = nil
     ) {
@@ -111,9 +112,10 @@ final class TranscriptionEngine: ObservableObject {
         self.dependencyPreflight = dependencyPreflight
         self.transcriber = transcriber
         self.textDelivery = textDelivery
+        self.liveOverlay = liveOverlay
         self.applicationBundleIdentifier = applicationBundleIdentifier
         self.maximumDuration = maximumDuration
-        self.livePreviewInterval = max(0.1, livePreviewInterval)
+        self.livePreviewInterval = max(0.05, livePreviewInterval)
         livePreview = LiveTranscriptionPreview(
             recordingFileStore: recordingFileStore,
             recordingSnapshotter: recordingSnapshotter,
@@ -332,30 +334,6 @@ final class TranscriptionEngine: ObservableObject {
                 // Capture the cursor before connecting a Bluetooth input or playing the cue.
                 if let self {
                     _ = await self.textDelivery.updateLiveTranscript("", in: self.currentSessionTarget)
-                    let session = await self.transcriber.startStreamingTranscription { [weak self] text in
-                        self?.liveTextPresenter.present(text) { [weak self] next in
-                            guard let self,
-                                  self.currentSessionIdentifier == sessionIdentifier,
-                                  self.state == .recording,
-                                  self.currentRecorderHasAudio else {
-                                return
-                            }
-                            _ = await self.textDelivery.updateLiveTranscript(next, in: self.currentSessionTarget)
-                        }
-                    }
-                    guard !Task.isCancelled,
-                          self.currentSessionIdentifier == sessionIdentifier,
-                          self.state == .starting else {
-                        if let session {
-                            Task { await session.cancel() }
-                        }
-                        recorder.cancel()
-                        return
-                    }
-                    self.currentStreamingSession = session
-                    recorder.setAudioBufferHandler { buffer in
-                        session?.append(buffer)
-                    }
                 }
                 guard !Task.isCancelled else { recorder.cancel(); return }
                 let prepared = await recorder.prepare()
@@ -407,21 +385,21 @@ final class TranscriptionEngine: ObservableObject {
                         statusText: "Recording… Release or tap Right Option to stop"
                     )
                 )
-                if self.currentStreamingSession == nil {
-                    self.livePreview.start(
-                        recordingURL: recordingURL,
-                        interval: self.livePreviewInterval
-                    ) { [weak self] text in
-                        self?.liveTextPresenter.present(text) { [weak self] next in
-                            guard let self,
-                                  self.currentSessionIdentifier == sessionIdentifier,
-                                  self.state == .recording,
-                                  self.currentRecorderHasAudio else {
-                                return
-                            }
-                            _ = await self.textDelivery.updateLiveTranscript(next, in: self.currentSessionTarget)
-                        }
+                // Drafts appear in the overlay the moment each pass finishes, faint
+                // until two passes agree. The field is written once, on release.
+                self.draftConfirmation = TranscriptConfirmation()
+                self.livePreview.start(
+                    recordingURL: recordingURL,
+                    minimumInterval: self.livePreviewInterval
+                ) { [weak self] text in
+                    guard let self,
+                          self.currentSessionIdentifier == sessionIdentifier,
+                          self.state == .recording,
+                          self.currentRecorderHasAudio else {
+                        return
                     }
+                    let confirmed = self.draftConfirmation.update(with: text)
+                    self.liveOverlay.show(text, confirmedCharacters: confirmed, near: self.currentSessionTarget)
                 }
                 logger.notice(
                     "Recording started with verified input; device: \(recorder.inputDeviceName, privacy: .public)"
@@ -454,8 +432,7 @@ final class TranscriptionEngine: ObservableObject {
             if let self, self.currentSessionIdentifier == sessionIdentifier, self.state == .stopping {
                 self.recordingStoppedCue.play()
             }
-            // The WAV and all converted buffers are closed before finalizing the
-            // stream or starting a batch fallback.
+            // The WAV and all converted buffers are closed before the final pass.
             guard let self,
                   self.currentSessionIdentifier == sessionIdentifier,
                   self.state == .stopping else {
@@ -566,18 +543,14 @@ final class TranscriptionEngine: ObservableObject {
             return
         }
         transition(to: Presentation(state: .transcribing, statusText: "Transcribing…"))
-        liveTextPresenter.cancel()
 
         activeTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            let outcome = await finalTranscriptionOutcome(
-                streamingSession: self.currentStreamingSession, audioURL: recordingURL, transcriber: self.transcriber
-            )
+            let outcome = await self.livePreview.finalTranscription(recordingURL: recordingURL)
             guard self.currentSessionIdentifier == sessionIdentifier else {
                 return
             }
 
-            self.currentStreamingSession = nil
             self.removeCurrentRecording()
             await self.handleTranscriptionOutcome(
                 outcome,
@@ -595,12 +568,17 @@ final class TranscriptionEngine: ObservableObject {
         transition(to: outcomePresentation)
 
         guard case let .success(text) = outcome else {
+            liveOverlay.dismiss()
             textDelivery.cancelLiveTranscript()
             finishSessionKeepingPresentation()
             return
         }
 
         let target = currentSessionTarget
+        liveOverlay.complete(with: text)
+        // One write at the cursor captured when recording began, using the
+        // field's own editing path (Accessibility or keystrokes), then commit.
+        _ = await textDelivery.updateLiveTranscript(text, in: target)
         let deliveryOutcome = await textDelivery.finalizeLiveTranscript(text, in: target)
         guard currentSessionIdentifier == sessionIdentifier else {
             return
@@ -615,14 +593,13 @@ final class TranscriptionEngine: ObservableObject {
         recordingStoppedCue.stop()
         currentSessionIdentifier = nil
         currentSessionTarget = nil
+        liveOverlay.dismiss()
         livePreview.cleanup()
-        liveTextPresenter.cancel()
         textDelivery.cancelLiveTranscript()
         activeTask?.cancel()
         activeTask = nil
         currentRecorder?.cancel()
         currentRecorder = nil
-        cancelStreamingSession()
         removeCurrentRecording()
     }
 
@@ -632,14 +609,13 @@ final class TranscriptionEngine: ObservableObject {
 
     private func finishFailure(_ presentation: Presentation) {
         recordingReadyCue.stop()
+        liveOverlay.dismiss()
         livePreview.cleanup()
-        liveTextPresenter.cancel()
         textDelivery.cancelLiveTranscript()
         activeTask?.cancel()
         activeTask = nil
         currentRecorder?.cancel()
         currentRecorder = nil
-        cancelStreamingSession()
         removeCurrentRecording()
         currentSessionIdentifier = nil
         currentSessionTarget = nil
@@ -650,16 +626,9 @@ final class TranscriptionEngine: ObservableObject {
         activeTask = nil
         livePreview.cleanup()
         currentRecorder = nil
-        cancelStreamingSession()
         currentRecordingURL = nil
         currentSessionIdentifier = nil
         currentSessionTarget = nil
-    }
-
-    private func cancelStreamingSession() {
-        guard let session = currentStreamingSession else { return }
-        currentStreamingSession = nil
-        Task { await session.cancel() }
     }
 
     private func removeCurrentRecording() {

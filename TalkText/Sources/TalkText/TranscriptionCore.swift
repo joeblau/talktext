@@ -81,13 +81,8 @@ protocol AudioRecording: AnyObject {
     /// Enables file capture and returns only after a post-cue buffer reaches the
     /// WAV. Starting an audio unit alone is not a readiness guarantee on macOS.
     func start(maximumDuration: TimeInterval) async -> Bool
-    func setAudioBufferHandler(_ handler: (@Sendable (AVAudioPCMBuffer) -> Void)?)
     func stop() async -> RecorderStopOutcome
     func cancel()
-}
-
-extension AudioRecording {
-    func setAudioBufferHandler(_ handler: (@Sendable (AVAudioPCMBuffer) -> Void)?) {}
 }
 
 enum AudioRecorderCreationError: Error, Equatable, Sendable {
@@ -362,27 +357,12 @@ protocol TranscriptionPreflighting: Sendable {
     func preflightDependencies() async -> TalkTextDependencyPreflightResult
 }
 
-protocol StreamingTranscriptionSession: Sendable {
-    func append(_ buffer: AVAudioPCMBuffer)
-    func finish() async -> TranscriptionOutcome
-    func cancel() async
-}
-
 protocol SpeechTranscribing: Sendable {
     func transcribe(audioURL: URL) async -> TranscriptionOutcome
-    func startStreamingTranscription(
-        onUpdate: @escaping @MainActor (String) async -> Void
-    ) async -> (any StreamingTranscriptionSession)?
     func cancelActiveTranscriptions()
 }
 
 extension SpeechTranscribing {
-    func startStreamingTranscription(
-        onUpdate: @escaping @MainActor (String) async -> Void
-    ) async -> (any StreamingTranscriptionSession)? {
-        nil
-    }
-
     func cancelActiveTranscriptions() {}
 }
 

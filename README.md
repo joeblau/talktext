@@ -2,23 +2,26 @@
 
 TalkText is a macOS menu bar app for recording speech, transcribing it live at the cursor with Parakeet, and inserting the final transcription into the focused text field.
 
-While recording, TalkText streams Parakeet's latest draft directly at the
-captured cursor in short character batches and shows an active microphone in the
-menu bar. Native fields that answer Accessibility are edited in place. Web
-fields in Safari, Chrome, and Electron apps such as Discord, plus fields that do
-not answer Accessibility, such as Sublime Text's editor or GPU-rendered
-terminals, receive drafts as keystrokes: only the changed tail is deleted and
-retyped, and only while that app stays frontmost. Safari reports Accessibility
-edits to web fields as successful without applying them, and rich web editors
-such as X's composer ignore value writes, so keystrokes are the reliable path. Converted audio feeds one incremental Parakeet
-Ultra session while it is also written to the recording. Drafts accumulate during
-capture instead of repeatedly transcribing the whole file. When recording stops,
-TalkText cancels the presentation animation and finalizes that session
-and replaces the draft with its final text. If streaming is unavailable, fails, or
-returns no text, TalkText transcribes the complete recording with fresh decoder
-state and the same loaded weights. Final text is trimmed without rewriting
-identifiers, symbols, or instructions; an LLM cleanup stage is not part of this
-workflow.
+While recording, TalkText shows the live transcript in a small overlay just below
+the text cursor and an active microphone in the menu bar. New words appear the
+moment each pass finishes, drawn faint. Every draft is a full-context pass with
+fresh decoder state, so a later pass may correct a word; once two consecutive
+passes agree on a word and everything before it, a soft left-to-right sweep
+develops it to full strength. Apps that do not report the cursor position, such
+as Chrome's web fields, place the overlay at the field's first line, and apps
+without an accessible field place it at the mouse pointer.
+
+The text field itself is written once, when recording stops: TalkText runs one
+final pass with the same loaded weights, develops the whole transcript in the
+overlay, and inserts it at the cursor captured when recording began. Native
+fields that answer Accessibility are edited in place. Web fields in Safari,
+Chrome, and Electron apps such as Discord, plus fields that do not answer
+Accessibility, such as Sublime Text's editor or GPU-rendered terminals, receive
+the text as keystrokes while that app stays frontmost. Safari reports
+Accessibility edits to web fields as successful without applying them, and rich
+web editors such as X's composer ignore value writes, so keystrokes are the
+reliable path. Final text is trimmed without rewriting identifiers, symbols, or
+instructions; an LLM cleanup stage is not part of this workflow.
 
 Hold the right Option key to record and release it to stop, or double-tap it to
 lock recording on until the next right-Option press stops it. A single tap does
@@ -160,12 +163,15 @@ shows an unsupported-hardware message on Intel or under Rosetta before loading
 models. Weights and the batch manager remain resident between recordings. Startup
 prewarms inference after Core ML loads and compiles for the device.
 
-During capture, 320 ms chunks flow into an incremental decoder with two seconds
-of left context and 240 ms of right context. Live preview appends or revises text
-as those chunks decode, and release only needs to finish the remaining audio.
-If incremental decoding cannot start, the previous snapshot preview remains as a
-fallback. Empty or failed streamed results trigger a complete batch transcription
-of the authoritative recording before delivery.
+During capture, live preview transcribes a snapshot of the open recording, then
+starts the next pass as soon as the previous one finishes (at most ten per
+second). A pass over 30 seconds of audio takes about a quarter second on Apple
+Silicon, so drafts carry final-pass accuracy at near-live speed. Once more than
+30 seconds of speech is pending, TalkText locks in the text up to the quietest
+moment 15–25 seconds in, so a word is never split, and later passes re-transcribe
+only the audio after it. The final pass covers the same unlocked audio, so release
+costs one short pass however long the dictation ran. If that windowed pass fails,
+the complete recording is transcribed instead.
 
 Inference is offline. TalkText uses `AsrModels.loadLocal`, disables SDK network
 fetches, and suppresses SDK transcript logging. Setup is the only model-download

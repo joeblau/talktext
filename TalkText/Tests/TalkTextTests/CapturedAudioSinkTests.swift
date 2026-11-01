@@ -75,25 +75,6 @@ final class CapturedAudioSinkTests: XCTestCase {
         XCTAssertFalse(health.isRunning)
     }
 
-    func testStreamingHandlerReceivesEveryConvertedAndFlushedFrame() throws {
-        let url = temporaryURL()
-        defer { try? FileManager.default.removeItem(at: url) }
-        let collector = AudioBufferCollector()
-        let sink = try makeSink(at: url)
-        sink.setAudioHandler { collector.append($0) }
-        XCTAssertTrue(sink.beginCapturing())
-        let input = try makeBuffer(sampleRate: 48_000, amplitude: 0.25)
-        for _ in 0..<10 {
-            sink.append(input)
-        }
-        XCTAssertTrue(sink.close())
-
-        let recording = try AVAudioFile(forReading: url)
-        XCTAssertEqual(collector.sampleRate, 16_000)
-        XCTAssertEqual(collector.frameCount, Int(recording.length))
-        XCTAssertGreaterThan(collector.bufferCount, 0)
-    }
-
     private func makeSink(at url: URL) throws -> CapturedAudioSink {
         let file = try AVAudioFile(forWriting: url, settings: [
             AVFormatIDKey: kAudioFormatLinearPCM,
@@ -119,23 +100,4 @@ final class CapturedAudioSinkTests: XCTestCase {
     }
 
     private func temporaryURL() -> URL { FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".wav") }
-}
-
-private final class AudioBufferCollector: @unchecked Sendable {
-    private let lock = NSLock()
-    private var buffers = 0
-    private var frames = 0
-    private var rate: Double = 0
-
-    var bufferCount: Int { lock.withLock { buffers } }
-    var frameCount: Int { lock.withLock { frames } }
-    var sampleRate: Double { lock.withLock { rate } }
-
-    func append(_ buffer: AVAudioPCMBuffer) {
-        lock.withLock {
-            buffers += 1
-            frames += Int(buffer.frameLength)
-            rate = buffer.format.sampleRate
-        }
-    }
 }

@@ -99,35 +99,43 @@ final class ParakeetIntegrationTests: XCTestCase {
         let phraseCount = words.components(separatedBy: "ask not").count - 1
         XCTAssertEqual(phraseCount, repetitions, "Every repeated passage must survive multi-window transcription: \(text)")
 
-        let optionalStream = await transcriber.startStreamingTranscription(onUpdate: { _ in })
-        let stream = try XCTUnwrap(optionalStream, "Ultra must expose incremental transcription")
-        let streamStart = ContinuousClock.now
-        let realtime = ProcessInfo.processInfo.environment["TALKTEXT_PARAKEET_REALTIME_STREAM_TEST"] == "1"
-        while written.framePosition < written.length {
-            let chunk = try XCTUnwrap(AVAudioPCMBuffer(
-                pcmFormat: written.processingFormat,
-                frameCapacity: 16_000
-            ))
-            let remaining = AVAudioFrameCount(written.length - written.framePosition)
-            try written.read(into: chunk, frameCount: min(16_000, remaining))
-            stream.append(chunk)
-            if realtime {
-                try await Task.sleep(for: .seconds(Double(chunk.frameLength) / written.processingFormat.sampleRate))
-            }
-        }
-        let finishStart = ContinuousClock.now
-        let streamedOutcome = await stream.finish()
-        print("Parakeet long streaming transcription: \(ContinuousClock.now - streamStart)")
-        print("Parakeet streaming release latency: \(ContinuousClock.now - finishStart)")
-        guard case let .success(streamedText) = streamedOutcome else {
-            return XCTFail("Expected incremental speech across Ultra's decoding windows: \(streamedOutcome)")
-        }
-        let streamedWords = streamedText.lowercased().split { !$0.isLetter }.map(String.init).joined(separator: " ")
-        let streamedPhraseCount = streamedWords.components(separatedBy: "ask not").count - 1
+        // Past 30 s the live preview locks earlier speech at a pause; the final
+        // transcript must still keep every passage.
+        let (draft, windowed) = try await Self.windowedTranscription(of: extendedURL, transcriber: transcriber)
+        guard case let .success(windowedText) = windowed else { return XCTFail("Expected a windowed final: \(windowed)") }
+        print("Parakeet windowed text: \(windowedText)")
+        XCTAssertEqual(draft, windowedText, "An unchanged recording must finalize to the text already shown")
+        let windowedWords = windowedText.lowercased().split { !$0.isLetter }.map(String.init).joined(separator: " ")
         XCTAssertEqual(
-            streamedPhraseCount,
+            windowedWords.components(separatedBy: "ask not").count - 1,
             repetitions,
-            "Every repeated passage must survive incremental transcription: \(streamedText)"
+            "Locking at a pause must not drop or split a passage: \(windowedText)"
         )
+    }
+
+    @MainActor
+    private static func windowedTranscription(
+        of recordingURL: URL,
+        transcriber: ParakeetTranscriber
+    ) async throws -> (draft: String, final: TranscriptionOutcome) {
+        let store = try TemporaryRecordingFileStore()
+        defer { try? store.cleanupInstance() }
+        let preview = LiveTranscriptionPreview(
+            recordingFileStore: store, recordingSnapshotter: ActiveWAVRecordingSnapshotter(), transcriber: transcriber
+        )
+        defer { preview.cleanup() }
+        let draftStart = ContinuousClock.now
+        var drafts: [String] = []
+        preview.start(recordingURL: recordingURL, minimumInterval: 0.05) { drafts.append($0) }
+        for _ in 0..<1_000 where drafts.isEmpty {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        print("Parakeet windowed draft: \(ContinuousClock.now - draftStart)")
+        await preview.stop()?.value
+        let draft = try XCTUnwrap(drafts.first, "Expected a live draft")
+        let finalStart = ContinuousClock.now
+        let final = await preview.finalTranscription(recordingURL: recordingURL)
+        print("Parakeet windowed final: \(ContinuousClock.now - finalStart)")
+        return (draft, final)
     }
 }

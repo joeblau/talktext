@@ -51,17 +51,6 @@ actor ParakeetTranscriber: SpeechTranscribing, TranscriptionPreflighting {
         }
     }
 
-    func startStreamingTranscription(
-        onUpdate: @escaping @MainActor (String) async -> Void
-    ) async -> (any StreamingTranscriptionSession)? {
-        do {
-            _ = try await prepareBackend()
-            return try await recognizer.startStreaming(onUpdate: onUpdate)
-        } catch {
-            return nil
-        }
-    }
-
     nonisolated func cancelActiveTranscriptions() {
         work.cancelAll()
     }
@@ -109,20 +98,12 @@ protocol ParakeetRecognizing: Sendable {
     func validateHardware() async throws
     func loadModels(at directory: URL) async throws
     func prewarm() async throws
-    func startStreaming(
-        onUpdate: @escaping @MainActor (String) async -> Void
-    ) async throws -> (any StreamingTranscriptionSession)?
     func transcribe(audioURL: URL) async throws -> String
 }
 
 extension ParakeetRecognizing {
     func validateHardware() async throws {}
     func prewarm() async throws {}
-    func startStreaming(
-        onUpdate: @escaping @MainActor (String) async -> Void
-    ) async throws -> (any StreamingTranscriptionSession)? {
-        nil
-    }
 }
 
 private actor FluidAudioParakeetRecognizer: ParakeetRecognizing {
@@ -191,13 +172,6 @@ private actor FluidAudioParakeetRecognizer: ParakeetRecognizing {
             prewarmTask = nil
             throw error
         }
-    }
-
-    func startStreaming(
-        onUpdate: @escaping @MainActor (String) async -> Void
-    ) async throws -> (any StreamingTranscriptionSession)? {
-        guard let models else { throw ASRError.notInitialized }
-        return try await FluidAudioStreamingTranscriptionSession(models: models, onUpdate: onUpdate)
     }
 
     func transcribe(audioURL: URL) async throws -> String {
